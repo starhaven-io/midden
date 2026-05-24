@@ -1,0 +1,14 @@
+# Configuration for https://github.com/lycheeverse/lychee
+# Run: `just lychee` to check README.md links.
+
+max_concurrency = 20
+timeout = 20
+max_retries = 3
+
+exclude = [
+    # claude.ai returns 403 to automated link checkers
+    "https://claude.ai/.*",
+    # TODO: drop after the first push to github.com/starhaven-io/midden.
+    # The CI badge, workflow link, and releases page 404 until the repo exists.
+    "https://github.com/starhaven-io/midden/.*",
+]

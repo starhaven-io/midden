@@ -1,0 +1,141 @@
+mod common;
+
+use common::{Fixture, standard_extras, standard_projects};
+use predicates::str::contains;
+use serde_json::json;
+
+#[test]
+fn dry_run_lists_orphans_and_writes_nothing() {
+    let fx = Fixture::new();
+    let live = fx.touch_dir("live-project");
+    fx.write_config(standard_projects(&live), standard_extras());
+    let before = std::fs::read_to_string(&fx.config).unwrap();
+
+    fx.cmd()
+        .arg("prune")
+        .assert()
+        .success()
+        .stdout(contains("/no/such/dir"))
+        .stdout(contains("/also/gone"))
+        .stdout(contains("[worktree]"))
+        .stdout(contains("dry run"));
+
+    let after = std::fs::read_to_string(&fx.config).unwrap();
+    assert_eq!(before, after, "dry run must not modify the config");
+    assert!(fx.backup_paths().is_empty(), "no backup on dry run");
+}
+
+#[test]
+fn apply_removes_orphans_keeps_live_and_extras_intact() {
+    let fx = Fixture::new();
+    let live = fx.touch_dir("live-project");
+    fx.write_config(standard_projects(&live), standard_extras());
+
+    fx.cmd()
+        .arg("prune")
+        .arg("--apply")
+        // We can't easily simulate "no running claude" in CI when Claude IS
+        // running. The test process itself is named differently, but if a real
+        // `claude` is up, --force is the only safe option in tests.
+        .arg("--force")
+        .assert()
+        .success()
+        .stdout(contains("backed up to"));
+
+    let after = fx.read_config();
+    let projects = after["projects"].as_object().unwrap();
+
+    assert_eq!(projects.len(), 1, "exactly one entry should survive");
+    assert!(projects.contains_key(&live));
+    assert!(!projects.contains_key("/no/such/dir"));
+    assert!(!projects.contains_key("/also/gone"));
+    assert!(
+        !projects.contains_key("/Users/x/proj/.claude/worktrees/witty-curie/checkout"),
+        "worktree orphan should be pruned"
+    );
+
+    // Unrelated top-level keys preserved in meaning.
+    assert_eq!(
+        after["mcpServers"]["example"]["command"],
+        json!("node"),
+        "mcpServers must survive"
+    );
+    assert_eq!(
+        after["oauthAccount"]["email"],
+        json!("patrick@example.com"),
+        "oauthAccount must survive"
+    );
+    assert_eq!(after["numStartups"], json!(42));
+
+    let backups = fx.backup_paths();
+    assert_eq!(backups.len(), 1, "exactly one backup should be written");
+}
+
+#[test]
+fn worktrees_only_skips_non_worktree_orphans() {
+    let fx = Fixture::new();
+    let live = fx.touch_dir("live-project");
+    fx.write_config(standard_projects(&live), standard_extras());
+
+    fx.cmd()
+        .arg("prune")
+        .arg("--worktrees-only")
+        .arg("--apply")
+        .arg("--force")
+        .assert()
+        .success();
+
+    let after = fx.read_config();
+    let projects = after["projects"].as_object().unwrap();
+    assert!(projects.contains_key(&live));
+    // Non-worktree orphans must remain when --worktrees-only is set.
+    assert!(projects.contains_key("/no/such/dir"));
+    assert!(projects.contains_key("/also/gone"));
+    assert!(
+        !projects.contains_key("/Users/x/proj/.claude/worktrees/witty-curie/checkout"),
+        "worktree orphan should be pruned"
+    );
+}
+
+#[test]
+fn clean_config_reports_no_action() {
+    let fx = Fixture::new();
+    let live = fx.touch_dir("only-live");
+    fx.write_config(json!({ &live: {} }), standard_extras());
+
+    fx.cmd()
+        .arg("prune")
+        .assert()
+        .success()
+        .stdout(contains("clean."));
+    assert!(fx.backup_paths().is_empty());
+}
+
+#[test]
+fn missing_config_is_an_error() {
+    let fx = Fixture::new();
+    // Don't write a config.
+    fx.cmd()
+        .arg("prune")
+        .assert()
+        .failure()
+        .stderr(contains("not found"));
+}
+
+#[test]
+fn json_output_dry_run_emits_orphans_array() {
+    let fx = Fixture::new();
+    let live = fx.touch_dir("live");
+    fx.write_config(standard_projects(&live), standard_extras());
+
+    let out = fx.cmd().arg("--json").arg("prune").output().expect("run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["total"], json!(4));
+    assert_eq!(v["orphans"].as_array().unwrap().len(), 3);
+    assert_eq!(v["removed"], json!(false));
+}

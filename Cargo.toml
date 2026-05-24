@@ -1,0 +1,37 @@
+[package]
+name = "midden"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+description = "Resolve, audit, and garbage-collect Claude Code's accumulated state"
+license = "AGPL-3.0-only"
+repository = "https://github.com/starhaven-io/midden"
+homepage = "https://midden.rs"
+keywords = ["claude-code", "config", "audit", "cli", "lint"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [
+    "/.github/",
+    "/scripts/",
+]
+
+[dependencies]
+clap = { version = "4", features = ["derive", "color"] }
+clap_complete = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+walkdir = "2"
+globset = "0.4"
+colored = "3"
+anyhow = "1"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true

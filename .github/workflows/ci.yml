@@ -1,0 +1,242 @@
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+  push:
+    branches:
+      - main
+
+defaults:
+  run:
+    shell: bash -xeuo pipefail {0}
+
+concurrency:
+  group: "ci-${{ github.ref }}"
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  generate-matrix:
+    name: Generate matrix
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Generate CI matrix
+        id: matrix
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          # Push to main: run lint to warm the cache.
+          if [[ "${EVENT_NAME}" == "push" ]]; then
+            echo 'matrix=[{"name":"Lint","check":"lint","runner":"ubuntu-latest"}]' >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          MATRIX='[{"name":"Conventional Commits","check":"commits","runner":"ubuntu-slim","fetch_depth":"0"}'
+
+          # For title/body edits, only recheck conventional commits
+          if [[ "${EVENT_ACTION}" == "edited" ]]; then
+            echo "matrix=${MATRIX}]" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          CHANGED=$(git diff --name-only "${BASE_SHA}...HEAD")
+
+          # Rust or build workflow changes: lint + test on all platforms
+          if echo "${CHANGED}" | grep -qE '\.rs$|^Cargo\.(toml|lock)$|^clippy\.toml$|^rustfmt\.toml$|^\.github/workflows/(ci|release)\.yml$'; then
+            MATRIX+=',{"name":"Lint","check":"lint","runner":"ubuntu-latest"}'
+            MATRIX+=',{"name":"Test (Linux)","check":"test","runner":"ubuntu-latest"}'
+            MATRIX+=',{"name":"Test (Linux ARM)","check":"test","runner":"ubuntu-22.04-arm"}'
+            MATRIX+=',{"name":"Test (macOS)","check":"test","runner":"macos-26"}'
+          fi
+
+          # Workflow changes: Actions security audit
+          if echo "${CHANGED}" | grep -qE '^\.github/workflows/'; then
+            MATRIX+=',{"name":"zizmor","check":"zizmor","runner":"ubuntu-latest"}'
+          fi
+
+          echo "matrix=${MATRIX}]" >> "${GITHUB_OUTPUT}"
+
+  check:
+    name: ${{ matrix.name }}
+    needs: generate-matrix
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      pull-requests: read # required to fetch PR commits for conventional commit validation
+      security-events: write # required for zizmor SARIF upload
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: ${{ matrix.fetch_depth || 1 }}
+          persist-credentials: false
+
+      # --- Cargo caches ---
+
+      - name: Restore cargo build cache
+        id: cargo-build-cache
+        if: matrix.check == 'lint' || matrix.check == 'test'
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-debug-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-debug-
+
+      - name: Restore lint tools cache
+        id: lint-tools-cache
+        if: matrix.check == 'lint'
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/bin/typos
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-lint-tools-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-lint-tools-
+
+      # --- Conventional Commits ---
+
+      - name: Check PR title
+        if: matrix.check == 'commits'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          PATTERN='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore)(\(.+\))?: .+'
+          if [[ ! "${PR_TITLE}" =~ ${PATTERN} ]]; then
+            echo "::error::PR title '${PR_TITLE}' does not follow Conventional Commits."
+            echo ""
+            echo "Expected format: <type>(<scope>): <description>"
+            echo ""
+            echo "Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore"
+            echo ""
+            echo "Examples:"
+            echo "  feat(doctor): add stale-worktree finding"
+            echo "  fix(prune): preserve key order in .claude.json"
+            echo "  ci: add zizmor workflow"
+            exit 1
+          fi
+
+      - name: Check commit messages
+        if: matrix.check == 'commits'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          PATTERN='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore)(\(.+\))?: .+'
+          FAILED=0
+          while IFS= read -r LINE; do
+            SHA="${LINE%% *}"
+            MSG="${LINE#* }"
+            if [[ "${MSG}" == Merge\ * ]]; then
+              continue
+            fi
+            if [[ ! "${MSG}" =~ ${PATTERN} ]]; then
+              echo "::error::Commit ${SHA} does not follow Conventional Commits: '${MSG}'"
+              FAILED=1
+            fi
+          done < <(git log --format="%h %s" "${BASE_SHA}..${HEAD_SHA}")
+
+          if [[ "${FAILED}" -eq 1 ]]; then
+            echo ""
+            echo "All commit messages must follow: <type>(<scope>): <description>"
+            echo "Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore"
+            exit 1
+          fi
+
+      # --- Lint ---
+
+      - name: Add Clippy and Rustfmt
+        if: matrix.check == 'lint'
+        run: rustup component add clippy rustfmt
+
+      - name: Install typos-cli
+        if: matrix.check == 'lint'
+        run: cargo install typos-cli --locked --version 1.46.2
+
+      - name: Install cargo-deny
+        if: matrix.check == 'lint'
+        run: cargo install cargo-deny --locked --version 0.19.6
+
+      - name: Clippy
+        if: matrix.check == 'lint'
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Rustfmt
+        if: matrix.check == 'lint'
+        run: cargo fmt -- --check
+
+      - name: Typos
+        if: matrix.check == 'lint'
+        run: typos
+
+      - name: Cargo deny
+        if: matrix.check == 'lint'
+        run: cargo deny check
+
+      - name: Save cargo build cache
+        if: matrix.check == 'lint' && github.event_name == 'push' && steps.cargo-build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-debug-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Save lint tools cache
+        if: matrix.check == 'lint' && github.event_name == 'push' && steps.lint-tools-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/bin/typos
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-lint-tools-${{ hashFiles('.github/workflows/ci.yml') }}
+
+      # --- Test ---
+
+      - name: Test
+        if: matrix.check == 'test'
+        run: cargo test
+
+      # --- zizmor ---
+
+      - name: Run zizmor
+        if: matrix.check == 'zizmor'
+        uses: zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d # v0.5.6
+        with:
+          persona: auditor
+
+  conclusion:
+    name: conclusion
+    needs: check
+    runs-on: ubuntu-slim
+    if: always()
+    steps:
+      - name: Result
+        env:
+          CHECK_RESULT: ${{ needs.check.result }}
+        run: test "${CHECK_RESULT}" = "success"
