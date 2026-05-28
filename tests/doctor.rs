@@ -207,6 +207,41 @@ fn json_output_emits_findings_array() {
 }
 
 #[test]
+fn bloat_finding_names_the_largest_key() {
+    let fx = Fixture::new();
+    let live = fx.touch_dir("alive");
+    // A dominant cache blob pushes the file past the bloat threshold; the
+    // finding should name the culprit, not just report a size.
+    let blob = "x".repeat(600 * 1024);
+    fx.write_config(
+        json!({ &live: {} }),
+        json!({ "cachedGrowthBookFeatures": blob }),
+    );
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("doctor")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let bloat = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "claude-json-bloat")
+        .expect("expected a claude-json-bloat finding");
+    let msg = bloat["message"].as_str().unwrap();
+    assert!(msg.contains("cachedGrowthBookFeatures"), "message: {msg}");
+}
+
+#[test]
 fn clean_config_reports_no_findings() {
     let fx = Fixture::new();
     let live = fx.touch_dir("alive");

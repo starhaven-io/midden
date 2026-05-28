@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use colored::Colorize;
 use serde_json::json;
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use crate::backup;
@@ -24,7 +25,7 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
         bail!("not found: {}", path.display());
     }
 
-    let mut config = ClaudeJson::load(path)?;
+    let config = ClaudeJson::load(path)?;
     let total = match config.projects() {
         Some(p) => p.len(),
         None => {
@@ -57,16 +58,8 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     let saved = config.raw.len().saturating_sub(new_raw.len());
 
     if opts.json {
-        let removed = if opts.apply {
-            apply_prune(env, &mut config, &orphans, &new_raw, &opts)?
-        } else {
-            false
-        };
-        let backup_path = if removed {
-            // We just wrote the backup; sibling glob would be brittle. Use the
-            // value we returned from apply_prune in the future. For now this
-            // is implicit (caller knows it was created).
-            Some(())
+        let backup = if opts.apply {
+            Some(apply_prune(env, &orphans, &new_raw, &opts)?)
         } else {
             None
         };
@@ -80,8 +73,8 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
                 })).collect::<Vec<_>>(),
                 "bytes_before": config.raw.len(),
                 "bytes_after": new_raw.len(),
-                "removed": removed,
-                "backup": backup_path.map(|_| true),
+                "removed": backup.is_some(),
+                "backup": backup.as_ref().map(|p| p.display().to_string()),
             })
         );
         return Ok(ExitCode::SUCCESS);
@@ -118,7 +111,7 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    apply_prune(env, &mut config, &orphans, &new_raw, &opts)?;
+    apply_prune(env, &orphans, &new_raw, &opts)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -133,22 +126,16 @@ fn preview_pruned(config: &ClaudeJson, orphans: &[orphans::Orphan]) -> Result<St
 
 fn apply_prune(
     env: &Env,
-    config: &mut ClaudeJson,
     orphans: &[orphans::Orphan],
     new_raw: &str,
     opts: &Options,
-) -> Result<bool> {
+) -> Result<PathBuf> {
     if !opts.force && process::claude_is_running() {
         bail!(
             "a `claude` process is running — quit it first, or pass --force \
              (Claude Code rewrites {} live and may overwrite our changes)",
             env.claude_json.display()
         );
-    }
-
-    let drop: BTreeSet<&str> = orphans.iter().map(|o| o.path.as_str()).collect();
-    if let Some(map) = config.projects_mut() {
-        map.retain(|k, _| !drop.contains(k.as_str()));
     }
 
     let backup_path = backup::timestamped_copy(&env.claude_json)?;
@@ -162,5 +149,5 @@ fn apply_prune(
             env.claude_json.display()
         );
     }
-    Ok(true)
+    Ok(backup_path)
 }
