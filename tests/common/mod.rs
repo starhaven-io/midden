@@ -70,6 +70,12 @@ impl Fixture {
         let mut cmd = Command::cargo_bin("midden").expect("binary");
         cmd.env_remove("NO_COLOR")
             .env("CLICOLOR", "0")
+            // Isolate git config (empty HOME, no system config) so a developer's
+            // global gitignore — which often ignores .claude/settings.local.json
+            // — can't sway doctor's git checks under test.
+            .env("HOME", self.home.path())
+            .env("XDG_CONFIG_HOME", self.home.path().join(".config"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .arg("--color")
             .arg("never")
             .arg("--config")
@@ -77,6 +83,20 @@ impl Fixture {
             .arg("--claude-home")
             .arg(&self.claude_home);
         cmd
+    }
+
+    /// Run git in the project root under the same isolated config the binary
+    /// gets, so repo setup and the binary's git checks agree on ignore state.
+    pub fn git(&self, args: &[&str]) {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(self.root.path())
+            .args(args)
+            .env("HOME", self.home.path())
+            .env("XDG_CONFIG_HOME", self.home.path().join(".config"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git");
     }
 
     pub fn backup_paths(&self) -> Vec<PathBuf> {
