@@ -138,4 +138,36 @@ fn json_output_dry_run_emits_orphans_array() {
     assert_eq!(v["total"], json!(4));
     assert_eq!(v["orphans"].as_array().unwrap().len(), 3);
     assert_eq!(v["removed"], json!(false));
+    assert_eq!(v["backup"], json!(null), "no backup on dry run");
+}
+
+#[test]
+fn json_output_apply_emits_backup_path() {
+    let fx = Fixture::new();
+    let live = fx.touch_dir("live");
+    fx.write_config(standard_projects(&live), standard_extras());
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("prune")
+        .arg("--apply")
+        .arg("--force")
+        .output()
+        .expect("run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["removed"], json!(true));
+    assert!(v["bytes_after"].as_u64().unwrap() < v["bytes_before"].as_u64().unwrap());
+
+    let backup = v["backup"].as_str().expect("backup path string");
+    assert!(backup.contains(".bak-"), "backup path: {backup}");
+    assert!(
+        std::path::Path::new(backup).is_file(),
+        "backup file should exist: {backup}"
+    );
 }
