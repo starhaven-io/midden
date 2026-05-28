@@ -3,7 +3,7 @@ use colored::Colorize;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 use walkdir::WalkDir;
@@ -11,6 +11,7 @@ use walkdir::WalkDir;
 use crate::backup;
 use crate::claude_json::{self, ClaudeJson};
 use crate::orphans;
+use crate::output;
 use crate::paths::{Env, ProjectPaths};
 use crate::process;
 use crate::secrets;
@@ -244,6 +245,19 @@ fn check_claude_json_size(env: &Env, out: &mut Vec<Finding>) -> Result<()> {
     if kb < CLAUDE_JSON_BLOAT_THRESHOLD_KB {
         return Ok(());
     }
+    // Point at the actual culprits. prune only reclaims orphaned `projects`
+    // entries; the bulk is usually regenerable `cached*` blobs and per-project
+    // metrics Claude Code rewrites — neither is safe to hand-prune.
+    let breakdown = match largest_top_level_keys(&env.claude_json, 3) {
+        keys if keys.is_empty() => String::new(),
+        keys => {
+            let parts: Vec<String> = keys
+                .iter()
+                .map(|(k, bytes)| format!("{k} ({})", output::kb(*bytes)))
+                .collect();
+            format!("; biggest: {}", parts.join(", "))
+        }
+    };
     out.push(Finding {
         id: "claude-json-bloat",
         severity: Severity::Info,
@@ -251,15 +265,33 @@ fn check_claude_json_size(env: &Env, out: &mut Vec<Finding>) -> Result<()> {
             file: env.claude_json.clone(),
             key_path: None,
         },
-        message: format!(
-            "{} is {} KB; Claude Code never prunes the `projects` map",
-            env.claude_json.display(),
-            kb
+        message: format!("{} is {} KB{}", env.claude_json.display(), kb, breakdown),
+        suggested_fix: Some(
+            "`midden prune --apply` reclaims orphaned project entries; the rest is \
+             cache and metrics Claude Code rewrites, not safe to hand-prune"
+                .into(),
         ),
-        suggested_fix: Some("run `midden prune --apply`".into()),
         auto_fixable: false,
     });
     Ok(())
+}
+
+/// The `n` largest top-level keys by compact-serialized byte size, so the bloat
+/// finding can name what is actually big. Empty if the file won't read or parse.
+fn largest_top_level_keys(path: &Path, n: usize) -> Vec<(String, usize)> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    let mut sizes: Vec<(String, usize)> = map
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::to_string(v).map_or(0, |s| s.len())))
+        .collect();
+    sizes.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    sizes.truncate(n);
+    sizes
 }
 
 fn check_stale_worktrees(project: &ProjectPaths, out: &mut Vec<Finding>) -> Result<()> {
@@ -691,5 +723,28 @@ mod tests {
 
         let (file, _) = recommend_deny_location(&project, &env);
         assert_eq!(file, project.settings());
+    }
+
+    #[test]
+    fn largest_top_level_keys_ranks_by_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("c.json");
+        std::fs::write(
+            &f,
+            r#"{"small":1,"big":"xxxxxxxxxxxxxxxxxxxx","mid":[1,2,3]}"#,
+        )
+        .unwrap();
+        let top = largest_top_level_keys(&f, 2);
+        assert_eq!(top.len(), 2, "truncated to n");
+        assert_eq!(top[0].0, "big");
+        assert_eq!(top[1].0, "mid");
+    }
+
+    #[test]
+    fn largest_top_level_keys_empty_on_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("nope.json");
+        std::fs::write(&f, "not json").unwrap();
+        assert!(largest_top_level_keys(&f, 3).is_empty());
     }
 }
