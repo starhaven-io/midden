@@ -10,6 +10,7 @@ use walkdir::WalkDir;
 
 use crate::backup;
 use crate::claude_json::{self, ClaudeJson};
+use crate::git;
 use crate::orphans;
 use crate::output;
 use crate::paths::{Env, ProjectPaths};
@@ -63,6 +64,7 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     check_claude_json_size(env, &mut findings)?;
     check_stale_worktrees(&project, &mut findings)?;
     check_secrets_in_committed_settings(&project, &mut findings, opts.show_secrets)?;
+    check_local_settings_in_git(&project, &mut findings)?;
     check_credential_deny_rules(&project, env, &mut findings)?;
     check_dead_skill_command_agent_refs(&project, env, &mut findings)?;
     check_disabled_mcp_servers(&project, env, &mut findings)?;
@@ -417,6 +419,52 @@ fn walk_for_secrets(value: &Value, path: &str, out: &mut Vec<(String, String)>) 
         }
         _ => {}
     }
+}
+
+/// `settings.local.json` is the machine-local override file — Claude Code, and
+/// our own secret-in-committed-settings fix, steer credentials into it on the
+/// assumption it stays out of git. Flag it when git tracks it (already exposed)
+/// or merely fails to ignore it (one `git add` away from exposure).
+fn check_local_settings_in_git(project: &ProjectPaths, out: &mut Vec<Finding>) -> Result<()> {
+    let local = project.local_settings();
+    if !local.is_file() {
+        return Ok(());
+    }
+    // Pass a repo-relative path so git resolves it against the worktree it
+    // discovers, regardless of symlinked roots.
+    let rel = local.strip_prefix(&project.root).unwrap_or(local.as_path());
+    if git::is_tracked(&project.root, rel) == Some(true) {
+        out.push(Finding {
+            id: "local-settings-tracked",
+            severity: Severity::Warn,
+            location: Location {
+                file: local.clone(),
+                key_path: None,
+            },
+            message: "settings.local.json is tracked by git — it is meant to stay machine-local \
+                      and often holds secrets"
+                .into(),
+            suggested_fix: Some(
+                "`git rm --cached .claude/settings.local.json`, then add it to .gitignore".into(),
+            ),
+            auto_fixable: false,
+        });
+    } else if git::is_ignored(&project.root, rel) == Some(false) {
+        out.push(Finding {
+            id: "local-settings-not-ignored",
+            severity: Severity::Warn,
+            location: Location {
+                file: local,
+                key_path: None,
+            },
+            message: "settings.local.json is not gitignored — `git add` would commit your \
+                      machine-local overrides"
+                .into(),
+            suggested_fix: Some("add `.claude/settings.local.json` to .gitignore".into()),
+            auto_fixable: false,
+        });
+    }
+    Ok(())
 }
 
 fn check_credential_deny_rules(

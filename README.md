@@ -159,6 +159,8 @@ An entry is a removal candidate only if its directory is provably absent from di
 | `claude-json-bloat` | Info | no | `~/.claude.json` over 512 KB (Claude Code never prunes it) |
 | `stale-worktree` | Info | no | Ephemeral worktree dir untouched for >30 days |
 | `secret-in-committed-settings` | Error | no | Suspect key holding a string value in committed `settings.json` |
+| `local-settings-tracked` | Warn | no | `settings.local.json` tracked by git (meant to stay machine-local) |
+| `local-settings-not-ignored` | Warn | no | `settings.local.json` not gitignored — one `git add` from being committed |
 | `missing-credential-deny` | Warn | no | No `permissions.deny` covers `.env` or `secrets/` paths |
 | `skill-missing-skill-md` | Warn | no | Skill directory missing its `SKILL.md` |
 | `empty-config-file` | Warn | no | Slash command or subagent markdown file is empty |

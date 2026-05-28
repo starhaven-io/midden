@@ -1,6 +1,7 @@
 mod backup;
 mod claude_json;
 mod doctor;
+mod git;
 mod orphans;
 mod output;
 mod paths;

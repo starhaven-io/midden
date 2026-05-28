@@ -263,3 +263,72 @@ fn clean_config_reports_no_findings() {
         .success()
         .stdout(contains("clean."));
 }
+
+#[test]
+fn flags_tracked_local_settings() {
+    let fx = Fixture::new();
+    fx.git(&["init", "--quiet"]);
+    write_json(
+        &fx.root.path().join(".claude/settings.local.json"),
+        &json!({ "env": { "GITHUB_TOKEN": "ghp_x" } }),
+    );
+    fx.git(&["add", ".claude/settings.local.json"]);
+
+    fx.cmd()
+        .arg("doctor")
+        .arg(fx.root.path())
+        .assert()
+        .success()
+        .stdout(contains("local-settings-tracked"));
+}
+
+#[test]
+fn flags_local_settings_not_gitignored() {
+    let fx = Fixture::new();
+    fx.git(&["init", "--quiet"]);
+    write_json(
+        &fx.root.path().join(".claude/settings.local.json"),
+        &json!({ "permissions": { "defaultMode": "bypassPermissions" } }),
+    );
+
+    fx.cmd()
+        .arg("doctor")
+        .arg(fx.root.path())
+        .assert()
+        .success()
+        .stdout(contains("local-settings-not-ignored"));
+}
+
+#[test]
+fn gitignored_local_settings_is_clean() {
+    let fx = Fixture::new();
+    fx.git(&["init", "--quiet"]);
+    std::fs::write(
+        fx.root.path().join(".gitignore"),
+        ".claude/settings.local.json\n",
+    )
+    .unwrap();
+    write_json(
+        &fx.root.path().join(".claude/settings.local.json"),
+        &json!({ "permissions": { "defaultMode": "bypassPermissions" } }),
+    );
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("doctor")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let ids: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["id"].as_str())
+        .collect();
+    assert!(
+        !ids.iter().any(|id| id.starts_with("local-settings")),
+        "gitignored local settings should not be flagged; ids: {ids:?}"
+    );
+}
