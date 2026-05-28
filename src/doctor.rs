@@ -66,7 +66,15 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     check_dead_skill_command_agent_refs(&project, env, &mut findings)?;
     check_disabled_mcp_servers(&project, env, &mut findings)?;
 
-    findings.sort_by_key(|f| (severity_rank(f.severity), f.id));
+    // Sort by severity, then id, then location so output is stable regardless
+    // of filesystem read order.
+    findings.sort_by(|a, b| {
+        severity_rank(a.severity)
+            .cmp(&severity_rank(b.severity))
+            .then(a.id.cmp(b.id))
+            .then(a.location.file.cmp(&b.location.file))
+            .then(a.location.key_path.cmp(&b.location.key_path))
+    });
 
     if opts.json {
         emit_json(&findings, opts.fix);
