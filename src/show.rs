@@ -1,7 +1,7 @@
 use anyhow::Result;
 use colored::Colorize;
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -114,32 +114,23 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
         }
     }
 
+    let report = Report {
+        root,
+        resolved,
+        claude_mds,
+        contradictions,
+        skills,
+        commands,
+        agents,
+        hooks,
+        mcp_servers,
+        worktrees,
+    };
+
     if opts.json {
-        emit_json(
-            &root,
-            &resolved,
-            &claude_mds,
-            &contradictions,
-            &skills,
-            &commands,
-            &agents,
-            &hooks,
-            &mcp_servers,
-            &worktrees,
-        );
+        emit_json(&report);
     } else {
-        emit_human(
-            &root,
-            &resolved,
-            &claude_mds,
-            &contradictions,
-            &skills,
-            &commands,
-            &agents,
-            &hooks,
-            &mcp_servers,
-            &worktrees,
-        );
+        emit_human(&report);
     }
 
     Ok(ExitCode::SUCCESS)
@@ -323,6 +314,7 @@ fn collect_claude_md(project: &ProjectPaths, env: &Env) -> Vec<ClaudeMd> {
         .max_depth(4)
         .into_iter()
         .filter_entry(|e| !is_vendored_dir(e.path()));
+    let mut nested: Vec<ClaudeMd> = Vec::new();
     for entry in walker.filter_map(|e| e.ok()) {
         let p = entry.path();
         if p.file_name().and_then(|n| n.to_str()) == Some("CLAUDE.md") && p != project.claude_md() {
@@ -330,7 +322,7 @@ fn collect_claude_md(project: &ProjectPaths, env: &Env) -> Vec<ClaudeMd> {
                 continue;
             }
             if let Ok(m) = entry.metadata() {
-                out.push(ClaudeMd {
+                nested.push(ClaudeMd {
                     file: p.to_path_buf(),
                     scope: ClaudeMdScope::Project,
                     bytes: m.len(),
@@ -338,6 +330,8 @@ fn collect_claude_md(project: &ProjectPaths, env: &Env) -> Vec<ClaudeMd> {
             }
         }
     }
+    nested.sort_by(|a, b| a.file.cmp(&b.file));
+    out.extend(nested);
     out
 }
 
@@ -478,10 +472,11 @@ fn collect_dirs(roots: &[PathBuf], required_file: &str) -> Vec<LocatedDir> {
         let Ok(entries) = std::fs::read_dir(root) else {
             continue;
         };
+        let mut found: Vec<LocatedDir> = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() && path.join(required_file).is_file() {
-                out.push(LocatedDir {
+                found.push(LocatedDir {
                     name: path
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
@@ -491,6 +486,8 @@ fn collect_dirs(roots: &[PathBuf], required_file: &str) -> Vec<LocatedDir> {
                 });
             }
         }
+        found.sort_by(|a, b| a.name.cmp(&b.name));
+        out.extend(found);
     }
     out
 }
@@ -513,10 +510,11 @@ fn collect_files(roots: &[PathBuf]) -> Vec<LocatedFile> {
             .max_depth(3)
             .into_iter()
             .filter_entry(|e| !is_vendored_dir(e.path()));
+        let mut found: Vec<LocatedFile> = Vec::new();
         for entry in walker.filter_map(|e| e.ok()) {
             let p = entry.path();
             if p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("md") {
-                out.push(LocatedFile {
+                found.push(LocatedFile {
                     name: p
                         .file_stem()
                         .map(|n| n.to_string_lossy().into_owned())
@@ -526,6 +524,8 @@ fn collect_files(roots: &[PathBuf]) -> Vec<LocatedFile> {
                 });
             }
         }
+        found.sort_by(|a, b| a.file.cmp(&b.file));
+        out.extend(found);
     }
     out
 }
@@ -666,24 +666,43 @@ fn collect_worktrees(project: &ProjectPaths) -> Vec<Worktree> {
             }
         }
     }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// Everything `show` resolved for a target directory. Field order is the JSON
+/// emission order; `settings`/`claude_md` keep their original key names.
+#[derive(Serialize)]
+struct Report {
+    root: PathBuf,
+    #[serde(rename = "settings")]
+    resolved: Vec<Resolved>,
+    #[serde(rename = "claude_md")]
+    claude_mds: Vec<ClaudeMd>,
+    contradictions: Vec<Contradiction>,
+    skills: Vec<LocatedDir>,
+    commands: Vec<LocatedFile>,
+    agents: Vec<LocatedFile>,
+    hooks: Vec<Hook>,
+    mcp_servers: Vec<McpServer>,
+    worktrees: Vec<Worktree>,
 }
 
 // -- presentation ------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-fn emit_human(
-    root: &Path,
-    resolved: &[Resolved],
-    claude_mds: &[ClaudeMd],
-    contradictions: &[Contradiction],
-    skills: &[LocatedDir],
-    commands: &[LocatedFile],
-    agents: &[LocatedFile],
-    hooks: &[Hook],
-    mcp_servers: &[McpServer],
-    worktrees: &[Worktree],
-) {
+fn emit_human(report: &Report) {
+    let Report {
+        root,
+        resolved,
+        claude_mds,
+        contradictions,
+        skills,
+        commands,
+        agents,
+        hooks,
+        mcp_servers,
+        worktrees,
+    } = report;
     println!("{} {}", "resolved for".bold(), root.display());
     println!();
 
@@ -852,32 +871,11 @@ fn truncate_oneline(s: &str, max: usize) -> String {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn emit_json(
-    root: &Path,
-    resolved: &[Resolved],
-    claude_mds: &[ClaudeMd],
-    contradictions: &[Contradiction],
-    skills: &[LocatedDir],
-    commands: &[LocatedFile],
-    agents: &[LocatedFile],
-    hooks: &[Hook],
-    mcp_servers: &[McpServer],
-    worktrees: &[Worktree],
-) {
-    let v = json!({
-        "root": root,
-        "settings": resolved,
-        "claude_md": claude_mds,
-        "contradictions": contradictions,
-        "skills": skills,
-        "commands": commands,
-        "agents": agents,
-        "hooks": hooks,
-        "mcp_servers": mcp_servers,
-        "worktrees": worktrees,
-    });
-    println!("{}", serde_json::to_string_pretty(&v).expect("serialize"));
+fn emit_json(report: &Report) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(report).expect("serialize")
+    );
 }
 
 #[cfg(test)]
