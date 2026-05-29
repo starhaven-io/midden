@@ -129,6 +129,39 @@ fn show_secrets_unmasks() {
 }
 
 #[test]
+fn gitignored_settings_json_is_not_flagged_as_committed_secret() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    fx.git(&["init", "--quiet"]);
+    // A repo that gitignores .claude/ wholesale (midden's own convention).
+    std::fs::write(fx.root.path().join(".gitignore"), ".claude/\n").unwrap();
+    let project_settings = fx.root.path().join(".claude/settings.json");
+    write_json(
+        &project_settings,
+        &json!({ "env": { "ANTHROPIC_API_KEY": "sk-very-real-token-abc123" } }),
+    );
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("doctor")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let ids: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["id"].as_str())
+        .collect();
+    assert!(
+        !ids.contains(&"secret-in-committed-settings"),
+        "gitignored settings.json must not be flagged as a committed secret; ids: {ids:?}"
+    );
+}
+
+#[test]
 fn flags_missing_credential_deny_rules() {
     let fx = Fixture::new();
     fx.write_config(json!({}), json!({}));

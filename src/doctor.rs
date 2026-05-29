@@ -361,6 +361,15 @@ fn check_secrets_in_committed_settings(
     if !settings.exists() {
         return Ok(());
     }
+    // A settings.json git explicitly ignores is not "committed" — flagging it as
+    // an Error (and exiting 1) is a false positive for the common pattern of
+    // gitignoring .claude/ wholesale. When git can't tell (not a repo, no git),
+    // fall through and flag it, as before. settings.local.json is covered
+    // separately by check_local_settings_in_git.
+    let rel = settings.strip_prefix(&project.root).unwrap_or(settings.as_path());
+    if git::is_ignored(&project.root, rel) == Some(true) {
+        return Ok(());
+    }
     let raw = std::fs::read_to_string(&settings)
         .with_context(|| format!("read {}", settings.display()))?;
     let Ok(value): Result<Value, _> = serde_json::from_str(&raw) else {
