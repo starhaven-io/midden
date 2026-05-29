@@ -73,13 +73,19 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
                 sources.push((Scope::Managed, managed, v));
             }
         } else if managed.is_dir() {
-            // Drop-in directory: merge each *.json file inside.
+            // Drop-in directory: merge each *.json file inside. Sort the paths
+            // first — read_dir order is unspecified, and for equal-scope sources
+            // the last one wins a scalar, so an unsorted read would make the
+            // resolved winner nondeterministic across runs and machines.
             if let Ok(entries) = std::fs::read_dir(&managed) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.extension().and_then(|e| e.to_str()) == Some("json")
-                        && let Some(v) = read_json(&p)
-                    {
+                let mut paths: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+                    .collect();
+                paths.sort();
+                for p in paths {
+                    if let Some(v) = read_json(&p) {
                         sources.push((Scope::Managed, p, v));
                     }
                 }
