@@ -9,7 +9,15 @@ use time::macros::format_description;
 /// be determined (some Linux distros, sandboxed environments).
 pub fn timestamped_copy(path: &Path) -> Result<PathBuf> {
     let stamp = stamp_now();
-    let backup = backup_path(path, &stamp);
+    // The stamp has one-second resolution, so two mutations in the same second
+    // (e.g. `prune --apply` then `doctor --fix`) would compute the same name and
+    // the second copy would clobber the first backup. Bump a suffix until free.
+    let mut backup = backup_path(path, &stamp);
+    let mut n = 1;
+    while backup.exists() {
+        backup = backup_path(path, &format!("{stamp}-{n}"));
+        n += 1;
+    }
     std::fs::copy(path, &backup)
         .with_context(|| format!("backup {} -> {}", path.display(), backup.display()))?;
     Ok(backup)

@@ -196,7 +196,7 @@ fn apply_fixes(env: &Env, findings: &[Finding], opts: &Options) -> Result<()> {
             let removed = before - map.len();
             let new_raw = claude_json::render(&config.data)?;
             let backup_path = backup::timestamped_copy(&env.claude_json)?;
-            std::fs::write(&env.claude_json, new_raw)?;
+            claude_json::write_atomic(&env.claude_json, &new_raw)?;
             if !opts.json {
                 println!("pruned {removed} orphaned project entries.");
                 println!("backed up to {}", backup_path.display());

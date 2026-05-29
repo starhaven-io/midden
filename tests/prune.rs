@@ -72,6 +72,31 @@ fn apply_removes_orphans_keeps_live_and_extras_intact() {
 }
 
 #[test]
+fn backup_is_a_faithful_copy_of_the_pre_apply_config() {
+    let fx = Fixture::new();
+    let live = fx.touch_dir("live-project");
+    fx.write_config(standard_projects(&live), standard_extras());
+    let before = std::fs::read_to_string(&fx.config).unwrap();
+
+    fx.cmd()
+        .arg("prune")
+        .arg("--apply")
+        .arg("--force")
+        .assert()
+        .success();
+
+    let backups = fx.backup_paths();
+    assert_eq!(backups.len(), 1, "exactly one backup");
+    let backed_up = std::fs::read_to_string(&backups[0]).unwrap();
+    assert_eq!(
+        backed_up, before,
+        "backup must byte-match the pre-apply config (not a post-write copy)"
+    );
+    let after = std::fs::read_to_string(&fx.config).unwrap();
+    assert_ne!(after, before, "live config should have changed");
+}
+
+#[test]
 fn worktrees_only_skips_non_worktree_orphans() {
     let fx = Fixture::new();
     let live = fx.touch_dir("live-project");
