@@ -173,6 +173,66 @@ fn clean_config_reports_no_action() {
 }
 
 #[test]
+fn apply_preserves_top_level_key_order() {
+    let fx = Fixture::new();
+    let live = fx.touch_dir("live-project");
+    fx.write_config(standard_projects(&live), standard_extras());
+
+    fx.cmd()
+        .arg("prune")
+        .arg("--apply")
+        .arg("--force")
+        .assert()
+        .success();
+
+    // Assert on the RAW written text — re-parsing with serde_json (which also
+    // has preserve_order) would mask a regression that dropped the feature.
+    let raw = std::fs::read_to_string(&fx.config).unwrap();
+    let pos = |needle: &str| {
+        raw.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle} in:\n{raw}"))
+    };
+    let (mcp, oauth, starts, projects) = (
+        pos("\"mcpServers\""),
+        pos("\"oauthAccount\""),
+        pos("\"numStartups\""),
+        pos("\"projects\""),
+    );
+    assert!(
+        mcp < oauth && oauth < starts && starts < projects,
+        "top-level key order not preserved (mcp={mcp} oauth={oauth} starts={starts} projects={projects}):\n{raw}"
+    );
+}
+
+#[test]
+fn errors_on_malformed_config() {
+    let fx = Fixture::new();
+    std::fs::write(&fx.config, "{ not valid json").unwrap();
+    fx.cmd()
+        .arg("prune")
+        .assert()
+        .failure()
+        .stderr(contains("parse"));
+}
+
+#[test]
+fn handles_config_without_projects_map() {
+    let fx = Fixture::new();
+    // Parseable, but no "projects" key (write_config always adds one, so write
+    // directly).
+    std::fs::write(
+        &fx.config,
+        serde_json::to_string_pretty(&json!({ "numStartups": 1 })).unwrap(),
+    )
+    .unwrap();
+    fx.cmd()
+        .arg("prune")
+        .assert()
+        .success()
+        .stdout(contains("no 'projects' map found"));
+}
+
+#[test]
 fn missing_config_is_an_error() {
     let fx = Fixture::new();
     // Don't write a config.

@@ -282,6 +282,136 @@ fn json_fix_applied_reflects_whether_a_mutation_happened() {
 }
 
 #[test]
+fn errors_on_malformed_claude_json() {
+    let fx = Fixture::new();
+    std::fs::write(&fx.config, "{ not valid json").unwrap();
+    fx.cmd()
+        .arg("doctor")
+        .arg(fx.root.path())
+        .assert()
+        .failure()
+        .stderr(contains("parse"));
+}
+
+#[test]
+fn skips_malformed_settings_json_but_still_runs_other_checks() {
+    let fx = Fixture::new();
+    let live = fx.touch_dir("alive");
+    fx.write_config(json!({ &live: {}, "/missing": {} }), json!({}));
+    // A malformed project settings.json must not abort doctor; the orphan
+    // finding still surfaces.
+    let project_settings = fx.root.path().join(".claude/settings.json");
+    std::fs::create_dir_all(project_settings.parent().unwrap()).unwrap();
+    std::fs::write(&project_settings, "{ not valid").unwrap();
+
+    fx.cmd()
+        .arg("doctor")
+        .arg(fx.root.path())
+        .assert()
+        .success()
+        .stdout(contains("orphaned-project"));
+}
+
+#[test]
+fn fix_with_nothing_auto_fixable_writes_nothing() {
+    let fx = Fixture::new();
+    let live = fx.touch_dir("alive");
+    fx.write_config(json!({ &live: {} }), json!({}));
+    // The only issue is a secret (Error, not auto-fixable).
+    let project_settings = fx.root.path().join(".claude/settings.json");
+    write_json(
+        &project_settings,
+        &json!({ "env": { "API_KEY": "sk-realsecret-aaaa" } }),
+    );
+
+    fx.cmd()
+        .arg("doctor")
+        .arg(fx.root.path())
+        .arg("--fix")
+        .arg("--force")
+        .assert()
+        .failure() // the secret finding is an Error -> exit 1
+        .stdout(contains("nothing auto-fixable"));
+    assert!(
+        fx.backup_paths().is_empty(),
+        "no backup when nothing is auto-fixable"
+    );
+}
+
+#[test]
+fn fix_is_idempotent() {
+    let fx = Fixture::new();
+    let live = fx.touch_dir("alive");
+    fx.write_config(json!({ &live: {}, "/missing": {} }), json!({}));
+
+    fx.cmd()
+        .arg("doctor")
+        .arg(fx.root.path())
+        .arg("--fix")
+        .arg("--force")
+        .assert()
+        .success();
+    assert_eq!(fx.backup_paths().len(), 1);
+
+    // Second run: the orphan is gone, so nothing is auto-fixable and no new
+    // backup is written.
+    fx.cmd()
+        .arg("doctor")
+        .arg(fx.root.path())
+        .arg("--fix")
+        .arg("--force")
+        .assert()
+        .success()
+        .stdout(contains("nothing auto-fixable"));
+    assert_eq!(fx.backup_paths().len(), 1, "no second backup");
+}
+
+#[test]
+fn flags_empty_command_file() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let cmd_dir = fx.root.path().join(".claude/commands");
+    std::fs::create_dir_all(&cmd_dir).unwrap();
+    std::fs::write(cmd_dir.join("empty.md"), "").unwrap();
+
+    fx.cmd()
+        .arg("doctor")
+        .arg(fx.root.path())
+        .assert()
+        .success()
+        .stdout(contains("empty-config-file"));
+}
+
+#[test]
+fn flags_disabled_mcp_server_distinctly_from_unreachable() {
+    let fx = Fixture::new();
+    fx.write_config(
+        json!({}),
+        json!({ "mcpServers": { "off": { "command": "node", "disabled": true } } }),
+    );
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("doctor")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let ids: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"mcp-server-disabled"), "ids: {ids:?}");
+    assert!(
+        !ids.contains(&"mcp-server-unreachable"),
+        "has a command, so not unreachable; ids: {ids:?}"
+    );
+}
+
+#[test]
 fn json_output_emits_findings_array() {
     let fx = Fixture::new();
     let live = fx.touch_dir("alive");
