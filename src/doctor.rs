@@ -793,6 +793,20 @@ mod tests {
     }
 
     #[test]
+    fn walk_for_secrets_descends_objects_under_sensitive_key() {
+        // Every string under a sensitive-named key is suspect, including those
+        // nested in a sub-object.
+        let v: Value =
+            serde_json::from_str(r#"{ "credentials": { "user": "alice", "pass": "hunter2-x" } }"#)
+                .unwrap();
+        let mut hits = Vec::new();
+        walk_for_secrets(&v, "", &mut hits);
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|(k, _)| k == "credentials.user"));
+        assert!(hits.iter().any(|(k, _)| k == "credentials.pass"));
+    }
+
+    #[test]
     fn recommend_deny_location_prefers_existing_user_settings() {
         let home = tempfile::tempdir().unwrap();
         let proj_root = tempfile::tempdir().unwrap();

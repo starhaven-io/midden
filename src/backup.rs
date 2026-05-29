@@ -50,6 +50,19 @@ mod tests {
     }
 
     #[test]
+    fn timestamped_copy_does_not_clobber_an_existing_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("config.json");
+        std::fs::write(&src, "{}").unwrap();
+        // Two back-to-back copies land in the same second; the second must get a
+        // distinct, suffix-bumped name rather than overwriting the first.
+        let first = timestamped_copy(&src).unwrap();
+        let second = timestamped_copy(&src).unwrap();
+        assert_ne!(first, second, "second backup reused the first name");
+        assert!(first.exists() && second.exists(), "both backups survive");
+    }
+
+    #[test]
     fn timestamped_copy_creates_sibling() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("config.json");
