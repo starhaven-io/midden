@@ -40,16 +40,10 @@ impl Env {
 }
 
 fn home_dir() -> PathBuf {
-    // std::env::home_dir was undeprecated in Rust 1.86. Fall back to $HOME on
-    // older toolchains and Linux where it consults /etc/passwd.
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home);
-    }
-    #[cfg(target_os = "windows")]
-    if let Some(home) = std::env::var_os("USERPROFILE") {
-        return PathBuf::from(home);
-    }
-    PathBuf::from(".")
+    // std::env::home_dir was un-deprecated in Rust 1.87 (< this crate's 1.88
+    // MSRV) and resolves $HOME, then /etc/passwd, on the Unix platforms this
+    // tool targets. Fall back to the current directory only if no home exists.
+    std::env::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Project-scope paths rooted at a target directory.
