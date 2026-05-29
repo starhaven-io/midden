@@ -402,19 +402,38 @@ fn walk_for_secrets(value: &Value, path: &str, out: &mut Vec<(String, String)>) 
                 } else {
                     format!("{path}.{k}")
                 };
-                if secrets::key_looks_sensitive(k)
-                    && let Value::String(s) = v
-                    && !s.is_empty()
-                {
-                    out.push((new_path.clone(), s.clone()));
-                    continue;
+                if secrets::key_looks_sensitive(k) {
+                    // The whole subtree under a sensitive key is suspect —
+                    // including bare strings in arrays, which carry no key.
+                    collect_secret_strings(v, &new_path, out);
+                } else {
+                    walk_for_secrets(v, &new_path, out);
                 }
-                walk_for_secrets(v, &new_path, out);
             }
         }
         Value::Array(arr) => {
             for (i, v) in arr.iter().enumerate() {
                 walk_for_secrets(v, &format!("{path}[{i}]"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect every non-empty string under an already-sensitive key, descending
+/// through nested objects and arrays so a secret stored as `apiKeys: ["sk-…"]`
+/// is caught, not just one stored as a direct string value.
+fn collect_secret_strings(value: &Value, path: &str, out: &mut Vec<(String, String)>) {
+    match value {
+        Value::String(s) if !s.is_empty() => out.push((path.to_string(), s.clone())),
+        Value::Array(arr) => {
+            for (i, v) in arr.iter().enumerate() {
+                collect_secret_strings(v, &format!("{path}[{i}]"), out);
+            }
+        }
+        Value::Object(map) => {
+            for (k, v) in map {
+                collect_secret_strings(v, &format!("{path}.{k}"), out);
             }
         }
         _ => {}
@@ -717,6 +736,21 @@ mod tests {
         walk_for_secrets(&v, "", &mut hits);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, "env.ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn walk_for_secrets_captures_array_elements_under_sensitive_key() {
+        // A secret stored as an array of bare strings under a sensitive key
+        // used to slip through (the elements have no key of their own).
+        let v: Value = serde_json::from_str(
+            r#"{ "apiKeys": ["sk-aaaa-1111", "sk-bbbb-2222"], "name": "fine" }"#,
+        )
+        .unwrap();
+        let mut hits = Vec::new();
+        walk_for_secrets(&v, "", &mut hits);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0, "apiKeys[0]");
+        assert_eq!(hits[1].0, "apiKeys[1]");
     }
 
     #[test]

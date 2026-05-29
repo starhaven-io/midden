@@ -82,6 +82,30 @@ fn flags_secrets_in_committed_settings_but_masks_by_default() {
 }
 
 #[test]
+fn flags_secret_in_array_under_sensitive_key() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let project_settings = fx.root.path().join(".claude/settings.json");
+    // A secret stored as a string array under a sensitive-named key.
+    write_json(
+        &project_settings,
+        &json!({ "apiKeys": ["sk-real-committed-secret-aaaa"] }),
+    );
+
+    let out = fx.cmd().arg("doctor").arg(fx.root.path()).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("secret-in-committed-settings"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("sk-real-committed-secret-aaaa"),
+        "array secret leaked unmasked:\n{stdout}"
+    );
+    assert!(stdout.contains("sk-r***"), "stdout:\n{stdout}");
+}
+
+#[test]
 fn show_secrets_unmasks() {
     let fx = Fixture::new();
     fx.write_config(json!({}), json!({}));

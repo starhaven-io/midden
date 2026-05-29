@@ -106,9 +106,9 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     if !opts.show_secrets {
         for r in &mut resolved {
             if path_looks_sensitive(&r.key) {
-                r.effective = mask_value_in_place(r.effective.clone());
+                secrets::mask_value(&mut r.effective);
                 for c in &mut r.contributions {
-                    c.value = mask_value_in_place(c.value.clone());
+                    secrets::mask_value(&mut c.value);
                 }
             }
         }
@@ -237,19 +237,6 @@ fn path_looks_sensitive(dotted: &str) -> bool {
         .next()
         .is_some_and(secrets::key_looks_sensitive)
         || secrets::key_looks_sensitive(dotted)
-}
-
-fn mask_value_in_place(mut v: Value) -> Value {
-    match &mut v {
-        Value::String(s) => {
-            *s = secrets::mask(s);
-        }
-        Value::Object(_) | Value::Array(_) => {
-            secrets::mask_value(&mut v);
-        }
-        _ => {}
-    }
-    v
 }
 
 #[derive(Debug, Serialize)]
