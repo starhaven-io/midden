@@ -79,14 +79,21 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
             .then(a.location.key_path.cmp(&b.location.key_path))
     });
 
-    if opts.json {
-        emit_json(&findings, opts.fix);
-    } else {
+    if !opts.json {
         emit_human(&findings);
     }
 
-    if opts.fix {
-        apply_fixes(env, &findings, &opts)?;
+    // Apply before emitting JSON so `fix_applied` reflects whether a mutation
+    // actually happened — not merely that --fix was passed. In human mode
+    // apply_fixes prints its own progress after the findings, so order is kept.
+    let fix_applied = if opts.fix {
+        apply_fixes(env, &findings, &opts)?
+    } else {
+        false
+    };
+
+    if opts.json {
+        emit_json(&findings, fix_applied);
     }
 
     let exit = if findings.iter().any(|f| f.severity == Severity::Error) {
@@ -161,13 +168,15 @@ fn emit_json(findings: &[Finding], fix: bool) {
     println!("{}", serde_json::to_string_pretty(&v).expect("serialize"));
 }
 
-fn apply_fixes(env: &Env, findings: &[Finding], opts: &Options) -> Result<()> {
+/// Apply the auto-fixable findings. Returns whether the config was actually
+/// mutated (false when nothing is auto-fixable or the targets no longer exist).
+fn apply_fixes(env: &Env, findings: &[Finding], opts: &Options) -> Result<bool> {
     let auto: Vec<&Finding> = findings.iter().filter(|f| f.auto_fixable).collect();
     if auto.is_empty() {
         if !opts.json {
             println!("nothing auto-fixable.");
         }
-        return Ok(());
+        return Ok(false);
     }
     if !opts.force && process::claude_is_running() {
         bail!(
@@ -187,24 +196,28 @@ fn apply_fixes(env: &Env, findings: &[Finding], opts: &Options) -> Result<()> {
                 .and_then(|k| k.strip_prefix("projects."))
         })
         .collect();
-
-    if !prune_targets.is_empty() {
-        let mut config = ClaudeJson::load(&env.claude_json)?;
-        if let Some(map) = config.projects_mut() {
-            let before = map.len();
-            map.retain(|k, _| !prune_targets.contains(k.as_str()));
-            let removed = before - map.len();
-            let new_raw = claude_json::render(&config.data)?;
-            let backup_path = backup::timestamped_copy(&env.claude_json)?;
-            claude_json::write_atomic(&env.claude_json, &new_raw)?;
-            if !opts.json {
-                println!("pruned {removed} orphaned project entries.");
-                println!("backed up to {}", backup_path.display());
-            }
-        }
+    if prune_targets.is_empty() {
+        return Ok(false);
     }
 
-    Ok(())
+    let mut config = ClaudeJson::load(&env.claude_json)?;
+    let Some(map) = config.projects_mut() else {
+        return Ok(false);
+    };
+    let before = map.len();
+    map.retain(|k, _| !prune_targets.contains(k.as_str()));
+    let removed = before - map.len();
+    if removed == 0 {
+        return Ok(false);
+    }
+    let new_raw = claude_json::render(&config.data)?;
+    let backup_path = backup::timestamped_copy(&env.claude_json)?;
+    claude_json::write_atomic(&env.claude_json, &new_raw)?;
+    if !opts.json {
+        println!("pruned {removed} orphaned project entries.");
+        println!("backed up to {}", backup_path.display());
+    }
+    Ok(true)
 }
 
 // -- checks ------------------------------------------------------------------

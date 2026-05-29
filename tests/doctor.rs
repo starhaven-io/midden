@@ -241,6 +241,47 @@ fn flags_skill_directory_missing_skill_md() {
 }
 
 #[test]
+fn json_fix_applied_reflects_whether_a_mutation_happened() {
+    // Nothing auto-fixable -> fix_applied is false even though --fix was passed.
+    let fx = Fixture::new();
+    let live = fx.touch_dir("alive");
+    fx.write_config(json!({ &live: {} }), json!({}));
+    let project_settings = fx.root.path().join(".claude/settings.json");
+    write_json(
+        &project_settings,
+        &json!({ "permissions": { "deny": ["Read(./.env)", "Read(./.env.*)", "Read(./secrets/**)"] } }),
+    );
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("doctor")
+        .arg(fx.root.path())
+        .arg("--fix")
+        .arg("--force")
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["fix_applied"], json!(false), "no auto-fixable findings");
+
+    // An orphan present -> fix_applied is true.
+    let fx2 = Fixture::new();
+    let live2 = fx2.touch_dir("alive");
+    fx2.write_config(json!({ &live2: {}, "/missing": {} }), json!({}));
+    let out2 = fx2
+        .cmd()
+        .arg("--json")
+        .arg("doctor")
+        .arg(fx2.root.path())
+        .arg("--fix")
+        .arg("--force")
+        .output()
+        .unwrap();
+    let v2: Value = serde_json::from_slice(&out2.stdout).unwrap();
+    assert_eq!(v2["fix_applied"], json!(true), "orphan pruned");
+}
+
+#[test]
 fn json_output_emits_findings_array() {
     let fx = Fixture::new();
     let live = fx.touch_dir("alive");
