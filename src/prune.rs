@@ -26,19 +26,15 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     }
 
     let config = ClaudeJson::load(path)?;
-    let total = match config.projects() {
-        Some(p) => p.len(),
-        None => {
-            if opts.json {
-                println!("{}", json!({"total": 0, "orphans": [], "removed": false}));
-            } else {
-                println!("no 'projects' map found; nothing to do");
-            }
-            return Ok(ExitCode::SUCCESS);
+    let Some(projects) = config.projects() else {
+        if opts.json {
+            println!("{}", json!({"total": 0, "orphans": [], "removed": false}));
+        } else {
+            println!("no 'projects' map found; nothing to do");
         }
+        return Ok(ExitCode::SUCCESS);
     };
-
-    let projects = config.projects().expect("checked above");
+    let total = projects.len();
     let orphans = orphans::find(projects, opts.worktrees_only);
 
     if orphans.is_empty() {
