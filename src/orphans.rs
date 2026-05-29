@@ -38,6 +38,15 @@ pub fn counts(orphans: &[Orphan]) -> (usize, usize) {
     (wt, orphans.len() - wt)
 }
 
+/// Whether a removal set this large relative to the total looks less like
+/// genuine orphans and more like running on the wrong machine or against an
+/// unmounted volume (where every recorded absolute path resolves missing).
+/// Existence alone can't distinguish the two, so mass deletions are gated
+/// behind `--force`.
+pub fn looks_like_wrong_host(removing: usize, total: usize) -> bool {
+    total >= 5 && removing * 100 >= total * 90
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,6 +99,15 @@ mod tests {
         let orphans = find(&projects, true);
         assert_eq!(orphans.len(), 1);
         assert!(orphans[0].is_worktree);
+    }
+
+    #[test]
+    fn wrong_host_heuristic() {
+        assert!(!looks_like_wrong_host(3, 4), "small total never trips");
+        assert!(!looks_like_wrong_host(4, 10), "40% is normal");
+        assert!(!looks_like_wrong_host(0, 10), "nothing missing");
+        assert!(looks_like_wrong_host(9, 10), "90% missing");
+        assert!(looks_like_wrong_host(10, 10), "all missing");
     }
 
     #[test]

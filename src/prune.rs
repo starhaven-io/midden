@@ -132,6 +132,25 @@ fn preview_pruned(config: &ClaudeJson, orphans: &[orphans::Orphan]) -> Result<St
 /// re-created since detection is not pruned. Backs up, then writes atomically.
 /// Returns (backup path, entries removed, bytes after).
 fn apply_prune(env: &Env, opts: &Options) -> Result<(PathBuf, usize, usize)> {
+    let mut config = ClaudeJson::load(&env.claude_json)?;
+    let total = config.projects().map(|p| p.len()).unwrap_or(0);
+    let drop: BTreeSet<String> = match config.projects() {
+        Some(projects) => orphans::find(projects, opts.worktrees_only)
+            .into_iter()
+            .map(|o| o.path)
+            .collect(),
+        None => BTreeSet::new(),
+    };
+
+    if !opts.force && orphans::looks_like_wrong_host(drop.len(), total) {
+        bail!(
+            "{} of {} project entries resolve missing — this usually means you are on a \
+             different machine or an unmounted volume, not that they are all dead. \
+             Re-run with --force to prune them anyway.",
+            drop.len(),
+            total
+        );
+    }
     if !opts.force && process::claude_is_running() {
         bail!(
             "a `claude` process is running — quit it first, or pass --force \
@@ -140,14 +159,6 @@ fn apply_prune(env: &Env, opts: &Options) -> Result<(PathBuf, usize, usize)> {
         );
     }
 
-    let mut config = ClaudeJson::load(&env.claude_json)?;
-    let drop: BTreeSet<String> = match config.projects() {
-        Some(projects) => orphans::find(projects, opts.worktrees_only)
-            .into_iter()
-            .map(|o| o.path)
-            .collect(),
-        None => BTreeSet::new(),
-    };
     let removed = match config.projects_mut() {
         Some(map) => {
             let before = map.len();

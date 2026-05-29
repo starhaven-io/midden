@@ -2,7 +2,7 @@ mod common;
 
 use common::{Fixture, standard_extras, standard_projects};
 use predicates::str::contains;
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[test]
 fn dry_run_lists_orphans_and_writes_nothing() {
@@ -120,6 +120,42 @@ fn worktrees_only_skips_non_worktree_orphans() {
         !projects.contains_key("/Users/x/proj/.claude/worktrees/witty-curie/checkout"),
         "worktree orphan should be pruned"
     );
+}
+
+#[test]
+fn refuses_mass_deletion_without_force() {
+    let fx = Fixture::new();
+    let live = fx.touch_dir("live");
+    let mut projects = serde_json::Map::new();
+    projects.insert(live, json!({}));
+    for i in 0..9 {
+        projects.insert(format!("/gone/{i}"), json!({}));
+    }
+    fx.write_config(Value::Object(projects), standard_extras());
+
+    // 9 of 10 entries resolve missing (>=90%). The mass-deletion guard is
+    // checked before the running-claude gate, so this is deterministic in CI
+    // regardless of whether a real claude process happens to be running.
+    fx.cmd()
+        .arg("prune")
+        .arg("--apply")
+        .assert()
+        .failure()
+        .stderr(contains("different machine"));
+    assert!(
+        fx.backup_paths().is_empty(),
+        "must not write when the mass-deletion guard refuses"
+    );
+
+    // --force overrides the guard.
+    fx.cmd()
+        .arg("prune")
+        .arg("--apply")
+        .arg("--force")
+        .assert()
+        .success();
+    let after = fx.read_config();
+    assert_eq!(after["projects"].as_object().unwrap().len(), 1);
 }
 
 #[test]

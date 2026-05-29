@@ -201,6 +201,16 @@ fn apply_fixes(env: &Env, findings: &[Finding], opts: &Options) -> Result<bool> 
     }
 
     let mut config = ClaudeJson::load(&env.claude_json)?;
+    let total = config.projects().map(|p| p.len()).unwrap_or(0);
+    if !opts.force && orphans::looks_like_wrong_host(prune_targets.len(), total) {
+        bail!(
+            "{} of {} project entries resolve missing — this usually means you are on a \
+             different machine or an unmounted volume, not that they are all dead. \
+             Re-run with --force to prune them anyway.",
+            prune_targets.len(),
+            total
+        );
+    }
     let Some(map) = config.projects_mut() else {
         return Ok(false);
     };
