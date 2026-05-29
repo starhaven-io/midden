@@ -110,7 +110,10 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     let (backup_path, removed, _) = apply_prune(env, &opts)?;
     println!();
     println!("backed up to {}", backup_path.display());
-    println!("removed {removed} entries from {}", env.claude_json.display());
+    println!(
+        "removed {removed} entries from {}",
+        env.claude_json.display()
+    );
     Ok(ExitCode::SUCCESS)
 }
 

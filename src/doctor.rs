@@ -390,7 +390,9 @@ fn check_secrets_in_committed_settings(
     // gitignoring .claude/ wholesale. When git can't tell (not a repo, no git),
     // fall through and flag it, as before. settings.local.json is covered
     // separately by check_local_settings_in_git.
-    let rel = settings.strip_prefix(&project.root).unwrap_or(settings.as_path());
+    let rel = settings
+        .strip_prefix(&project.root)
+        .unwrap_or(settings.as_path());
     if git::is_ignored(&project.root, rel) == Some(true) {
         return Ok(());
     }
