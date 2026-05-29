@@ -5,7 +5,10 @@ on:
 
 defaults:
   run:
-    shell: bash -xeuo pipefail {0}
+    # No -x: this workflow handles signing/notarization secrets, and xtrace
+    # would echo runner-generated values (e.g. the temporary keychain password)
+    # into public build logs, which GitHub only masks for registered secrets.
+    shell: bash -euo pipefail {0}
 
 concurrency:
   group: release
