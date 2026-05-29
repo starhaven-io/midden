@@ -1,124 +1,89 @@
-# midden — Claude Project Context
+# midden — Claude project brief
 
-midden is a CLI for resolving, auditing, and garbage-collecting the state Claude Code accumulates. It exists because Claude Code writes a lot — `~/.claude.json`'s `projects` map grows forever, settings sprawl across four scopes with non-obvious precedence, ephemeral worktrees pile up, MCP servers and skills and slash commands and subagents live in their own places — and almost nothing has a lifecycle.
+midden is a Rust CLI for resolving, auditing, and garbage-collecting the state Claude Code accumulates. Claude Code writes a lot and prunes almost none of it: `~/.claude.json`'s `projects` map grows on every visit, settings sprawl across four scopes with non-obvious precedence, ephemeral worktrees pile up, and MCP servers / skills / commands / subagents each live in their own place. midden does the three things other tools don't: **resolve** (what's active for a directory, with provenance), **audit** (what's stale, misconfigured, or leaking), **clean** (GC what Claude Code never prunes). It is deliberately *not* another MCP-server-list editor.
 
-The product is deliberately not another MCP-server list editor. The three things nobody else does well are: **resolve** (what's actually active for this directory, with provenance), **audit** (what's stale, misconfigured, or leaking), **clean** (GC the state Claude Code writes but never prunes).
+## Facts
 
-## Project overview
+- **Language:** Rust, 2024 edition, MSRV 1.88.
+- **Platforms:** macOS and Linux. Windows is out of scope for v0 (a `cfg(windows)` branch may exist but is untested/unsupported).
+- **License:** AGPL-3.0-only.
+- **Binary:** one CLI; subcommands `prune`, `doctor`, `show`, plus `completions` for shell completion.
+- **Deps:** clap/clap_complete, serde/serde_json (with `preserve_order`), walkdir, globset, colored, anyhow, time, sysinfo. Error handling is anyhow throughout — there are no `thiserror` types.
 
-- **Language:** Rust (2024 edition)
-- **Platform:** macOS, Linux (Windows out of scope for v0)
-- **Architecture:** Single binary CLI with three subcommands (`prune`, `doctor`, `show`)
-- **License:** AGPL-3.0-only
-- **Dependencies:** clap/clap_complete (CLI), serde/serde_json with `preserve_order` (config parsing), walkdir (file discovery), globset (path patterns), colored (terminal output), time (timestamped backups), sysinfo (running-process detection)
+## Commands
 
-## Repository structure
+- `prune [--apply] [--worktrees-only] [--force]` — GC dead `projects` entries from `~/.claude.json`. Dry-run by default; removes only entries whose directory is provably absent. `--apply` backs up then writes; `--worktrees-only` restricts to `.claude/worktrees/` paths; `--force` overrides the write gates.
+- `doctor [PATH] [--fix] [--force] [--show-secrets]` — emit structured `Finding { id, severity, location, message, suggested_fix, auto_fixable }`. `--fix` applies the `auto_fixable` findings under the same backup + atomic-write discipline as prune (today only `orphaned-project` is auto-fixable). See the README for the full check list.
+- `show [PATH] [--show-secrets]` — resolve every config surface for a directory with provenance: settings (with shadow/merge tags), every contributing `CLAUDE.md`, skills, commands, subagents, hooks, MCP servers, worktrees.
 
-```
-midden/
-├── Cargo.toml
-├── src/
-│   ├── main.rs              # Entry point, clap CLI definition, command dispatch
-│   ├── prune.rs             # Prune command — GC orphaned `projects` entries
-│   ├── doctor.rs            # Doctor command — structured Finding lint
-│   ├── show.rs              # Show command — multi-scope resolver with provenance
-│   ├── orphans.rs           # Orphan detection, reusable by prune + doctor
-│   ├── claude_json.rs       # ~/.claude.json read/render (preserves key order)
-│   ├── paths.rs             # Path helpers (user + project + managed scopes)
-│   ├── backup.rs            # Timestamped sibling copy before any write
-│   ├── process.rs           # Detect a running `claude` for the write-safety gate
-│   ├── secrets.rs           # Mask suspect keys (token, api_key, password…)
-│   └── output.rs            # Small presentation helpers (KB formatting)
-├── tests/
-│   ├── common/mod.rs        # Fixture helpers shared across integration tests
-│   ├── prune.rs             # Prune integration tests (incl. acceptance)
-│   ├── doctor.rs            # Doctor integration tests
-│   └── show.rs              # Show integration tests
-├── scripts/
-│   └── format-release-notes.py  # Categorize gh-generated release notes by conventional commit type
-├── .github/
-│   ├── workflows/           # CI, CodeQL, zizmor, release, link-check, dependabot lockfile refresh, cargo-tools bump, pinprick-audit
-│   ├── dependabot.yml       # Cargo + Actions dependency updates
-│   └── FUNDING.yml
-├── justfile                 # Task runner (build, test, lint, check)
-├── rustfmt.toml             # 2024 style edition
-├── deny.toml                # cargo-deny config
-├── lychee.toml              # Link checker config
-├── _typos.toml              # typos-cli config
-└── .gitignore
-```
+Global flags: `--json` (machine output; disables color), `--color auto|always|never`, `--config <PATH>` (override `~/.claude.json`), `--claude-home <PATH>` (override `~/.claude`). The two override flags exist for testing — integration tests point them at fixture dirs.
 
-## Architecture
+## Architecture (`src/`, flat modules — no nested dirs)
 
-### Commands
+- `main.rs` — clap CLI definition and dispatch.
+- `prune.rs` — prune command.
+- `doctor.rs` — doctor command: the `Finding` lint and its checks.
+- `show.rs` — show command. `resolve_settings` is the single source of truth for settings precedence + provenance.
+- `orphans.rs` — orphan detection (shared by prune + doctor) and `looks_like_wrong_host` (the mass-deletion heuristic).
+- `claude_json.rs` — read/render `~/.claude.json` (order-preserving) and `write_atomic`.
+- `paths.rs` — user/project/managed path helpers. `managed_settings_paths()` are hardcoded system paths (not overridable — so managed-scope file discovery isn't reachable from integration tests yet).
+- `backup.rs` — timestamped sibling copy taken before any write.
+- `process.rs` — detect a running `claude` process for the write gate.
+- `secrets.rs` — sensitive-key detection (`key_looks_sensitive`) and masking (`mask`, `mask_value`).
+- `git.rs` — `is_tracked` / `is_ignored` via the `git` CLI; both return `None` when git is unavailable or the path isn't in a repo.
+- `output.rs` — KB formatting.
 
-- `midden prune [--apply] [--worktrees-only] [--force]` — garbage-collect dead `projects` entries from `~/.claude.json`. Dry-run by default. Removes only entries whose directory is provably absent. `--apply` writes a timestamped backup, then mutates. `--worktrees-only` restricts to `.claude/worktrees/`-pathed entries. `--force` allows writing while `claude` is running.
-- `midden doctor [PATH] [--fix] [--force] [--show-secrets]` — emits structured `Finding { id, severity, location, message, suggested_fix, auto_fixable }`. Starter checks: orphaned `projects` entries, oversized `.claude.json`, stale worktree directories, secrets in committed `settings.json` (masked by default), `settings.local.json` that git tracks or doesn't ignore, missing credential `permissions.deny` coverage, broken/disabled MCP servers, skill directories without `SKILL.md`, empty command/agent files. `--fix` applies the `auto_fixable: true` findings under the same backup discipline as prune.
-- `midden show [PATH] [--show-secrets]` — resolves every config surface for a target directory with provenance. Settings: scalars override (highest scope wins, lowers marked `shadowed`); arrays concat + dedupe across scopes. Lists every contributing `CLAUDE.md` (user, project, ancestor, local, nested) and runs a heuristic contradiction-detection pass. Lists skills, slash commands, subagents, MCP servers, worktrees.
+Tests: `tests/{prune,doctor,show}.rs` (integration, via `assert_cmd`) + `tests/common/mod.rs` (the `Fixture` helper) + `#[cfg(test)]` unit modules in `src/`.
 
-### Global flags
+## Settings precedence (the `show` model)
 
-- `--json` — Output as JSON for CI integration. Auto-disables color.
-- `--color auto|always|never` — Control color output.
-- `--config <PATH>` — Override `~/.claude.json` location (testing).
-- `--claude-home <PATH>` — Override `~/.claude` location (testing).
-- `--version` / `-V` — Print version.
+`settings.json`, highest scope to lowest: **Managed → Local → Project → User**. Scalars: highest scope wins, lower contributions are tagged `shadowed`. Arrays: concatenate + dedupe across all scopes (no shadowing). This mirrors Claude Code's documented behavior — arrays merge, scalars override, objects deep-merge — and Managed cannot be overridden. `resolve_settings` in `show.rs` is the single source of truth; keep it so.
 
-### Settings precedence
+There is **no** "command-line args" settings scope — the `Scope` enum is exactly `User | Project | Local | Managed`.
 
-For `settings.json`, precedence from highest to lowest is **Managed → command-line args → Local → Project → User**. Scalars from a higher scope override lower ones. Arrays concatenate and deduplicate across scopes. Managed settings cannot be overridden by anything.
+## CLAUDE.md handling
 
-`show` faithfully implements this precedence and tracks provenance per dotted key path. The `resolve_settings` function in `src/show.rs` is the single source of truth.
+CLAUDE.md does **not** follow settings precedence. All applicable files load simultaneously; midden does a no-precedence merge and runs a heuristic contradiction-detection pass instead of picking a winner. The one ordering exception: `CLAUDE.local.md` loads after `CLAUDE.md` in the same directory.
 
-### CLAUDE.md handling
+## Safety discipline (do not weaken without discussion)
 
-CLAUDE.md does **not** follow the same precedence model. All applicable CLAUDE.md files load simultaneously and conflicts are not resolved by precedence. midden treats this as a no-precedence merge and runs a contradiction-detection pass instead of picking a winner. The only documented exception is that `CLAUDE.local.md` loads after `CLAUDE.md` in the same directory.
+- **Read-only by default.** Mutation requires an explicit flag (`--apply` / `--fix`).
+- **Backup before every write.** `backup::timestamped_copy` writes a `.bak-YYYYMMDD-HHMMSS` sibling (suffix-bumped on a same-second collision) before any mutation.
+- **Atomic writes.** `claude_json::write_atomic` streams to a temp sibling, fsyncs, then renames over the target — never an in-place truncating write of `~/.claude.json`.
+- **Running-`claude` gate.** Refuses to write while a `claude` process runs (Claude Code rewrites the file live). `--force` overrides.
+- **Mass-deletion gate.** Refuses to prune when ≥90% of a non-trivial `projects` map resolves missing — that usually means the wrong host or an unmounted volume, not real orphans. `--force` overrides.
+- **Conservative deletion.** Removes only entries whose directory is provably absent; never guesses from value contents. Apply re-reads and re-derives immediately before writing, so concurrent edits to unrelated keys survive.
+- **Mask secrets by default.** Sensitive-named keys (`token`, `secret`, `password`, `apikey`, `auth`, `credential`, …) have their string values masked — including strings nested in arrays/objects under such a key. `--show-secrets` opts out.
+- `doctor`'s `secret-in-committed-settings` (the only `Error`) is suppressed for git-ignored files.
+- **`--json` on every command** for CI/scripting.
 
-### Safety discipline
+## Build / test / lint
 
-- **Read-only by default.** Every write requires an explicit flag (`--apply` or `--fix`).
-- **Timestamped backup before any mutation.** `backup::timestamped_copy` writes `<file>.bak-YYYYMMDD-HHMMSS` next to the original.
-- **Refuses to write if a `claude` process is running.** Claude Code rewrites `~/.claude.json` live and may stomp our changes. `--force` overrides.
-- **Conservative deletion.** Prune removes only `projects` entries whose directory is provably absent. Never guesses from value contents.
-- **Mask secrets by default.** Suspect key names (token, secret, password, apikey, auth, credential…) have their string values masked to `abcd***`. `--show-secrets` opts in.
-- **`--json` on every command** for scripting and CI.
+`just` recipes (raw command in parens):
+- `just build` / `just test` (`cargo build` / `cargo test`)
+- `just clippy` — `cargo clippy --all-targets -- -D warnings` (zero warnings required)
+- `just fmt` / `just fmt-check` — rustfmt, 2024 style edition (`rustfmt.toml`)
+- `just typos`, `just deny` (`cargo deny check`), `just lychee`, `just audit` (zizmor)
+- `just check` — run everything; skips tools that aren't installed
 
-### Exit codes
+## Exit codes
 
-- `0` — clean (no findings, no orphans, or successful apply)
-- `1` — findings present (doctor with errors)
-- `2` — error (bad input, file not found, write blocked by running claude)
+`0` clean / successful apply · `1` doctor found an `Error`-severity finding · `2` error (bad input, missing file, or a write blocked by a gate).
 
-## Code style and conventions
+## Conventions
 
-- `cargo clippy --all-targets -- -D warnings` with zero warnings
-- `cargo fmt` for formatting (2024 style edition, see `rustfmt.toml`)
-- Flat module structure, no nested directories
-- `thiserror` for typed errors in library code, `anyhow` for context-rich error propagation in commands
-- Comments only when the *why* is non-obvious; let well-named identifiers explain the *what*
+- Conventional Commits: `type(scope): description` (feat, fix, refactor, docs, ci, chore, perf, test, style, build). The PR title and every commit are checked in CI.
+- Every commit: `git commit -s` (DCO) plus a `Co-authored-by: Claude Opus 4.8 <noreply@anthropic.com>` trailer when authored with Claude.
+- Never commit to `main` — branch and open a PR. PR descriptions contain a summary of changes only: no test plans, no bot footers.
+- Errors: anyhow throughout (`Result`, `.with_context`, `bail!`). Flat modules. Comments explain *why*, not *what*.
 
-## CI workflows (.github/workflows/)
+## Gotchas
 
-- **ci.yml** — Dynamic matrix PR checks: conventional commits, lint (clippy + rustfmt + typos + deny), test (Linux, Linux ARM, macOS), zizmor on workflow changes
-- **codeql.yml** — CodeQL Actions analysis on push to main
-- **zizmor.yml** — GitHub Actions security audit on push to main
-- **pinprick-audit.yml** — Run pinprick on midden's own workflows with SARIF upload (dogfooding)
-- **link-check.yml** — Weekly lychee scan of README links
-- **release.yml** — Manual dispatch: cross-platform binaries (linux-amd64, linux-arm64, darwin-arm64) with macOS signing + notarization, build provenance attestations, GitHub release with formatted notes, crates.io publish, Homebrew cask bump
-- **bump-cargo-tools.yml** — Weekly: scan crates.io for newer versions of `typos-cli` and `cargo-deny`, open a PR if any are stale
-- **refresh-cargo-lockfile.yml** — Weekly `cargo update` to pick up transitive bumps Dependabot ignores
+- `~/.claude.json` is the central, live file Claude Code rewrites constantly — the highest-stakes thing midden touches. All mutations go through backup → atomic write → the running-claude gate.
+- Orphan detection is existence-only (`Path::is_dir`); "not visible on this host" ≠ "dead", which is why the mass-deletion gate exists.
+- `git.rs` shells out; treat `None` as "can't tell" (not a repo / no git), never as "false".
+- Integration tests isolate `HOME`, `XDG_CONFIG_HOME`, and `GIT_CONFIG_NOSYSTEM` so a developer's global gitignore can't sway doctor's git checks — preserve that in `tests/common/mod.rs`.
 
-## Commit conventions
+## CI (`.github/workflows/`)
 
-Conventional Commits format: `type(scope): description`
-
-Common types: `feat`, `fix`, `refactor`, `docs`, `ci`, `chore`, `perf`, `test`, `style`, `build`
-
-All commits must:
-- Use `git commit -s` for DCO sign-off
-- Include a `Co-authored-by: Claude Opus 4.8 <noreply@anthropic.com>` trailer when authored with Claude
-
-## Git workflow
-
-- Never commit directly to main — always create a feature branch and open a PR
-- PR descriptions should contain only a summary of the changes — no test plan sections, no bot attribution, no "Generated with Claude Code" footers
+`ci.yml` (dynamic matrix: conventional-commit check, lint, test on Linux/Linux-ARM/macOS, coverage to Codecov, zizmor on workflow changes); `release.yml` (manual dispatch: cross-platform signed + notarized binaries, build-provenance attestation, crates.io publish via OIDC, Homebrew cask bump); `codeql.yml`, `zizmor.yml`, `pinprick-audit.yml` (dogfood), `link-check.yml`; weekly `bump-cargo-tools.yml` and `refresh-cargo-lockfile.yml`. Third-party actions are SHA-pinned and workflows are least-privilege (`permissions: {}` at the top, granted per-job). `release.yml` deliberately omits shell `-x` so secrets don't leak into public logs.
