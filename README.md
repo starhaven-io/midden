@@ -41,7 +41,7 @@ cargo install --git https://github.com/starhaven-io/midden
 
 ## Usage
 
-All commands default to safe modes: dry-run for prune, read-only for show, and report-only for doctor. Writes always require an explicit flag and always create a timestamped backup first. Use `--json` for machine-readable output.
+All commands default to safe modes: dry-run for prune, read-only for show, and report-only for doctor. Writes always require an explicit flag, create a timestamped backup first, and replace the file atomically. Use `--json` for machine-readable output.
 
 ```bash
 # Show what's actually active for a directory with provenance
@@ -149,7 +149,7 @@ dry run. re-run with --apply to remove these entries.
 quit all Claude Code sessions first; it rewrites this file live.
 ```
 
-An entry is a removal candidate only if its directory is provably absent from disk. midden never guesses from value contents. `--worktrees-only` restricts to entries under a `.claude/worktrees/` path.
+An entry is a removal candidate only if its directory is provably absent from disk. midden never guesses from value contents. `--worktrees-only` restricts to entries under a `.claude/worktrees/` path. If nearly all entries resolve missing — usually a sign you are on a different machine or an unmounted volume rather than that they are all dead — `prune --apply` refuses unless you pass `--force`.
 
 ## What doctor checks
 
@@ -158,7 +158,7 @@ An entry is a removal candidate only if its directory is provably absent from di
 | `orphaned-project` | Warn | yes | `projects` entry whose directory no longer exists |
 | `claude-json-bloat` | Info | no | `~/.claude.json` over 512 KB (Claude Code never prunes it) |
 | `stale-worktree` | Info | no | Ephemeral worktree dir untouched for >30 days |
-| `secret-in-committed-settings` | Error | no | Suspect key holding a string value in committed `settings.json` |
+| `secret-in-committed-settings` | Error | no | Suspect secret in a `settings.json` that git doesn't ignore (masked by default) |
 | `local-settings-tracked` | Warn | no | `settings.local.json` tracked by git (meant to stay machine-local) |
 | `local-settings-not-ignored` | Warn | no | `settings.local.json` not gitignored — one `git add` from being committed |
 | `missing-credential-deny` | Warn | no | No `permissions.deny` covers `.env` or `secrets/` paths |
@@ -178,7 +178,7 @@ midden does not yet have a config file — all behavior is controlled by CLI fla
 | `--json` | Emit machine-readable JSON instead of styled text |
 | `--color auto\|always\|never` | Control color output |
 | `--show-secrets` | Unmask secret-looking values in `show` / `doctor` output |
-| `--force` | Allow writes (`prune --apply`, `doctor --fix`) while a `claude` process is running |
+| `--force` | Allow writes while a `claude` process is running, and override the mass-deletion guard |
 
 ## Exit codes
 

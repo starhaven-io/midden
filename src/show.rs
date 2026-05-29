@@ -73,13 +73,19 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
                 sources.push((Scope::Managed, managed, v));
             }
         } else if managed.is_dir() {
-            // Drop-in directory: merge each *.json file inside.
+            // Drop-in directory: merge each *.json file inside. Sort the paths
+            // first — read_dir order is unspecified, and for equal-scope sources
+            // the last one wins a scalar, so an unsorted read would make the
+            // resolved winner nondeterministic across runs and machines.
             if let Ok(entries) = std::fs::read_dir(&managed) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.extension().and_then(|e| e.to_str()) == Some("json")
-                        && let Some(v) = read_json(&p)
-                    {
+                let mut paths: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+                    .collect();
+                paths.sort();
+                for p in paths {
+                    if let Some(v) = read_json(&p) {
                         sources.push((Scope::Managed, p, v));
                     }
                 }
@@ -106,9 +112,9 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     if !opts.show_secrets {
         for r in &mut resolved {
             if path_looks_sensitive(&r.key) {
-                r.effective = mask_value_in_place(r.effective.clone());
+                secrets::mask_value(&mut r.effective);
                 for c in &mut r.contributions {
-                    c.value = mask_value_in_place(c.value.clone());
+                    secrets::mask_value(&mut c.value);
                 }
             }
         }
@@ -237,19 +243,6 @@ fn path_looks_sensitive(dotted: &str) -> bool {
         .next()
         .is_some_and(secrets::key_looks_sensitive)
         || secrets::key_looks_sensitive(dotted)
-}
-
-fn mask_value_in_place(mut v: Value) -> Value {
-    match &mut v {
-        Value::String(s) => {
-            *s = secrets::mask(s);
-        }
-        Value::Object(_) | Value::Array(_) => {
-            secrets::mask_value(&mut v);
-        }
-        _ => {}
-    }
-    v
 }
 
 #[derive(Debug, Serialize)]

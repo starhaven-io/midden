@@ -108,6 +108,52 @@ fn show_masks_secret_settings_by_default() {
 }
 
 #[test]
+fn show_masks_secret_arrays_by_default() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let user_settings = fx.claude_home.join("settings.json");
+    // A sensitive-named key holding an array of secrets must be masked, not
+    // printed verbatim (regression guard for the array-masking leak).
+    write_json(
+        &user_settings,
+        &json!({ "apiKeys": ["sk-real-secret-aaaa", "sk-real-secret-bbbb"] }),
+    );
+
+    let out = fx.cmd().arg("show").arg(fx.root.path()).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("apiKeys"), "stdout:\n{stdout}");
+    assert!(
+        !stdout.contains("sk-real-secret-aaaa") && !stdout.contains("sk-real-secret-bbbb"),
+        "array secret leaked unmasked:\n{stdout}"
+    );
+    assert!(stdout.contains("sk-r***"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn show_secrets_flag_unmasks() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let user_settings = fx.claude_home.join("settings.json");
+    write_json(
+        &user_settings,
+        &json!({ "apiKeys": ["sk-real-secret-aaaa"] }),
+    );
+
+    let out = fx
+        .cmd()
+        .arg("show")
+        .arg(fx.root.path())
+        .arg("--show-secrets")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("sk-real-secret-aaaa"),
+        "--show-secrets should unmask:\n{stdout}"
+    );
+}
+
+#[test]
 fn show_lists_claude_md_files_and_flags_contradictions() {
     let fx = Fixture::new();
     fx.write_config(json!({}), json!({}));

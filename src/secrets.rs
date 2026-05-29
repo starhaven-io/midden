@@ -1,4 +1,4 @@
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 /// Keys whose values are masked unless `--show-secrets` is set.
 ///
@@ -36,32 +36,16 @@ pub fn mask(s: &str) -> String {
     }
 }
 
-/// Walk a JSON value and mask any string under a key that looks sensitive.
-/// Non-string sensitive values (e.g. `{"token": {"value": "..."}}`) get their
-/// strings masked recursively under the suspect subtree.
+/// Mask every string anywhere inside `value`. Callers invoke this only once a
+/// key is already known sensitive, so the entire subtree must be masked —
+/// including bare strings inside arrays (e.g. `apiKeys: ["sk-…"]`), which have
+/// no key of their own and would otherwise leak through unmasked.
 pub fn mask_value(value: &mut Value) {
-    mask_inner(value, false);
-}
-
-fn mask_inner(value: &mut Value, mask_all: bool) {
     match value {
-        Value::Object(map) => mask_object(map, mask_all),
-        Value::Array(arr) => {
-            for v in arr {
-                mask_inner(v, mask_all);
-            }
-        }
-        Value::String(s) if mask_all => {
-            *s = mask(s);
-        }
+        Value::String(s) => *s = mask(s),
+        Value::Array(arr) => arr.iter_mut().for_each(mask_value),
+        Value::Object(map) => map.values_mut().for_each(mask_value),
         _ => {}
-    }
-}
-
-fn mask_object(map: &mut Map<String, Value>, mask_all: bool) {
-    for (k, v) in map.iter_mut() {
-        let sensitive = mask_all || key_looks_sensitive(k);
-        mask_inner(v, sensitive);
     }
 }
 
@@ -90,27 +74,29 @@ mod tests {
     }
 
     #[test]
-    fn mask_value_masks_strings_under_suspect_keys() {
+    fn mask_value_masks_every_string_in_subtree() {
+        // Callers gate this on an already-sensitive key, so every string under
+        // it is masked — including array elements, the case that used to leak.
         let mut v = json!({
-            "name": "fine",
-            "apiKey": "sk-secret-12345",
+            "scalar": "sk-secret-12345",
             "nested": { "GITHUB_TOKEN": "ghp_aaaaaaaa" },
-            "items": [{ "secret": "shhh-very-long" }]
+            "list": ["sk-one-aaaa", "sk-two-bbbb"],
+            "count": 7
         });
         mask_value(&mut v);
-        assert_eq!(v["name"], "fine");
-        assert_eq!(v["apiKey"], "sk-s***");
+        assert_eq!(v["scalar"], "sk-s***");
         assert_eq!(v["nested"]["GITHUB_TOKEN"], "ghp_***");
-        assert_eq!(v["items"][0]["secret"], "shhh***");
+        assert_eq!(v["list"][0], "sk-o***");
+        assert_eq!(v["list"][1], "sk-t***");
+        // Non-string leaves are left untouched.
+        assert_eq!(v["count"], 7);
     }
 
     #[test]
-    fn mask_value_recurses_into_suspect_subtree() {
-        let mut v = json!({
-            "credentials": { "alpha": "secret-alpha", "beta": "secret-beta" }
-        });
+    fn mask_value_masks_a_bare_string_array() {
+        let mut v = json!(["sk-real-aaaa", "sk-real-bbbb"]);
         mask_value(&mut v);
-        assert_eq!(v["credentials"]["alpha"], "secr***");
-        assert_eq!(v["credentials"]["beta"], "secr***");
+        assert_eq!(v[0], "sk-r***");
+        assert_eq!(v[1], "sk-r***");
     }
 }

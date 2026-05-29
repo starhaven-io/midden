@@ -2,7 +2,7 @@ mod common;
 
 use common::{Fixture, standard_extras, standard_projects};
 use predicates::str::contains;
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[test]
 fn dry_run_lists_orphans_and_writes_nothing() {
@@ -72,6 +72,31 @@ fn apply_removes_orphans_keeps_live_and_extras_intact() {
 }
 
 #[test]
+fn backup_is_a_faithful_copy_of_the_pre_apply_config() {
+    let fx = Fixture::new();
+    let live = fx.touch_dir("live-project");
+    fx.write_config(standard_projects(&live), standard_extras());
+    let before = std::fs::read_to_string(&fx.config).unwrap();
+
+    fx.cmd()
+        .arg("prune")
+        .arg("--apply")
+        .arg("--force")
+        .assert()
+        .success();
+
+    let backups = fx.backup_paths();
+    assert_eq!(backups.len(), 1, "exactly one backup");
+    let backed_up = std::fs::read_to_string(&backups[0]).unwrap();
+    assert_eq!(
+        backed_up, before,
+        "backup must byte-match the pre-apply config (not a post-write copy)"
+    );
+    let after = std::fs::read_to_string(&fx.config).unwrap();
+    assert_ne!(after, before, "live config should have changed");
+}
+
+#[test]
 fn worktrees_only_skips_non_worktree_orphans() {
     let fx = Fixture::new();
     let live = fx.touch_dir("live-project");
@@ -98,6 +123,42 @@ fn worktrees_only_skips_non_worktree_orphans() {
 }
 
 #[test]
+fn refuses_mass_deletion_without_force() {
+    let fx = Fixture::new();
+    let live = fx.touch_dir("live");
+    let mut projects = serde_json::Map::new();
+    projects.insert(live, json!({}));
+    for i in 0..9 {
+        projects.insert(format!("/gone/{i}"), json!({}));
+    }
+    fx.write_config(Value::Object(projects), standard_extras());
+
+    // 9 of 10 entries resolve missing (>=90%). The mass-deletion guard is
+    // checked before the running-claude gate, so this is deterministic in CI
+    // regardless of whether a real claude process happens to be running.
+    fx.cmd()
+        .arg("prune")
+        .arg("--apply")
+        .assert()
+        .failure()
+        .stderr(contains("different machine"));
+    assert!(
+        fx.backup_paths().is_empty(),
+        "must not write when the mass-deletion guard refuses"
+    );
+
+    // --force overrides the guard.
+    fx.cmd()
+        .arg("prune")
+        .arg("--apply")
+        .arg("--force")
+        .assert()
+        .success();
+    let after = fx.read_config();
+    assert_eq!(after["projects"].as_object().unwrap().len(), 1);
+}
+
+#[test]
 fn clean_config_reports_no_action() {
     let fx = Fixture::new();
     let live = fx.touch_dir("only-live");
@@ -109,6 +170,66 @@ fn clean_config_reports_no_action() {
         .success()
         .stdout(contains("clean."));
     assert!(fx.backup_paths().is_empty());
+}
+
+#[test]
+fn apply_preserves_top_level_key_order() {
+    let fx = Fixture::new();
+    let live = fx.touch_dir("live-project");
+    fx.write_config(standard_projects(&live), standard_extras());
+
+    fx.cmd()
+        .arg("prune")
+        .arg("--apply")
+        .arg("--force")
+        .assert()
+        .success();
+
+    // Assert on the RAW written text — re-parsing with serde_json (which also
+    // has preserve_order) would mask a regression that dropped the feature.
+    let raw = std::fs::read_to_string(&fx.config).unwrap();
+    let pos = |needle: &str| {
+        raw.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle} in:\n{raw}"))
+    };
+    let (mcp, oauth, starts, projects) = (
+        pos("\"mcpServers\""),
+        pos("\"oauthAccount\""),
+        pos("\"numStartups\""),
+        pos("\"projects\""),
+    );
+    assert!(
+        mcp < oauth && oauth < starts && starts < projects,
+        "top-level key order not preserved (mcp={mcp} oauth={oauth} starts={starts} projects={projects}):\n{raw}"
+    );
+}
+
+#[test]
+fn errors_on_malformed_config() {
+    let fx = Fixture::new();
+    std::fs::write(&fx.config, "{ not valid json").unwrap();
+    fx.cmd()
+        .arg("prune")
+        .assert()
+        .failure()
+        .stderr(contains("parse"));
+}
+
+#[test]
+fn handles_config_without_projects_map() {
+    let fx = Fixture::new();
+    // Parseable, but no "projects" key (write_config always adds one, so write
+    // directly).
+    std::fs::write(
+        &fx.config,
+        serde_json::to_string_pretty(&json!({ "numStartups": 1 })).unwrap(),
+    )
+    .unwrap();
+    fx.cmd()
+        .arg("prune")
+        .assert()
+        .success()
+        .stdout(contains("no 'projects' map found"));
 }
 
 #[test]

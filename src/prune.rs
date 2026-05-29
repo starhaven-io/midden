@@ -26,19 +26,15 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     }
 
     let config = ClaudeJson::load(path)?;
-    let total = match config.projects() {
-        Some(p) => p.len(),
-        None => {
-            if opts.json {
-                println!("{}", json!({"total": 0, "orphans": [], "removed": false}));
-            } else {
-                println!("no 'projects' map found; nothing to do");
-            }
-            return Ok(ExitCode::SUCCESS);
+    let Some(projects) = config.projects() else {
+        if opts.json {
+            println!("{}", json!({"total": 0, "orphans": [], "removed": false}));
+        } else {
+            println!("no 'projects' map found; nothing to do");
         }
+        return Ok(ExitCode::SUCCESS);
     };
-
-    let projects = config.projects().expect("checked above");
+    let total = projects.len();
     let orphans = orphans::find(projects, opts.worktrees_only);
 
     if orphans.is_empty() {
@@ -58,8 +54,8 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     let saved = config.raw.len().saturating_sub(new_raw.len());
 
     if opts.json {
-        let backup = if opts.apply {
-            Some(apply_prune(env, &orphans, &new_raw, &opts)?)
+        let applied = if opts.apply {
+            Some(apply_prune(env, &opts)?)
         } else {
             None
         };
@@ -72,9 +68,9 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
                     "is_worktree": o.is_worktree,
                 })).collect::<Vec<_>>(),
                 "bytes_before": config.raw.len(),
-                "bytes_after": new_raw.len(),
-                "removed": backup.is_some(),
-                "backup": backup.as_ref().map(|p| p.display().to_string()),
+                "bytes_after": applied.as_ref().map(|(_, _, b)| *b).unwrap_or(new_raw.len()),
+                "removed": applied.is_some(),
+                "backup": applied.as_ref().map(|(p, _, _)| p.display().to_string()),
             })
         );
         return Ok(ExitCode::SUCCESS);
@@ -111,7 +107,13 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    apply_prune(env, &orphans, &new_raw, &opts)?;
+    let (backup_path, removed, _) = apply_prune(env, &opts)?;
+    println!();
+    println!("backed up to {}", backup_path.display());
+    println!(
+        "removed {removed} entries from {}",
+        env.claude_json.display()
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -124,12 +126,30 @@ fn preview_pruned(config: &ClaudeJson, orphans: &[orphans::Orphan]) -> Result<St
     claude_json::render(&new_data)
 }
 
-fn apply_prune(
-    env: &Env,
-    orphans: &[orphans::Orphan],
-    new_raw: &str,
-    opts: &Options,
-) -> Result<PathBuf> {
+/// Re-read the config immediately before writing — so a concurrent Claude Code
+/// rewrite of unrelated keys survives — and re-check existence so a directory
+/// re-created since detection is not pruned. Backs up, then writes atomically.
+/// Returns (backup path, entries removed, bytes after).
+fn apply_prune(env: &Env, opts: &Options) -> Result<(PathBuf, usize, usize)> {
+    let mut config = ClaudeJson::load(&env.claude_json)?;
+    let total = config.projects().map(|p| p.len()).unwrap_or(0);
+    let drop: BTreeSet<String> = match config.projects() {
+        Some(projects) => orphans::find(projects, opts.worktrees_only)
+            .into_iter()
+            .map(|o| o.path)
+            .collect(),
+        None => BTreeSet::new(),
+    };
+
+    if !opts.force && orphans::looks_like_wrong_host(drop.len(), total) {
+        bail!(
+            "{} of {} project entries resolve missing — this usually means you are on a \
+             different machine or an unmounted volume, not that they are all dead. \
+             Re-run with --force to prune them anyway.",
+            drop.len(),
+            total
+        );
+    }
     if !opts.force && process::claude_is_running() {
         bail!(
             "a `claude` process is running — quit it first, or pass --force \
@@ -138,16 +158,16 @@ fn apply_prune(
         );
     }
 
+    let removed = match config.projects_mut() {
+        Some(map) => {
+            let before = map.len();
+            map.retain(|k, _| !drop.contains(k));
+            before - map.len()
+        }
+        None => 0,
+    };
+    let new_raw = claude_json::render(&config.data)?;
     let backup_path = backup::timestamped_copy(&env.claude_json)?;
-    std::fs::write(&env.claude_json, new_raw)?;
-    if !opts.json {
-        println!();
-        println!("backed up to {}", backup_path.display());
-        println!(
-            "removed {} entries from {}",
-            orphans.len(),
-            env.claude_json.display()
-        );
-    }
-    Ok(backup_path)
+    claude_json::write_atomic(&env.claude_json, &new_raw)?;
+    Ok((backup_path, removed, new_raw.len()))
 }

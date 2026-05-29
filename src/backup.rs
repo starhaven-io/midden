@@ -9,7 +9,15 @@ use time::macros::format_description;
 /// be determined (some Linux distros, sandboxed environments).
 pub fn timestamped_copy(path: &Path) -> Result<PathBuf> {
     let stamp = stamp_now();
-    let backup = backup_path(path, &stamp);
+    // The stamp has one-second resolution, so two mutations in the same second
+    // (e.g. `prune --apply` then `doctor --fix`) would compute the same name and
+    // the second copy would clobber the first backup. Bump a suffix until free.
+    let mut backup = backup_path(path, &stamp);
+    let mut n = 1;
+    while backup.exists() {
+        backup = backup_path(path, &format!("{stamp}-{n}"));
+        n += 1;
+    }
     std::fs::copy(path, &backup)
         .with_context(|| format!("backup {} -> {}", path.display(), backup.display()))?;
     Ok(backup)
@@ -39,6 +47,19 @@ mod tests {
         let p = Path::new("/tmp/.claude.json");
         let b = backup_path(p, "20260101-120000");
         assert_eq!(b, Path::new("/tmp/.claude.json.bak-20260101-120000"));
+    }
+
+    #[test]
+    fn timestamped_copy_does_not_clobber_an_existing_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("config.json");
+        std::fs::write(&src, "{}").unwrap();
+        // Two back-to-back copies land in the same second; the second must get a
+        // distinct, suffix-bumped name rather than overwriting the first.
+        let first = timestamped_copy(&src).unwrap();
+        let second = timestamped_copy(&src).unwrap();
+        assert_ne!(first, second, "second backup reused the first name");
+        assert!(first.exists() && second.exists(), "both backups survive");
     }
 
     #[test]

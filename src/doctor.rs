@@ -60,14 +60,22 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     let project = ProjectPaths::new(opts.path.canonicalize().unwrap_or(opts.path.clone()));
     let mut findings = Vec::new();
 
-    check_orphaned_projects(env, &mut findings)?;
-    check_claude_json_size(env, &mut findings)?;
+    // Read the user-scope ~/.claude.json once; three checks consult it. A parse
+    // error aborts the run (exit 2), as it did when the first check loaded it.
+    let claude_json = if env.claude_json.exists() {
+        Some(ClaudeJson::load(&env.claude_json)?)
+    } else {
+        None
+    };
+
+    check_orphaned_projects(env, claude_json.as_ref(), &mut findings);
+    check_claude_json_size(env, claude_json.as_ref(), &mut findings);
     check_stale_worktrees(&project, &mut findings)?;
     check_secrets_in_committed_settings(&project, &mut findings, opts.show_secrets)?;
     check_local_settings_in_git(&project, &mut findings)?;
     check_credential_deny_rules(&project, env, &mut findings)?;
     check_dead_skill_command_agent_refs(&project, env, &mut findings)?;
-    check_disabled_mcp_servers(&project, env, &mut findings)?;
+    check_disabled_mcp_servers(&project, env, claude_json.as_ref(), &mut findings)?;
 
     // Sort by severity, then id, then location so output is stable regardless
     // of filesystem read order.
@@ -79,14 +87,21 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
             .then(a.location.key_path.cmp(&b.location.key_path))
     });
 
-    if opts.json {
-        emit_json(&findings, opts.fix);
-    } else {
+    if !opts.json {
         emit_human(&findings);
     }
 
-    if opts.fix {
-        apply_fixes(env, &findings, &opts)?;
+    // Apply before emitting JSON so `fix_applied` reflects whether a mutation
+    // actually happened — not merely that --fix was passed. In human mode
+    // apply_fixes prints its own progress after the findings, so order is kept.
+    let fix_applied = if opts.fix {
+        apply_fixes(env, &findings, &opts)?
+    } else {
+        false
+    };
+
+    if opts.json {
+        emit_json(&findings, fix_applied);
     }
 
     let exit = if findings.iter().any(|f| f.severity == Severity::Error) {
@@ -161,13 +176,15 @@ fn emit_json(findings: &[Finding], fix: bool) {
     println!("{}", serde_json::to_string_pretty(&v).expect("serialize"));
 }
 
-fn apply_fixes(env: &Env, findings: &[Finding], opts: &Options) -> Result<()> {
+/// Apply the auto-fixable findings. Returns whether the config was actually
+/// mutated (false when nothing is auto-fixable or the targets no longer exist).
+fn apply_fixes(env: &Env, findings: &[Finding], opts: &Options) -> Result<bool> {
     let auto: Vec<&Finding> = findings.iter().filter(|f| f.auto_fixable).collect();
     if auto.is_empty() {
         if !opts.json {
             println!("nothing auto-fixable.");
         }
-        return Ok(());
+        return Ok(false);
     }
     if !opts.force && process::claude_is_running() {
         bail!(
@@ -187,35 +204,48 @@ fn apply_fixes(env: &Env, findings: &[Finding], opts: &Options) -> Result<()> {
                 .and_then(|k| k.strip_prefix("projects."))
         })
         .collect();
-
-    if !prune_targets.is_empty() {
-        let mut config = ClaudeJson::load(&env.claude_json)?;
-        if let Some(map) = config.projects_mut() {
-            let before = map.len();
-            map.retain(|k, _| !prune_targets.contains(k.as_str()));
-            let removed = before - map.len();
-            let new_raw = claude_json::render(&config.data)?;
-            let backup_path = backup::timestamped_copy(&env.claude_json)?;
-            std::fs::write(&env.claude_json, new_raw)?;
-            if !opts.json {
-                println!("pruned {removed} orphaned project entries.");
-                println!("backed up to {}", backup_path.display());
-            }
-        }
+    if prune_targets.is_empty() {
+        return Ok(false);
     }
 
-    Ok(())
+    let mut config = ClaudeJson::load(&env.claude_json)?;
+    let total = config.projects().map(|p| p.len()).unwrap_or(0);
+    if !opts.force && orphans::looks_like_wrong_host(prune_targets.len(), total) {
+        bail!(
+            "{} of {} project entries resolve missing — this usually means you are on a \
+             different machine or an unmounted volume, not that they are all dead. \
+             Re-run with --force to prune them anyway.",
+            prune_targets.len(),
+            total
+        );
+    }
+    let Some(map) = config.projects_mut() else {
+        return Ok(false);
+    };
+    let before = map.len();
+    map.retain(|k, _| !prune_targets.contains(k.as_str()));
+    let removed = before - map.len();
+    if removed == 0 {
+        return Ok(false);
+    }
+    let new_raw = claude_json::render(&config.data)?;
+    let backup_path = backup::timestamped_copy(&env.claude_json)?;
+    claude_json::write_atomic(&env.claude_json, &new_raw)?;
+    if !opts.json {
+        println!("pruned {removed} orphaned project entries.");
+        println!("backed up to {}", backup_path.display());
+    }
+    Ok(true)
 }
 
 // -- checks ------------------------------------------------------------------
 
-fn check_orphaned_projects(env: &Env, out: &mut Vec<Finding>) -> Result<()> {
-    if !env.claude_json.exists() {
-        return Ok(());
-    }
-    let config = ClaudeJson::load(&env.claude_json)?;
+fn check_orphaned_projects(env: &Env, config: Option<&ClaudeJson>, out: &mut Vec<Finding>) {
+    let Some(config) = config else {
+        return;
+    };
     let Some(projects) = config.projects() else {
-        return Ok(());
+        return;
     };
     for o in orphans::find(projects, false) {
         out.push(Finding {
@@ -234,23 +264,21 @@ fn check_orphaned_projects(env: &Env, out: &mut Vec<Finding>) -> Result<()> {
             auto_fixable: true,
         });
     }
-    Ok(())
 }
 
-fn check_claude_json_size(env: &Env, out: &mut Vec<Finding>) -> Result<()> {
-    if !env.claude_json.exists() {
-        return Ok(());
-    }
-    let meta = std::fs::metadata(&env.claude_json)
-        .with_context(|| format!("stat {}", env.claude_json.display()))?;
-    let kb = (meta.len() as usize) / 1024;
+fn check_claude_json_size(env: &Env, config: Option<&ClaudeJson>, out: &mut Vec<Finding>) {
+    let Some(config) = config else {
+        return;
+    };
+    // `raw` is the file's text as read, so its byte length is the on-disk size.
+    let kb = config.raw.len() / 1024;
     if kb < CLAUDE_JSON_BLOAT_THRESHOLD_KB {
-        return Ok(());
+        return;
     }
     // Point at the actual culprits. prune only reclaims orphaned `projects`
     // entries; the bulk is usually regenerable `cached*` blobs and per-project
     // metrics Claude Code rewrites — neither is safe to hand-prune.
-    let breakdown = match largest_top_level_keys(&env.claude_json, 3) {
+    let breakdown = match largest_top_level_keys(&config.data, 3) {
         keys if keys.is_empty() => String::new(),
         keys => {
             let parts: Vec<String> = keys
@@ -275,16 +303,12 @@ fn check_claude_json_size(env: &Env, out: &mut Vec<Finding>) -> Result<()> {
         ),
         auto_fixable: false,
     });
-    Ok(())
 }
 
 /// The `n` largest top-level keys by compact-serialized byte size, so the bloat
-/// finding can name what is actually big. Empty if the file won't read or parse.
-fn largest_top_level_keys(path: &Path, n: usize) -> Vec<(String, usize)> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) else {
+/// finding can name what is actually big. Empty if `data` is not a JSON object.
+fn largest_top_level_keys(data: &Value, n: usize) -> Vec<(String, usize)> {
+    let Value::Object(map) = data else {
         return Vec::new();
     };
     let mut sizes: Vec<(String, usize)> = map
@@ -361,6 +385,17 @@ fn check_secrets_in_committed_settings(
     if !settings.exists() {
         return Ok(());
     }
+    // A settings.json git explicitly ignores is not "committed" — flagging it as
+    // an Error (and exiting 1) is a false positive for the common pattern of
+    // gitignoring .claude/ wholesale. When git can't tell (not a repo, no git),
+    // fall through and flag it, as before. settings.local.json is covered
+    // separately by check_local_settings_in_git.
+    let rel = settings
+        .strip_prefix(&project.root)
+        .unwrap_or(settings.as_path());
+    if git::is_ignored(&project.root, rel) == Some(true) {
+        return Ok(());
+    }
     let raw = std::fs::read_to_string(&settings)
         .with_context(|| format!("read {}", settings.display()))?;
     let Ok(value): Result<Value, _> = serde_json::from_str(&raw) else {
@@ -402,19 +437,38 @@ fn walk_for_secrets(value: &Value, path: &str, out: &mut Vec<(String, String)>) 
                 } else {
                     format!("{path}.{k}")
                 };
-                if secrets::key_looks_sensitive(k)
-                    && let Value::String(s) = v
-                    && !s.is_empty()
-                {
-                    out.push((new_path.clone(), s.clone()));
-                    continue;
+                if secrets::key_looks_sensitive(k) {
+                    // The whole subtree under a sensitive key is suspect —
+                    // including bare strings in arrays, which carry no key.
+                    collect_secret_strings(v, &new_path, out);
+                } else {
+                    walk_for_secrets(v, &new_path, out);
                 }
-                walk_for_secrets(v, &new_path, out);
             }
         }
         Value::Array(arr) => {
             for (i, v) in arr.iter().enumerate() {
                 walk_for_secrets(v, &format!("{path}[{i}]"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect every non-empty string under an already-sensitive key, descending
+/// through nested objects and arrays so a secret stored as `apiKeys: ["sk-…"]`
+/// is caught, not just one stored as a direct string value.
+fn collect_secret_strings(value: &Value, path: &str, out: &mut Vec<(String, String)>) {
+    match value {
+        Value::String(s) if !s.is_empty() => out.push((path.to_string(), s.clone())),
+        Value::Array(arr) => {
+            for (i, v) in arr.iter().enumerate() {
+                collect_secret_strings(v, &format!("{path}[{i}]"), out);
+            }
+        }
+        Value::Object(map) => {
+            for (k, v) in map {
+                collect_secret_strings(v, &format!("{path}.{k}"), out);
             }
         }
         _ => {}
@@ -633,13 +687,15 @@ fn check_dead_skill_command_agent_refs(
 fn check_disabled_mcp_servers(
     project: &ProjectPaths,
     env: &Env,
+    config: Option<&ClaudeJson>,
     out: &mut Vec<Finding>,
 ) -> Result<()> {
-    for path in [
-        env.claude_json.clone(),
-        project.mcp_json(),
-        project.managed_mcp_json(),
-    ] {
+    // User scope: reuse the already-parsed ~/.claude.json.
+    if let Some(config) = config {
+        scan_mcp_servers(&config.data, &env.claude_json, out);
+    }
+    // Project and managed scopes live in their own files.
+    for path in [project.mcp_json(), project.managed_mcp_json()] {
         if !path.exists() {
             continue;
         }
@@ -649,45 +705,47 @@ fn check_disabled_mcp_servers(
         let Ok(v) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
-        let Some(servers) = v.get("mcpServers").and_then(Value::as_object) else {
-            continue;
-        };
-        for (name, def) in servers {
-            let cmd = def.get("command").and_then(Value::as_str).unwrap_or("");
-            let url = def.get("url").and_then(Value::as_str).unwrap_or("");
-            if cmd.is_empty() && url.is_empty() {
-                out.push(Finding {
-                    id: "mcp-server-unreachable",
-                    severity: Severity::Warn,
-                    location: Location {
-                        file: path.clone(),
-                        key_path: Some(format!("mcpServers.{name}")),
-                    },
-                    message: format!(
-                        "MCP server `{name}` has no command or url — it will never start"
-                    ),
-                    suggested_fix: Some(
-                        "set `command` (stdio) or `url` (http/sse), or remove the entry".into(),
-                    ),
-                    auto_fixable: false,
-                });
-            }
-            if def.get("disabled").and_then(Value::as_bool) == Some(true) {
-                out.push(Finding {
-                    id: "mcp-server-disabled",
-                    severity: Severity::Info,
-                    location: Location {
-                        file: path.clone(),
-                        key_path: Some(format!("mcpServers.{name}")),
-                    },
-                    message: format!("MCP server `{name}` is defined but disabled"),
-                    suggested_fix: Some("remove the entry if you no longer need it".into()),
-                    auto_fixable: false,
-                });
-            }
-        }
+        scan_mcp_servers(&v, &path, out);
     }
     Ok(())
+}
+
+fn scan_mcp_servers(v: &Value, file: &Path, out: &mut Vec<Finding>) {
+    let Some(servers) = v.get("mcpServers").and_then(Value::as_object) else {
+        return;
+    };
+    for (name, def) in servers {
+        let cmd = def.get("command").and_then(Value::as_str).unwrap_or("");
+        let url = def.get("url").and_then(Value::as_str).unwrap_or("");
+        if cmd.is_empty() && url.is_empty() {
+            out.push(Finding {
+                id: "mcp-server-unreachable",
+                severity: Severity::Warn,
+                location: Location {
+                    file: file.to_path_buf(),
+                    key_path: Some(format!("mcpServers.{name}")),
+                },
+                message: format!("MCP server `{name}` has no command or url — it will never start"),
+                suggested_fix: Some(
+                    "set `command` (stdio) or `url` (http/sse), or remove the entry".into(),
+                ),
+                auto_fixable: false,
+            });
+        }
+        if def.get("disabled").and_then(Value::as_bool) == Some(true) {
+            out.push(Finding {
+                id: "mcp-server-disabled",
+                severity: Severity::Info,
+                location: Location {
+                    file: file.to_path_buf(),
+                    key_path: Some(format!("mcpServers.{name}")),
+                },
+                message: format!("MCP server `{name}` is defined but disabled"),
+                suggested_fix: Some("remove the entry if you no longer need it".into()),
+                auto_fixable: false,
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -717,6 +775,35 @@ mod tests {
         walk_for_secrets(&v, "", &mut hits);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, "env.ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn walk_for_secrets_captures_array_elements_under_sensitive_key() {
+        // A secret stored as an array of bare strings under a sensitive key
+        // used to slip through (the elements have no key of their own).
+        let v: Value = serde_json::from_str(
+            r#"{ "apiKeys": ["sk-aaaa-1111", "sk-bbbb-2222"], "name": "fine" }"#,
+        )
+        .unwrap();
+        let mut hits = Vec::new();
+        walk_for_secrets(&v, "", &mut hits);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0, "apiKeys[0]");
+        assert_eq!(hits[1].0, "apiKeys[1]");
+    }
+
+    #[test]
+    fn walk_for_secrets_descends_objects_under_sensitive_key() {
+        // Every string under a sensitive-named key is suspect, including those
+        // nested in a sub-object.
+        let v: Value =
+            serde_json::from_str(r#"{ "credentials": { "user": "alice", "pass": "hunter2-x" } }"#)
+                .unwrap();
+        let mut hits = Vec::new();
+        walk_for_secrets(&v, "", &mut hits);
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|(k, _)| k == "credentials.user"));
+        assert!(hits.iter().any(|(k, _)| k == "credentials.pass"));
     }
 
     #[test]
@@ -775,24 +862,18 @@ mod tests {
 
     #[test]
     fn largest_top_level_keys_ranks_by_size() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = dir.path().join("c.json");
-        std::fs::write(
-            &f,
-            r#"{"small":1,"big":"xxxxxxxxxxxxxxxxxxxx","mid":[1,2,3]}"#,
-        )
-        .unwrap();
-        let top = largest_top_level_keys(&f, 2);
+        let v: Value =
+            serde_json::from_str(r#"{"small":1,"big":"xxxxxxxxxxxxxxxxxxxx","mid":[1,2,3]}"#)
+                .unwrap();
+        let top = largest_top_level_keys(&v, 2);
         assert_eq!(top.len(), 2, "truncated to n");
         assert_eq!(top[0].0, "big");
         assert_eq!(top[1].0, "mid");
     }
 
     #[test]
-    fn largest_top_level_keys_empty_on_invalid_json() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = dir.path().join("nope.json");
-        std::fs::write(&f, "not json").unwrap();
-        assert!(largest_top_level_keys(&f, 3).is_empty());
+    fn largest_top_level_keys_empty_on_non_object() {
+        let v: Value = serde_json::from_str(r#""just a string""#).unwrap();
+        assert!(largest_top_level_keys(&v, 3).is_empty());
     }
 }

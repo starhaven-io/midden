@@ -28,6 +28,10 @@ confidence-threshold = 0.95
 unused-allowed-license = "allow"
 
 [advisories]
+# Vulnerabilities and unmaintained/unsound advisories already error by default;
+# yanked defaults to only `warn`. A yanked crate is a common signal a release
+# was pulled for a security or correctness problem, so fail on it too.
+yanked = "deny"
 
 [sources]
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
