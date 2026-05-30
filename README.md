@@ -203,11 +203,12 @@ just deny           # cargo-deny: license + advisory + source checks
 just lychee         # Check README links
 just audit          # Audit GitHub Actions workflows (zizmor)
 just check          # Run all checks
+just install-hooks  # Install git hooks: pre-push check + DCO sign-off (once per clone)
 ```
 
 ## Contributing
 
-Commits must follow [Conventional Commits](https://www.conventionalcommits.org/) format and include a DCO sign-off (`git commit -s`).
+Commits must follow [Conventional Commits](https://www.conventionalcommits.org/) format and include a DCO sign-off (`git commit -s`). Run `just install-hooks` once per clone to enable the git hooks (a pre-push `just check` and DCO sign-off enforcement).
 
 ## Acknowledgements
 
