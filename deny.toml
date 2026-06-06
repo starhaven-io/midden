@@ -28,9 +28,9 @@ confidence-threshold = 0.95
 unused-allowed-license = "allow"
 
 [advisories]
-# Vulnerabilities and unmaintained/unsound advisories already error by default;
-# yanked defaults to only `warn`. A yanked crate is a common signal a release
-# was pulled for a security or correctness problem, so fail on it too.
+# Scan the whole dep tree for unmaintained crates, not just workspace members (default: workspace).
+unmaintained = "all"
+# A yank usually signals a release pulled for a security or correctness problem (default: warn).
 yanked = "deny"
 
 [sources]
