@@ -26,30 +26,15 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Restore pinprick cache
-        id: pinprick-cache
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ~/.cargo/bin/pinprick
-          key: ${{ runner.os }}-${{ runner.arch }}-pinprick-0.10.0
-
       - name: Install pinprick
-        if: steps.pinprick-cache.outputs.cache-hit != 'true'
-        run: cargo install pinprick --locked --version 0.10.0
-
-      - name: Save pinprick cache
-        if: github.event_name == 'push' && steps.pinprick-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ~/.cargo/bin/pinprick
-          key: ${{ runner.os }}-${{ runner.arch }}-pinprick-0.10.0
+        run: /home/linuxbrew/.linuxbrew/bin/brew install starhaven-io/tap/pinprick
 
       - name: Run pinprick audit
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set +e
-          pinprick audit --sarif . > pinprick.sarif
+          /home/linuxbrew/.linuxbrew/bin/pinprick audit --sarif . > pinprick.sarif
           EXIT=$?
           # 0 = clean, 1 = findings (still upload), 2+ = real error
           if [[ "${EXIT}" -gt 1 ]]; then
