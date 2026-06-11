@@ -94,7 +94,7 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
         }
     }
 
-    let hooks = collect_hooks(&sources);
+    let mut hooks = collect_hooks(&sources);
     let resolved: Vec<Resolved> = resolve_settings(&sources)
         .into_iter()
         // Hooks have their own section — drop them from the generic settings
@@ -106,7 +106,7 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     let skills = collect_dirs(&[env.user_skills_dir(), project.skills_dir()], "SKILL.md");
     let commands = collect_files(&[env.user_commands_dir(), project.commands_dir()]);
     let agents = collect_files(&[env.user_agents_dir(), project.agents_dir()]);
-    let mcp_servers = collect_mcp_servers(env, &project);
+    let mut mcp_servers = collect_mcp_servers(env, &project);
     let worktrees = collect_worktrees(&project);
 
     let mut resolved = resolved;
@@ -117,6 +117,22 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
                 for c in &mut r.contributions {
                     secrets::mask_value(&mut c.value);
                 }
+            }
+            // Token-shaped values hide under innocent keys too — args arrays,
+            // env.DATABASE_URL — so mask by content as well as by key name.
+            secrets::mask_sensitive_values(&mut r.effective);
+            for c in &mut r.contributions {
+                secrets::mask_sensitive_values(&mut c.value);
+            }
+        }
+        // Hook commands and MCP URLs are free-form text that can embed
+        // credentials (Bearer headers, user:pass URLs, token query params).
+        for h in &mut hooks {
+            h.command = secrets::mask_embedded(&h.command);
+        }
+        for s in &mut mcp_servers {
+            if let Some(url) = &mut s.url {
+                *url = secrets::mask_embedded(url);
             }
         }
     }
