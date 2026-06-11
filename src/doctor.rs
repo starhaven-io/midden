@@ -76,6 +76,7 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     check_credential_deny_rules(&project, env, &mut findings)?;
     check_dead_skill_command_agent_refs(&project, env, &mut findings)?;
     check_disabled_mcp_servers(&project, env, claude_json.as_ref(), &mut findings)?;
+    check_mcpjson_approvals(&project, env, claude_json.as_ref(), &mut findings);
 
     // Sort by severity, then id, then location so output is stable regardless
     // of filesystem read order.
@@ -740,9 +741,15 @@ fn check_disabled_mcp_servers(
     config: Option<&ClaudeJson>,
     out: &mut Vec<Finding>,
 ) -> Result<()> {
-    // User scope: reuse the already-parsed ~/.claude.json.
+    // User and local scope both live in the already-parsed ~/.claude.json:
+    // top-level `mcpServers` is user scope; the per-project entry's is local
+    // scope, where `claude mcp add` writes by default.
     if let Some(config) = config {
-        scan_mcp_servers(&config.data, &env.claude_json, out);
+        scan_mcp_servers(&config.data, &env.claude_json, "", out);
+        if let Some(entry) = claude_json::project_entry(&config.data, &project.root) {
+            let prefix = format!("projects.{}.", project.root.display());
+            scan_mcp_servers(entry, &env.claude_json, &prefix, out);
+        }
     }
     // Project and managed scopes live in their own files.
     for path in [project.mcp_json(), project.managed_mcp_json()] {
@@ -755,12 +762,12 @@ fn check_disabled_mcp_servers(
         let Ok(v) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
-        scan_mcp_servers(&v, &path, out);
+        scan_mcp_servers(&v, &path, "", out);
     }
     Ok(())
 }
 
-fn scan_mcp_servers(v: &Value, file: &Path, out: &mut Vec<Finding>) {
+fn scan_mcp_servers(v: &Value, file: &Path, key_prefix: &str, out: &mut Vec<Finding>) {
     let Some(servers) = v.get("mcpServers").and_then(Value::as_object) else {
         return;
     };
@@ -773,7 +780,7 @@ fn scan_mcp_servers(v: &Value, file: &Path, out: &mut Vec<Finding>) {
                 severity: Severity::Warn,
                 location: Location {
                     file: file.to_path_buf(),
-                    key_path: Some(format!("mcpServers.{name}")),
+                    key_path: Some(format!("{key_prefix}mcpServers.{name}")),
                 },
                 message: format!("MCP server `{name}` has no command or url — it will never start"),
                 suggested_fix: Some(
@@ -788,12 +795,78 @@ fn scan_mcp_servers(v: &Value, file: &Path, out: &mut Vec<Finding>) {
                 severity: Severity::Info,
                 location: Location {
                     file: file.to_path_buf(),
-                    key_path: Some(format!("mcpServers.{name}")),
+                    key_path: Some(format!("{key_prefix}mcpServers.{name}")),
                 },
                 message: format!("MCP server `{name}` is defined but disabled"),
                 suggested_fix: Some("remove the entry if you no longer need it".into()),
                 auto_fixable: false,
             });
+        }
+    }
+}
+
+/// `.mcp.json` servers are approved or rejected per project via the
+/// `enabledMcpjsonServers` / `disabledMcpjsonServers` arrays in the project's
+/// `~/.claude.json` entry — Claude Code's actual disable mechanism (a
+/// `disabled: true` key on a definition, scanned above, is another
+/// ecosystem's convention). Flag list entries naming servers that no longer
+/// exist, and surface defined-but-disabled servers.
+fn check_mcpjson_approvals(
+    project: &ProjectPaths,
+    env: &Env,
+    config: Option<&ClaudeJson>,
+    out: &mut Vec<Finding>,
+) {
+    let Some(config) = config else { return };
+    let Some(entry) = claude_json::project_entry(&config.data, &project.root) else {
+        return;
+    };
+    let mut defined: HashSet<String> = HashSet::new();
+    for path in [project.mcp_json(), project.managed_mcp_json()] {
+        if let Ok(text) = std::fs::read_to_string(&path)
+            && let Ok(v) = serde_json::from_str::<Value>(&text)
+            && let Some(servers) = v.get("mcpServers").and_then(Value::as_object)
+        {
+            defined.extend(servers.keys().cloned());
+        }
+    }
+    for list in ["enabledMcpjsonServers", "disabledMcpjsonServers"] {
+        let Some(names) = entry.get(list).and_then(Value::as_array) else {
+            continue;
+        };
+        for name in names.iter().filter_map(Value::as_str) {
+            let key_path = Some(format!("projects.{}.{list}", project.root.display()));
+            if !defined.contains(name) {
+                out.push(Finding {
+                    id: "stale-mcp-approval",
+                    severity: Severity::Info,
+                    location: Location {
+                        file: env.claude_json.clone(),
+                        key_path,
+                    },
+                    message: format!("{list} lists `{name}`, but .mcp.json defines no such server"),
+                    suggested_fix: Some(format!(
+                        "remove `{name}` from {list}; the server it referred to is gone"
+                    )),
+                    auto_fixable: false,
+                });
+            } else if list == "disabledMcpjsonServers" {
+                out.push(Finding {
+                    id: "mcp-server-disabled",
+                    severity: Severity::Info,
+                    location: Location {
+                        file: env.claude_json.clone(),
+                        key_path,
+                    },
+                    message: format!(
+                        "MCP server `{name}` (.mcp.json) is disabled for this project"
+                    ),
+                    suggested_fix: Some(format!(
+                        "re-enable it, or remove `{name}` from .mcp.json if no longer needed"
+                    )),
+                    auto_fixable: false,
+                });
+            }
         }
     }
 }

@@ -14,7 +14,7 @@ midden is a Rust CLI for resolving, auditing, and garbage-collecting the state C
 
 - `prune [--apply] [--worktrees-only] [--force]` — GC dead `projects` entries from `~/.claude.json`. Dry-run by default; removes only entries whose directory is provably absent. `--apply` backs up then writes; `--worktrees-only` restricts to `.claude/worktrees/` paths; `--force` overrides the write gates.
 - `doctor [PATH] [--fix] [--force] [--show-secrets]` — emit structured `Finding { id, severity, location, message, suggested_fix, auto_fixable }`. `--fix` applies the `auto_fixable` findings under the same backup + atomic-write discipline as prune (today only `orphaned-project` is auto-fixable). See the README for the full check list.
-- `show [PATH] [--show-secrets]` — resolve every config surface for a directory with provenance: settings (with shadow/merge tags), every contributing `CLAUDE.md`, skills, commands, subagents, hooks, MCP servers, worktrees.
+- `show [PATH] [--show-secrets]` — resolve every config surface for a directory with provenance: settings (with shadow/merge tags), every contributing `CLAUDE.md`, skills, commands, subagents, hooks, MCP servers (user/local/project/managed — local being the per-project `mcpServers` map inside `~/.claude.json`), worktrees.
 
 Global flags: `--json` (machine output; disables color), `--color auto|always|never`, `--config <PATH>` (override `~/.claude.json`), `--claude-home <PATH>` (override `~/.claude`). The two override flags exist for testing — integration tests point them at fixture dirs.
 

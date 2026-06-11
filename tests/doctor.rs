@@ -325,6 +325,87 @@ fn flags_unreachable_mcp_server() {
 }
 
 #[test]
+fn flags_unreachable_local_scope_mcp_server() {
+    let fx = Fixture::new();
+    // Local scope: the server definition lives in the project's entry inside
+    // ~/.claude.json, the default destination of `claude mcp add`.
+    let root_key = fx.root.path().to_string_lossy().into_owned();
+    fx.write_config(
+        json!({ &root_key: { "mcpServers": { "broken": {} } } }),
+        json!({}),
+    );
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("doctor")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let finding = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "mcp-server-unreachable")
+        .expect("local-scope server should be linted");
+    let key_path = finding["location"]["key_path"].as_str().unwrap();
+    assert!(
+        key_path.starts_with("projects.") && key_path.ends_with(".mcpServers.broken"),
+        "key_path should locate the projects entry: {key_path}"
+    );
+}
+
+#[test]
+fn flags_stale_mcpjson_approvals_and_real_disables() {
+    let fx = Fixture::new();
+    let root_key = fx.root.path().to_string_lossy().into_owned();
+    // .mcp.json defines `real`; the project entry approves a server that no
+    // longer exists and disables the one that does.
+    write_json(
+        &fx.root.path().join(".mcp.json"),
+        &json!({ "mcpServers": { "real": { "command": "node" } } }),
+    );
+    fx.write_config(
+        json!({
+            &root_key: {
+                "enabledMcpjsonServers": ["ghost"],
+                "disabledMcpjsonServers": ["real"]
+            }
+        }),
+        json!({}),
+    );
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("doctor")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let findings = v["findings"].as_array().unwrap();
+    let stale = findings
+        .iter()
+        .find(|f| f["id"] == "stale-mcp-approval")
+        .expect("ghost approval should be flagged");
+    assert!(
+        stale["message"].as_str().unwrap().contains("ghost"),
+        "message: {}",
+        stale["message"]
+    );
+    let disabled = findings
+        .iter()
+        .find(|f| f["id"] == "mcp-server-disabled")
+        .expect("disabledMcpjsonServers entry should surface");
+    assert!(
+        disabled["message"].as_str().unwrap().contains("real"),
+        "message: {}",
+        disabled["message"]
+    );
+}
+
+#[test]
 fn flags_skill_directory_missing_skill_md() {
     let fx = Fixture::new();
     fx.write_config(json!({}), json!({}));
