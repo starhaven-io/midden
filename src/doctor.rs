@@ -453,7 +453,7 @@ fn scan_committed_secret_file(
         let displayed = if show_secrets {
             raw_value.clone()
         } else {
-            secrets::mask(&raw_value)
+            secrets::masked_for_display(&raw_value)
         };
         out.push(Finding {
             id,
@@ -501,6 +501,11 @@ fn walk_for_secrets(value: &Value, path: &str, out: &mut Vec<(String, String)>) 
             for (i, v) in arr.iter().enumerate() {
                 walk_for_secrets(v, &format!("{path}[{i}]"), out);
             }
+        }
+        // Content-shaped detection: a token under an innocent key — an `args`
+        // array, env.DATABASE_URL — is still a committed secret.
+        Value::String(s) if secrets::value_looks_sensitive(s) => {
+            out.push((path.to_string(), s.clone()));
         }
         _ => {}
     }

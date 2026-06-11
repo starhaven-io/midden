@@ -192,6 +192,61 @@ fn flags_secret_in_committed_mcp_json() {
 }
 
 #[test]
+fn flags_token_shaped_value_under_innocent_key() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    // The key (`args`) is innocent; only the value's shape gives it away.
+    // Assembled at runtime so the source holds no scanner-matching literal.
+    let token = format!("ghp_{}", "AAAAbbbb1111cccc2222dddd3333eeee");
+    write_json(
+        &fx.root.path().join(".mcp.json"),
+        &json!({
+            "mcpServers": {
+                "svc": {
+                    "command": "node",
+                    "args": ["--token", token]
+                }
+            }
+        }),
+    );
+
+    let out = fx.cmd().arg("doctor").arg(fx.root.path()).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("secret-in-committed-mcp"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("args[1]"), "stdout:\n{stdout}");
+    assert!(stdout.contains("ghp_***"), "stdout:\n{stdout}");
+    assert!(!stdout.contains(&token), "leak:\n{stdout}");
+}
+
+#[test]
+fn flags_url_password_in_committed_settings() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    // DATABASE_URL is not a sensitive-looking key name; the embedded
+    // user:pass userinfo is what makes it a committed credential.
+    write_json(
+        &fx.root.path().join(".claude/settings.json"),
+        &json!({ "env": { "DATABASE_URL": "postgres://app:hunter2pass@db.example.com/prod" } }),
+    );
+
+    let out = fx.cmd().arg("doctor").arg(fx.root.path()).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("secret-in-committed-settings"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("env.DATABASE_URL"), "stdout:\n{stdout}");
+    assert!(!stdout.contains("hunter2pass"), "leak:\n{stdout}");
+    assert!(
+        stdout.contains("postgres://***@db.example.com/prod"),
+        "context survives masking:\n{stdout}"
+    );
+}
+
+#[test]
 fn env_expansion_in_mcp_json_is_not_flagged() {
     let fx = Fixture::new();
     fx.write_config(json!({}), json!({}));
