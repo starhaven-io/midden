@@ -51,6 +51,21 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     {
         let mut f = std::fs::File::create(&tmp)
             .with_context(|| format!("create temp {}", tmp.display()))?;
+        // The rename publishes the temp's permissions as the target's, and
+        // `File::create` applies the umask (typically 0644) — which would
+        // silently broaden a 0600 target holding OAuth tokens. Mirror the
+        // target's current mode, owner-only for new files, before any content
+        // is written.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = match std::fs::metadata(path) {
+                Ok(m) => m.permissions().mode() & 0o7777,
+                Err(_) => 0o600,
+            };
+            f.set_permissions(std::fs::Permissions::from_mode(mode))
+                .with_context(|| format!("set mode on temp {}", tmp.display()))?;
+        }
         f.write_all(contents.as_bytes())
             .with_context(|| format!("write temp {}", tmp.display()))?;
         f.sync_all()
@@ -64,5 +79,71 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
             path.display()
         ));
     }
+    // The rename is durable only once the directory entry is synced; until
+    // then a crash can roll back to the old file. Best-effort — not every
+    // filesystem supports fsync on a directory handle.
+    #[cfg(unix)]
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_atomic_replaces_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        std::fs::write(&path, "old").unwrap();
+        write_atomic(&path, "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_preserves_a_restrictive_target_mode() {
+        // Regression: File::create + umask used to broaden a 0600 target to
+        // 0644 on every rewrite.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        std::fs::write(&path, "{}").unwrap();
+        chmod(&path, 0o600);
+        write_atomic(&path, "{\"k\":1}").unwrap();
+        assert_eq!(mode(&path), 0o600, "0600 target must stay 0600");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_preserves_a_broad_target_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        std::fs::write(&path, "{}").unwrap();
+        chmod(&path, 0o644);
+        write_atomic(&path, "{\"k\":1}").unwrap();
+        assert_eq!(mode(&path), 0o644, "deliberate modes are kept, not clamped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_creates_missing_targets_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.json");
+        write_atomic(&path, "{}").unwrap();
+        assert_eq!(mode(&path), 0o600, "this file class holds credentials");
+    }
 }
