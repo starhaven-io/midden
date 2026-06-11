@@ -196,6 +196,32 @@ fn show_lists_mcp_servers_with_scope_and_target() {
 }
 
 #[test]
+fn show_lists_local_scope_mcp_servers_from_the_projects_map() {
+    let fx = Fixture::new();
+    // `claude mcp add` defaults to local scope: the server lands in the
+    // project's entry inside ~/.claude.json, not in any settings file. The key
+    // is written as the shell reported the cwd, which on macOS may be a
+    // non-canonical alias (/var vs /private/var) of the path show resolves.
+    let root_key = fx.root.path().to_string_lossy().into_owned();
+    fx.write_config(
+        json!({
+            &root_key: {
+                "mcpServers": { "local-one": { "command": "uvx", "args": ["serve"] } },
+                "hasTrustDialogAccepted": true
+            }
+        }),
+        json!({ "mcpServers": { "user-one": { "command": "node" } } }),
+    );
+
+    let out = fx.cmd().arg("show").arg(fx.root.path()).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("local-one"), "stdout:\n{stdout}");
+    assert!(stdout.contains("[local]"), "stdout:\n{stdout}");
+    assert!(stdout.contains("user-one"), "stdout:\n{stdout}");
+    assert!(stdout.contains("[user]"), "stdout:\n{stdout}");
+}
+
+#[test]
 fn show_lists_skills_with_skill_md() {
     let fx = Fixture::new();
     fx.write_config(json!({}), json!({}));
