@@ -20,6 +20,15 @@ pub fn timestamped_copy(path: &Path) -> Result<PathBuf> {
     }
     std::fs::copy(path, &backup)
         .with_context(|| format!("backup {} -> {}", path.display(), backup.display()))?;
+    // `fs::copy` mirrors the source's permissions — including an erroneously
+    // broad mode. Backups of credential-bearing config exist only for the
+    // owner to restore, so clamp to owner-only regardless of the source.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("set mode on backup {}", backup.display()))?;
+    }
     Ok(backup)
 }
 
@@ -60,6 +69,22 @@ mod tests {
         let second = timestamped_copy(&src).unwrap();
         assert_ne!(first, second, "second backup reused the first name");
         assert!(first.exists() && second.exists(), "both backups survive");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backups_are_owner_only_even_when_the_source_is_broad() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("config.json");
+        std::fs::write(&src, "{\"token\":1}").unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let backup = timestamped_copy(&src).unwrap();
+
+        let mode = std::fs::metadata(&backup).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o600, "backup must not inherit a broad source mode");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "{\"token\":1}");
     }
 
     #[test]

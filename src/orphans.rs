@@ -1,6 +1,7 @@
 use crate::paths::WORKTREE_MARKER;
 use serde_json::Map;
 use serde_json::Value;
+use std::io::ErrorKind;
 use std::path::Path;
 
 /// One orphaned project entry: a key in `projects` whose directory no longer
@@ -21,7 +22,7 @@ pub fn find(projects: &Map<String, Value>, worktrees_only: bool) -> Vec<Orphan> 
         if worktrees_only && !is_worktree {
             continue;
         }
-        if !Path::new(path).is_dir() {
+        if provably_absent(Path::new(path)) {
             out.push(Orphan {
                 path: path.clone(),
                 is_worktree,
@@ -30,6 +31,18 @@ pub fn find(projects: &Map<String, Value>, worktrees_only: bool) -> Vec<Orphan> 
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out
+}
+
+/// Whether `path` is provably not a project directory. Only a definitive
+/// answer counts: the path resolves to nothing (`NotFound`), routes through a
+/// non-directory (`NotADirectory`), or exists but is not a directory. Any
+/// other stat failure — permission denied, I/O error, an unresponsive mount —
+/// means "can't tell", and an entry we can't check must never be pruned.
+fn provably_absent(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(meta) => !meta.is_dir(),
+        Err(e) => matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory),
+    }
 }
 
 /// Split a list of orphans into (worktree, other) counts.
@@ -74,6 +87,57 @@ mod tests {
         assert_eq!(orphans.len(), 1);
         assert_eq!(orphans[0].path, "/no/such/path");
         assert!(!orphans[0].is_worktree);
+    }
+
+    #[test]
+    fn a_file_at_the_path_is_an_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, "x").unwrap();
+        let key = file.to_string_lossy().into_owned();
+        let projects = map(&[(&key, json!({}))]);
+        assert_eq!(
+            find(&projects, false).len(),
+            1,
+            "a file is provably not a project dir"
+        );
+    }
+
+    #[test]
+    fn a_path_through_a_file_is_an_orphan() {
+        // stat() on <file>/child fails with ENOTDIR — still a definitive answer.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, "x").unwrap();
+        let key = file.join("child").to_string_lossy().into_owned();
+        let projects = map(&[(&key, json!({}))]);
+        assert_eq!(find(&projects, false).len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unstatable_path_is_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let project = locked.join("project");
+        std::fs::create_dir(&project).unwrap();
+        let key = project.to_string_lossy().into_owned();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let projects = map(&[(&key, json!({}))]);
+        let orphans = find(&projects, false);
+
+        // Restore so the TempDir can clean up after itself.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Unprivileged: the stat fails with EACCES -> can't tell -> kept. Root
+        // bypasses the mode and sees a live directory -> also kept.
+        assert!(
+            orphans.is_empty(),
+            "unstatable entries must never be pruned: {orphans:?}"
+        );
     }
 
     #[test]

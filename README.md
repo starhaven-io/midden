@@ -41,7 +41,7 @@ cargo install --git https://github.com/starhaven-io/midden
 
 ## Usage
 
-All commands default to safe modes: dry-run for prune, read-only for show, and report-only for doctor. Writes always require an explicit flag, create a timestamped backup first, and replace the file atomically. Use `--json` for machine-readable output.
+All commands default to safe modes: dry-run for prune, read-only for show, and report-only for doctor. Writes always require an explicit flag, create a timestamped backup first, and replace the file atomically, preserving its file mode. Use `--json` for machine-readable output.
 
 ```bash
 # Show what's actually active for a directory with provenance
@@ -149,7 +149,7 @@ dry run. re-run with --apply to remove these entries.
 quit all Claude Code sessions first; it rewrites this file live.
 ```
 
-An entry is a removal candidate only if its directory is provably absent from disk. midden never guesses from value contents. `--worktrees-only` restricts to entries under a `.claude/worktrees/` path. If nearly all entries resolve missing — usually a sign you are on a different machine or an unmounted volume rather than that they are all dead — `prune --apply` refuses unless you pass `--force`.
+An entry is a removal candidate only if its directory is provably absent from disk — a path that merely *fails to stat* (permission denied, an unreachable mount) is kept, and midden never guesses from value contents. `--worktrees-only` restricts to entries under a `.claude/worktrees/` path. If nearly all entries resolve missing — usually a sign you are on a different machine or an unmounted volume rather than that they are all dead — `prune --apply` refuses unless you pass `--force`.
 
 ## What doctor checks
 

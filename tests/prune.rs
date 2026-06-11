@@ -96,6 +96,31 @@ fn backup_is_a_faithful_copy_of_the_pre_apply_config() {
     assert_ne!(after, before, "live config should have changed");
 }
 
+#[cfg(unix)]
+#[test]
+fn apply_never_broadens_the_config_file_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fixture::new();
+    let live = fx.touch_dir("live-project");
+    fx.write_config(standard_projects(&live), standard_extras());
+    // Claude Code keeps ~/.claude.json owner-only; a prune --apply must not
+    // republish it under the umask default (the 0600 -> 0644 regression).
+    std::fs::set_permissions(&fx.config, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    fx.cmd()
+        .arg("prune")
+        .arg("--apply")
+        .arg("--force")
+        .assert()
+        .success();
+
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode(&fx.config), 0o600, "config must stay owner-only");
+    let backups = fx.backup_paths();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(mode(&backups[0]), 0o600, "backup holds the same secrets");
+}
+
 #[test]
 fn worktrees_only_skips_non_worktree_orphans() {
     let fx = Fixture::new();
