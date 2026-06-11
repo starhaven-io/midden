@@ -35,6 +35,20 @@ pub fn render(data: &Value) -> Result<String> {
     serde_json::to_string_pretty(data).map_err(|e| anyhow!("serialize: {e}"))
 }
 
+/// The `projects.<dir>` entry whose key refers to `root`, if any. Claude Code
+/// records the working directory as the shell reported it, which can differ
+/// from the canonical form (macOS `/var` -> `/private/var`), so fall back to
+/// comparing canonicalized keys when no exact match exists.
+pub fn project_entry<'a>(data: &'a Value, root: &Path) -> Option<&'a Value> {
+    let projects = data.get("projects")?.as_object()?;
+    if let Some(v) = projects.get(root.to_string_lossy().as_ref()) {
+        return Some(v);
+    }
+    projects
+        .iter()
+        .find_map(|(k, v)| (std::fs::canonicalize(k).ok()? == root).then_some(v))
+}
+
 /// Write `contents` to `path` atomically: stream to a temp sibling on the same
 /// filesystem, flush it to disk, then rename over the target. A crash or
 /// `ENOSPC` mid-write leaves either the old file or the new one intact — never
@@ -92,6 +106,31 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn project_entry_matches_an_exact_key() {
+        let data = json!({ "projects": { "/x/y": { "k": 1 } } });
+        assert!(project_entry(&data, Path::new("/x/y")).is_some());
+        assert!(project_entry(&data, Path::new("/x/z")).is_none());
+    }
+
+    #[test]
+    fn project_entry_falls_back_to_canonical_comparison() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        std::fs::create_dir(&a).unwrap();
+        let root = a.canonicalize().unwrap();
+        // A key recorded in non-canonical form (here via a `.` component) must
+        // still resolve to the same entry.
+        let noncanon = dir.path().join(".").join("a");
+        let mut projects = Map::new();
+        projects.insert(noncanon.to_string_lossy().into_owned(), json!({ "k": 1 }));
+        let mut top = Map::new();
+        top.insert("projects".into(), Value::Object(projects));
+        let data = Value::Object(top);
+        assert!(project_entry(&data, &root).is_some());
+    }
 
     #[test]
     fn write_atomic_replaces_content() {

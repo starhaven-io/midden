@@ -109,6 +109,8 @@ mcp servers
 
 Settings precedence is **Managed → Local → Project → User**. Scalars from a higher scope override; arrays concat and deduplicate across scopes. `show` tags every value with its source and marks contributions shadowed by a higher scope. `CLAUDE.md` files do not follow precedence — all applicable files load simultaneously, so midden lists every contributor and runs a heuristic contradiction-detection pass instead of picking a winner.
 
+MCP servers are gathered from all four scopes: user (`~/.claude.json`), **local** (the per-project entry inside `~/.claude.json` — where `claude mcp add` writes by default), project (`.mcp.json`), and managed (`.claude/managed-mcp.json`).
+
 Secret-looking keys (`*_token`, `*_api_key`, `password`, `credential`, …) are masked to `abcd***` by default. Pass `--show-secrets` to unmask.
 
 ### Doctor
@@ -159,13 +161,15 @@ An entry is a removal candidate only if its directory is provably absent from di
 | `claude-json-bloat` | Info | no | `~/.claude.json` over 512 KB (Claude Code never prunes it) |
 | `stale-worktree` | Info | no | Ephemeral worktree dir untouched for >30 days |
 | `secret-in-committed-settings` | Error | no | Suspect secret in a `settings.json` that git doesn't ignore (masked by default) |
+| `secret-in-committed-mcp` | Error | no | Suspect secret in a `.mcp.json` / `managed-mcp.json` that git doesn't ignore; pure `${VAR}` references are exempt |
 | `local-settings-tracked` | Warn | no | `settings.local.json` tracked by git (meant to stay machine-local) |
 | `local-settings-not-ignored` | Warn | no | `settings.local.json` not gitignored — one `git add` from being committed |
 | `missing-credential-deny` | Warn | no | No `permissions.deny` covers `.env` or `secrets/` paths |
 | `skill-missing-skill-md` | Warn | no | Skill directory missing its `SKILL.md` |
 | `empty-config-file` | Warn | no | Slash command or subagent markdown file is empty |
-| `mcp-server-unreachable` | Warn | no | MCP server defined with no `command` or `url` |
-| `mcp-server-disabled` | Info | no | MCP server defined but `disabled: true` |
+| `mcp-server-unreachable` | Warn | no | MCP server defined with no `command` or `url` (any scope, including local) |
+| `mcp-server-disabled` | Info | no | MCP server defined but disabled — `disabled: true`, or listed in the project's `disabledMcpjsonServers` |
+| `stale-mcp-approval` | Info | no | `enabledMcpjsonServers`/`disabledMcpjsonServers` names a server `.mcp.json` no longer defines |
 
 ## Configuration
 

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use walkdir::WalkDir;
 
+use crate::claude_json;
 use crate::paths::{Env, ProjectPaths, managed_settings_paths};
 use crate::secrets;
 
@@ -606,31 +607,48 @@ struct McpServer {
 
 fn collect_mcp_servers(env: &Env, project: &ProjectPaths) -> Vec<McpServer> {
     let mut out = Vec::new();
-    let candidates: &[(&str, PathBuf)] = &[
-        ("user", env.claude_json.clone()),
+    // User and local scope both live in ~/.claude.json: the top-level
+    // `mcpServers` map is user scope; the per-project entry's `mcpServers` is
+    // local scope — the default destination of `claude mcp add`.
+    if let Some(claude) = read_json(&env.claude_json) {
+        push_mcp_servers(claude.get("mcpServers"), "user", &env.claude_json, &mut out);
+        let local = claude_json::project_entry(&claude, &project.root)
+            .and_then(|entry| entry.get("mcpServers"));
+        push_mcp_servers(local, "local", &env.claude_json, &mut out);
+    }
+    for (scope, path) in [
         ("project", project.mcp_json()),
         ("managed", project.managed_mcp_json()),
-    ];
-    for (scope, path) in candidates {
-        let Some(v) = read_json(path) else { continue };
-        let Some(servers) = v.get("mcpServers").and_then(Value::as_object) else {
-            continue;
-        };
-        for (name, def) in servers {
-            out.push(McpServer {
-                name: name.clone(),
-                scope,
-                file: path.clone(),
-                command: def.get("command").and_then(Value::as_str).map(String::from),
-                url: def.get("url").and_then(Value::as_str).map(String::from),
-                disabled: def
-                    .get("disabled")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            });
+    ] {
+        if let Some(v) = read_json(&path) {
+            push_mcp_servers(v.get("mcpServers"), scope, &path, &mut out);
         }
     }
     out
+}
+
+fn push_mcp_servers(
+    servers: Option<&Value>,
+    scope: &'static str,
+    file: &Path,
+    out: &mut Vec<McpServer>,
+) {
+    let Some(servers) = servers.and_then(Value::as_object) else {
+        return;
+    };
+    for (name, def) in servers {
+        out.push(McpServer {
+            name: name.clone(),
+            scope,
+            file: file.to_path_buf(),
+            command: def.get("command").and_then(Value::as_str).map(String::from),
+            url: def.get("url").and_then(Value::as_str).map(String::from),
+            disabled: def
+                .get("disabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        });
+    }
 }
 
 #[derive(Debug, Serialize)]
