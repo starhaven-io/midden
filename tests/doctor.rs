@@ -162,6 +162,106 @@ fn gitignored_settings_json_is_not_flagged_as_committed_secret() {
 }
 
 #[test]
+fn flags_secret_in_committed_mcp_json() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    write_json(
+        &fx.root.path().join(".mcp.json"),
+        &json!({
+            "mcpServers": {
+                "svc": {
+                    "command": "node",
+                    "env": { "SERVICE_API_KEY": "sk-mcp-committed-aaaa" }
+                }
+            }
+        }),
+    );
+
+    let out = fx.cmd().arg("doctor").arg(fx.root.path()).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("secret-in-committed-mcp"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("mcpServers.svc.env.SERVICE_API_KEY"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("sk-m***"), "stdout:\n{stdout}");
+    assert!(!stdout.contains("sk-mcp-committed-aaaa"), "leak:\n{stdout}");
+}
+
+#[test]
+fn env_expansion_in_mcp_json_is_not_flagged() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    // The recommended pattern: the committed file references the environment
+    // instead of carrying the credential.
+    write_json(
+        &fx.root.path().join(".mcp.json"),
+        &json!({
+            "mcpServers": {
+                "svc": { "command": "node", "env": { "SERVICE_API_KEY": "${SERVICE_API_KEY}" } }
+            }
+        }),
+    );
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("doctor")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let ids: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["id"].as_str())
+        .collect();
+    assert!(
+        !ids.contains(&"secret-in-committed-mcp"),
+        "a ${{VAR}} reference is not a committed secret; ids: {ids:?}"
+    );
+}
+
+#[test]
+fn gitignored_mcp_json_is_not_flagged() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    fx.git(&["init", "--quiet"]);
+    std::fs::write(fx.root.path().join(".gitignore"), ".mcp.json\n").unwrap();
+    write_json(
+        &fx.root.path().join(".mcp.json"),
+        &json!({
+            "mcpServers": {
+                "svc": { "command": "node", "env": { "API_KEY": "sk-mcp-ignored-aaaa" } }
+            }
+        }),
+    );
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("doctor")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let ids: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["id"].as_str())
+        .collect();
+    assert!(
+        !ids.contains(&"secret-in-committed-mcp"),
+        "gitignored .mcp.json is not committed; ids: {ids:?}"
+    );
+}
+
+#[test]
 fn flags_missing_credential_deny_rules() {
     let fx = Fixture::new();
     fx.write_config(json!({}), json!({}));

@@ -159,6 +159,7 @@ An entry is a removal candidate only if its directory is provably absent from di
 | `claude-json-bloat` | Info | no | `~/.claude.json` over 512 KB (Claude Code never prunes it) |
 | `stale-worktree` | Info | no | Ephemeral worktree dir untouched for >30 days |
 | `secret-in-committed-settings` | Error | no | Suspect secret in a `settings.json` that git doesn't ignore (masked by default) |
+| `secret-in-committed-mcp` | Error | no | Suspect secret in a `.mcp.json` / `managed-mcp.json` that git doesn't ignore; pure `${VAR}` references are exempt |
 | `local-settings-tracked` | Warn | no | `settings.local.json` tracked by git (meant to stay machine-local) |
 | `local-settings-not-ignored` | Warn | no | `settings.local.json` not gitignored — one `git add` from being committed |
 | `missing-credential-deny` | Warn | no | No `permissions.deny` covers `.env` or `secrets/` paths |

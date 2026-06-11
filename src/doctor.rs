@@ -381,23 +381,57 @@ fn check_secrets_in_committed_settings(
     out: &mut Vec<Finding>,
     show_secrets: bool,
 ) -> Result<()> {
-    let settings = project.settings();
-    if !settings.exists() {
+    scan_committed_secret_file(
+        project,
+        &project.settings(),
+        "secret-in-committed-settings",
+        |key_path| format!("move `{key_path}` to .claude/settings.local.json (gitignored)"),
+        out,
+        show_secrets,
+    )?;
+    // .mcp.json is committed by design, and MCP server definitions are exactly
+    // where credentials land: env blocks, headers, tokens in args.
+    for path in [project.mcp_json(), project.managed_mcp_json()] {
+        scan_committed_secret_file(
+            project,
+            &path,
+            "secret-in-committed-mcp",
+            |key_path| {
+                format!(
+                    "replace `{key_path}` with a ${{VAR}} expansion, or define the server at \
+                     local scope (`claude mcp add` without `--scope project`)"
+                )
+            },
+            out,
+            show_secrets,
+        )?;
+    }
+    Ok(())
+}
+
+/// Scan one committed JSON file for secret-looking values under
+/// sensitive-named keys.
+fn scan_committed_secret_file(
+    project: &ProjectPaths,
+    file: &Path,
+    id: &'static str,
+    suggested_fix: impl Fn(&str) -> String,
+    out: &mut Vec<Finding>,
+    show_secrets: bool,
+) -> Result<()> {
+    if !file.exists() {
         return Ok(());
     }
-    // A settings.json git explicitly ignores is not "committed" — flagging it as
-    // an Error (and exiting 1) is a false positive for the common pattern of
-    // gitignoring .claude/ wholesale. When git can't tell (not a repo, no git),
-    // fall through and flag it, as before. settings.local.json is covered
-    // separately by check_local_settings_in_git.
-    let rel = settings
-        .strip_prefix(&project.root)
-        .unwrap_or(settings.as_path());
+    // A file git explicitly ignores is not "committed" — flagging it as an
+    // Error (and exiting 1) is a false positive for the common pattern of
+    // gitignoring .claude/ wholesale. When git can't tell (not a repo, no
+    // git), fall through and flag it, as before. settings.local.json is
+    // covered separately by check_local_settings_in_git.
+    let rel = file.strip_prefix(&project.root).unwrap_or(file);
     if git::is_ignored(&project.root, rel) == Some(true) {
         return Ok(());
     }
-    let raw = std::fs::read_to_string(&settings)
-        .with_context(|| format!("read {}", settings.display()))?;
+    let raw = std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
     let Ok(value): Result<Value, _> = serde_json::from_str(&raw) else {
         return Ok(());
     };
@@ -405,27 +439,43 @@ fn check_secrets_in_committed_settings(
     let mut hits = Vec::new();
     walk_for_secrets(&value, "", &mut hits);
 
+    let name = file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     for (key_path, raw_value) in hits {
+        // A pure `${VAR}` reference resolves at load time and commits nothing
+        // — it's the very fix we recommend, so don't flag it.
+        if is_env_expansion(&raw_value) {
+            continue;
+        }
         let displayed = if show_secrets {
             raw_value.clone()
         } else {
             secrets::mask(&raw_value)
         };
         out.push(Finding {
-            id: "secret-in-committed-settings",
+            id,
             severity: Severity::Error,
             location: Location {
-                file: settings.clone(),
+                file: file.to_path_buf(),
                 key_path: Some(key_path.clone()),
             },
-            message: format!("possible secret in committed settings: {key_path} = {displayed}"),
-            suggested_fix: Some(format!(
-                "move `{key_path}` to .claude/settings.local.json (gitignored)"
-            )),
+            message: format!("possible secret in committed {name}: {key_path} = {displayed}"),
+            suggested_fix: Some(suggested_fix(&key_path)),
             auto_fixable: false,
         });
     }
     Ok(())
+}
+
+/// Whether a string is purely a `${VAR}` environment reference. A
+/// `${VAR:-default}` ships whatever the default holds, so it is still scanned.
+fn is_env_expansion(s: &str) -> bool {
+    let Some(inner) = s.strip_prefix("${").and_then(|r| r.strip_suffix('}')) else {
+        return false;
+    };
+    !inner.is_empty() && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn walk_for_secrets(value: &Value, path: &str, out: &mut Vec<(String, String)>) {
@@ -804,6 +854,19 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().any(|(k, _)| k == "credentials.user"));
         assert!(hits.iter().any(|(k, _)| k == "credentials.pass"));
+    }
+
+    #[test]
+    fn env_expansion_detection() {
+        assert!(is_env_expansion("${API_KEY}"));
+        assert!(is_env_expansion("${a1_b2}"));
+        assert!(
+            !is_env_expansion("${API_KEY:-sk-default}"),
+            "defaults ship content"
+        );
+        assert!(!is_env_expansion("sk-real-value"));
+        assert!(!is_env_expansion("${}"));
+        assert!(!is_env_expansion("prefix ${API_KEY}"));
     }
 
     #[test]
