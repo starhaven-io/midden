@@ -49,7 +49,7 @@ CLAUDE.md does **not** follow settings precedence. All applicable files load sim
 
 - **Read-only by default.** Mutation requires an explicit flag (`--apply` / `--fix`).
 - **Backup before every write.** `backup::timestamped_copy` writes a `.bak-YYYYMMDD-HHMMSS` sibling (suffix-bumped on a same-second collision) before any mutation.
-- **Atomic writes.** `claude_json::write_atomic` streams to a temp sibling, fsyncs, then renames over the target — never an in-place truncating write of `~/.claude.json`.
+- **Atomic writes.** `claude_json::write_atomic` streams to a temp sibling, fsyncs, then renames over the target — never an in-place truncating write of `~/.claude.json`. The temp mirrors the target's file mode (owner-only `0600` for new files) so a rewrite never broadens permissions on a credential-bearing file; backups are clamped to `0600` likewise.
 - **Running-`claude` gate.** Refuses to write while a `claude` process runs (Claude Code rewrites the file live). `--force` overrides.
 - **Mass-deletion gate.** Refuses to prune when ≥90% of a non-trivial `projects` map resolves missing — that usually means the wrong host or an unmounted volume, not real orphans. `--force` overrides.
 - **Conservative deletion.** Removes only entries whose directory is provably absent; never guesses from value contents. Apply re-reads and re-derives immediately before writing, so concurrent edits to unrelated keys survive.
@@ -81,7 +81,7 @@ CLAUDE.md does **not** follow settings precedence. All applicable files load sim
 ## Gotchas
 
 - `~/.claude.json` is the central, live file Claude Code rewrites constantly — the highest-stakes thing midden touches. All mutations go through backup → atomic write → the running-claude gate.
-- Orphan detection is existence-only (`Path::is_dir`); "not visible on this host" ≠ "dead", which is why the mass-deletion gate exists.
+- Orphan detection is existence-only (`fs::metadata`): only `NotFound` / `NotADirectory` (or an existing non-directory) count as provably absent — any other stat failure (permission denied, I/O error, dead mount) means "can't tell" and the entry is kept. "Not visible on this host" ≠ "dead", which is why the mass-deletion gate also exists.
 - `git.rs` shells out; treat `None` as "can't tell" (not a repo / no git), never as "false".
 - Integration tests isolate `HOME`, `XDG_CONFIG_HOME`, and `GIT_CONFIG_NOSYSTEM` so a developer's global gitignore can't sway doctor's git checks — preserve that in `tests/common/mod.rs`.
 
