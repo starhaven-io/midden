@@ -130,6 +130,86 @@ fn show_masks_secret_arrays_by_default() {
 }
 
 #[test]
+fn show_masks_token_shaped_values_under_innocent_keys() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let user_settings = fx.claude_home.join("settings.json");
+    // Neither `env.EXTRA` nor `model` looks sensitive by name; the first
+    // value is masked purely by its token shape, the second left alone. The
+    // token is assembled at runtime so the source never holds a
+    // scanner-matching literal.
+    let token = format!("ghp_{}", "AAAAbbbb1111cccc2222dddd3333eeee");
+    write_json(
+        &user_settings,
+        &json!({
+            "env": { "EXTRA": token },
+            "model": "opus"
+        }),
+    );
+
+    let out = fx.cmd().arg("show").arg(fx.root.path()).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("ghp_***"), "stdout:\n{stdout}");
+    assert!(!stdout.contains(&token), "token leaked:\n{stdout}");
+    assert!(stdout.contains("\"opus\""), "stdout:\n{stdout}");
+}
+
+#[test]
+fn show_masks_hook_commands_and_mcp_urls() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let user_settings = fx.claude_home.join("settings.json");
+    write_json(
+        &user_settings,
+        &json!({
+            "hooks": {
+                "Stop": [{ "hooks": [{
+                    "type": "command",
+                    "command": "curl -H 'Authorization: Bearer SECRETtoken1234567890' https://api.example.com/done"
+                }] }]
+            }
+        }),
+    );
+    write_json(
+        &fx.root.path().join(".mcp.json"),
+        &json!({
+            "mcpServers": {
+                "sse": { "url": "https://mcp.example.com/sse?api_key=verysecret1234&v=2" }
+            }
+        }),
+    );
+
+    let out = fx.cmd().arg("show").arg(fx.root.path()).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("SECRETtoken1234567890"),
+        "bearer token leaked:\n{stdout}"
+    );
+    assert!(stdout.contains("SECR***"), "stdout:\n{stdout}");
+    assert!(
+        !stdout.contains("verysecret1234"),
+        "url query secret leaked:\n{stdout}"
+    );
+    assert!(stdout.contains("api_key=very***"), "stdout:\n{stdout}");
+    assert!(stdout.contains("v=2"), "innocent param survives:\n{stdout}");
+
+    // --show-secrets restores the raw values.
+    let out = fx
+        .cmd()
+        .arg("show")
+        .arg(fx.root.path())
+        .arg("--show-secrets")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("SECRETtoken1234567890"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("verysecret1234"), "stdout:\n{stdout}");
+}
+
+#[test]
 fn show_secrets_flag_unmasks() {
     let fx = Fixture::new();
     fx.write_config(json!({}), json!({}));

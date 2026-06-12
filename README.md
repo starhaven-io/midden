@@ -111,7 +111,7 @@ Settings precedence is **Managed → Local → Project → User**. Scalars from 
 
 MCP servers are gathered from all four scopes: user (`~/.claude.json`), **local** (the per-project entry inside `~/.claude.json` — where `claude mcp add` writes by default), project (`.mcp.json`), and managed (`.claude/managed-mcp.json`).
 
-Secret-looking keys (`*_token`, `*_api_key`, `password`, `credential`, …) are masked to `abcd***` by default. Pass `--show-secrets` to unmask.
+Secrets are masked to `abcd***` by default — both by key name (`*_token`, `*_api_key`, `password`, `credential`, …) and by value shape under innocent keys: known token prefixes (`sk-`, `ghp_`, `xoxb-`, AWS key ids, JWTs, private-key blocks), `user:pass` URLs, credential-named query parameters, and `Bearer` tokens inside hook commands. Pass `--show-secrets` to unmask.
 
 ### Doctor
 
@@ -160,8 +160,8 @@ An entry is a removal candidate only if its directory is provably absent from di
 | `orphaned-project` | Warn | yes | `projects` entry whose directory no longer exists |
 | `claude-json-bloat` | Info | no | `~/.claude.json` over 512 KB (Claude Code never prunes it) |
 | `stale-worktree` | Info | no | Ephemeral worktree dir untouched for >30 days |
-| `secret-in-committed-settings` | Error | no | Suspect secret in a `settings.json` that git doesn't ignore (masked by default) |
-| `secret-in-committed-mcp` | Error | no | Suspect secret in a `.mcp.json` / `managed-mcp.json` that git doesn't ignore; pure `${VAR}` references are exempt |
+| `secret-in-committed-settings` | Error | no | Suspect secret in a `settings.json` that git doesn't ignore — by key name or value shape (masked by default) |
+| `secret-in-committed-mcp` | Error | no | Suspect secret in a `.mcp.json` / `managed-mcp.json` that git doesn't ignore — by key name or value shape; pure `${VAR}` references are exempt |
 | `local-settings-tracked` | Warn | no | `settings.local.json` tracked by git (meant to stay machine-local) |
 | `local-settings-not-ignored` | Warn | no | `settings.local.json` not gitignored — one `git add` from being committed |
 | `missing-credential-deny` | Warn | no | No `permissions.deny` covers `.env` or `secrets/` paths |
