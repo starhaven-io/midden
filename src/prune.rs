@@ -55,7 +55,7 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
 
     if opts.json {
         let applied = if opts.apply {
-            Some(apply_prune(env, &opts)?)
+            apply_prune(env, &opts)?
         } else {
             None
         };
@@ -107,13 +107,20 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let (backup_path, removed, _) = apply_prune(env, &opts)?;
-    println!();
-    println!("backed up to {}", backup_path.display());
-    println!(
-        "removed {removed} entries from {}",
-        env.claude_json.display()
-    );
+    match apply_prune(env, &opts)? {
+        Some((backup_path, removed, _)) => {
+            println!();
+            println!("backed up to {}", backup_path.display());
+            println!(
+                "removed {removed} entries from {}",
+                env.claude_json.display()
+            );
+        }
+        None => {
+            println!();
+            println!("nothing left to remove on re-check; file left unmodified.");
+        }
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -129,8 +136,9 @@ fn preview_pruned(config: &ClaudeJson, orphans: &[orphans::Orphan]) -> Result<St
 /// Re-read the config immediately before writing — so a concurrent Claude Code
 /// rewrite of unrelated keys survives — and re-check existence so a directory
 /// re-created since detection is not pruned. Backs up, then writes atomically.
-/// Returns (backup path, entries removed, bytes after).
-fn apply_prune(env: &Env, opts: &Options) -> Result<(PathBuf, usize, usize)> {
+/// Returns (backup path, entries removed, bytes after), or None when the
+/// re-check leaves nothing to remove and the file is left untouched.
+fn apply_prune(env: &Env, opts: &Options) -> Result<Option<(PathBuf, usize, usize)>> {
     let mut config = ClaudeJson::load(&env.claude_json)?;
     let total = config.projects().map(|p| p.len()).unwrap_or(0);
     let drop: BTreeSet<String> = match config.projects() {
@@ -166,8 +174,51 @@ fn apply_prune(env: &Env, opts: &Options) -> Result<(PathBuf, usize, usize)> {
         }
         None => 0,
     };
+    if removed == 0 {
+        // Everything re-checked as live since detection — rewriting an
+        // identical file (and leaving a backup behind) serves nobody.
+        return Ok(None);
+    }
     let new_raw = claude_json::render(&config.data)?;
     let backup_path = backup::timestamped_copy(&env.claude_json)?;
     claude_json::write_atomic(&env.claude_json, &new_raw)?;
-    Ok((backup_path, removed, new_raw.len()))
+    Ok(Some((backup_path, removed, new_raw.len())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn apply_prune_skips_the_write_when_recheck_finds_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let config_path = home.path().join(".claude.json");
+        let live = tempfile::tempdir().unwrap();
+        let key = live.path().to_string_lossy().into_owned();
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&json!({ "projects": { &key: {} } })).unwrap(),
+        )
+        .unwrap();
+        let env = Env::new(Some(config_path.clone()), Some(home.path().join(".claude")));
+        let opts = Options {
+            apply: true,
+            worktrees_only: false,
+            force: true,
+            json: true,
+        };
+        let before = std::fs::read_to_string(&config_path).unwrap();
+
+        let applied = apply_prune(&env, &opts).unwrap();
+
+        assert!(applied.is_none(), "no orphans on re-check -> no write");
+        assert_eq!(before, std::fs::read_to_string(&config_path).unwrap());
+        let backups = std::fs::read_dir(home.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".bak-"))
+            .count();
+        assert_eq!(backups, 0, "no backup for a no-op");
+    }
 }
