@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use walkdir::WalkDir;
 
 use crate::claude_json;
-use crate::paths::{Env, ProjectPaths, managed_settings_paths};
+use crate::paths::{Env, ProjectPaths, managed_settings_files};
 use crate::secrets;
 
 pub struct Options {
@@ -76,29 +76,9 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     if let Some(v) = read_json(&project.local_settings()) {
         sources.push((Scope::Local, project.local_settings(), v));
     }
-    for managed in managed_settings_paths() {
-        if managed.is_file() {
-            if let Some(v) = read_json(&managed) {
-                sources.push((Scope::Managed, managed, v));
-            }
-        } else if managed.is_dir() {
-            // Drop-in directory: merge each *.json file inside. Sort the paths
-            // first — read_dir order is unspecified, and for equal-scope sources
-            // the last one wins a scalar, so an unsorted read would make the
-            // resolved winner nondeterministic across runs and machines.
-            if let Ok(entries) = std::fs::read_dir(&managed) {
-                let mut paths: Vec<PathBuf> = entries
-                    .flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
-                    .collect();
-                paths.sort();
-                for p in paths {
-                    if let Some(v) = read_json(&p) {
-                        sources.push((Scope::Managed, p, v));
-                    }
-                }
-            }
+    for managed in managed_settings_files() {
+        if let Some(v) = read_json(&managed) {
+            sources.push((Scope::Managed, managed, v));
         }
     }
 

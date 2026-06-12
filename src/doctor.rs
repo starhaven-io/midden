@@ -13,7 +13,7 @@ use crate::claude_json::{self, ClaudeJson};
 use crate::git;
 use crate::orphans;
 use crate::output;
-use crate::paths::{Env, ProjectPaths};
+use crate::paths::{Env, ProjectPaths, managed_settings_files};
 use crate::process;
 use crate::secrets;
 
@@ -667,11 +667,15 @@ fn recommend_deny_location(project: &ProjectPaths, env: &Env) -> (PathBuf, Strin
 
 fn merged_deny_rules(project: &ProjectPaths, env: &Env) -> Result<Vec<String>> {
     let mut out = Vec::new();
-    for path in [
+    // Managed scope can carry the org-wide deny rules; ignoring it produced
+    // false missing-credential-deny findings on MDM-managed machines.
+    let mut paths = vec![
         env.user_settings(),
         project.settings(),
         project.local_settings(),
-    ] {
+    ];
+    paths.extend(managed_settings_files());
+    for path in paths {
         if let Ok(text) = std::fs::read_to_string(&path)
             && let Ok(v) = serde_json::from_str::<Value>(&text)
             && let Some(deny) = v.pointer("/permissions/deny").and_then(Value::as_array)
