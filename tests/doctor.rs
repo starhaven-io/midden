@@ -518,6 +518,18 @@ fn json_fix_applied_reflects_whether_a_mutation_happened() {
 }
 
 #[test]
+fn nonexistent_target_path_is_an_error() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    fx.cmd()
+        .arg("doctor")
+        .arg("/no/such/target")
+        .assert()
+        .code(2)
+        .stderr(contains("target directory not found"));
+}
+
+#[test]
 fn errors_on_malformed_claude_json() {
     let fx = Fixture::new();
     std::fs::write(&fx.config, "{ not valid json").unwrap();

@@ -57,7 +57,16 @@ pub struct Finding {
 }
 
 pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
-    let project = ProjectPaths::new(opts.path.canonicalize().unwrap_or(opts.path.clone()));
+    // A typo'd path silently no-ops every project check and reports "clean" —
+    // bad input is the exit-2 lane, not a passing bill of health.
+    let root = opts
+        .path
+        .canonicalize()
+        .with_context(|| format!("target directory not found: {}", opts.path.display()))?;
+    if !root.is_dir() {
+        bail!("target is not a directory: {}", root.display());
+    }
+    let project = ProjectPaths::new(root);
     let mut findings = Vec::new();
 
     // Read the user-scope ~/.claude.json once; three checks consult it. A parse

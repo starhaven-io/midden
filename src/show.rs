@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use colored::Colorize;
 use serde::Serialize;
 use serde_json::Value;
@@ -55,7 +55,15 @@ struct Resolved {
 }
 
 pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
-    let root = opts.path.canonicalize().unwrap_or(opts.path.clone());
+    // A typo'd path would resolve an empty report as if it were real state —
+    // bad input is the exit-2 lane.
+    let root = opts
+        .path
+        .canonicalize()
+        .with_context(|| format!("target directory not found: {}", opts.path.display()))?;
+    if !root.is_dir() {
+        bail!("target is not a directory: {}", root.display());
+    }
     let project = ProjectPaths::new(&root);
 
     let mut sources: Vec<(Scope, PathBuf, Value)> = Vec::new();
