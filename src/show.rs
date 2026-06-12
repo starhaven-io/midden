@@ -435,11 +435,22 @@ fn parse_directive(line: &str) -> Option<(Polarity, String, String)> {
         return None;
     }
     let lower = trimmed.to_ascii_lowercase();
+    // Negations before their positive prefixes: "must not" would otherwise
+    // parse as a positive "must" and invert the directive's polarity. The
+    // typographic apostrophe variant shows up in prose-styled files.
     let (polarity, rest) = if let Some(rest) = lower.strip_prefix("never ") {
         (Polarity::Dont, rest)
-    } else if let Some(rest) = lower.strip_prefix("don't ") {
+    } else if let Some(rest) = lower
+        .strip_prefix("don't ")
+        .or_else(|| lower.strip_prefix("don’t "))
+    {
         (Polarity::Dont, rest)
     } else if let Some(rest) = lower.strip_prefix("do not ") {
+        (Polarity::Dont, rest)
+    } else if let Some(rest) = lower
+        .strip_prefix("must not ")
+        .or_else(|| lower.strip_prefix("must never "))
+    {
         (Polarity::Dont, rest)
     } else if let Some(rest) = lower.strip_prefix("always ") {
         (Polarity::Do, rest)
@@ -1018,6 +1029,44 @@ mod tests {
         assert_eq!(pol, Polarity::Do);
 
         assert!(parse_directive("This is a paragraph.").is_none());
+    }
+
+    #[test]
+    fn parse_directive_handles_negated_must() {
+        let (pol, kw, _) = parse_directive("- Must not commit directly to main").unwrap();
+        assert_eq!(pol, Polarity::Dont, "must not is a negation");
+        assert!(kw.starts_with("commit"), "keyword: {kw}");
+
+        let (pol, _, _) = parse_directive("must never push tags").unwrap();
+        assert_eq!(pol, Polarity::Dont);
+
+        // Typographic apostrophe, common in prose-styled CLAUDE.md files.
+        let (pol, _, _) = parse_directive("Don’t use tabs").unwrap();
+        assert_eq!(pol, Polarity::Dont);
+    }
+
+    #[test]
+    fn must_not_contradicts_always() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("A.md");
+        let b = dir.path().join("B.md");
+        std::fs::write(&a, "- Always use tabs.\n").unwrap();
+        std::fs::write(&b, "- Must not use tabs.\n").unwrap();
+        let files = vec![
+            ClaudeMd {
+                file: a,
+                scope: ClaudeMdScope::User,
+                bytes: 0,
+            },
+            ClaudeMd {
+                file: b,
+                scope: ClaudeMdScope::Project,
+                bytes: 0,
+            },
+        ];
+        let c = detect_contradictions(&files);
+        assert_eq!(c.len(), 1, "polarity must differ: {c:?}");
+        assert!(c[0].keyword.starts_with("use"));
     }
 
     #[test]
