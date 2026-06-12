@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use colored::Colorize;
 use serde::Serialize;
 use serde_json::Value;
@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use walkdir::WalkDir;
 
 use crate::claude_json;
-use crate::paths::{Env, ProjectPaths, managed_settings_paths};
+use crate::paths::{Env, ProjectPaths, managed_settings_files};
 use crate::secrets;
 
 pub struct Options {
@@ -55,7 +55,15 @@ struct Resolved {
 }
 
 pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
-    let root = opts.path.canonicalize().unwrap_or(opts.path.clone());
+    // A typo'd path would resolve an empty report as if it were real state —
+    // bad input is the exit-2 lane.
+    let root = opts
+        .path
+        .canonicalize()
+        .with_context(|| format!("target directory not found: {}", opts.path.display()))?;
+    if !root.is_dir() {
+        bail!("target is not a directory: {}", root.display());
+    }
     let project = ProjectPaths::new(&root);
 
     let mut sources: Vec<(Scope, PathBuf, Value)> = Vec::new();
@@ -68,29 +76,9 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     if let Some(v) = read_json(&project.local_settings()) {
         sources.push((Scope::Local, project.local_settings(), v));
     }
-    for managed in managed_settings_paths() {
-        if managed.is_file() {
-            if let Some(v) = read_json(&managed) {
-                sources.push((Scope::Managed, managed, v));
-            }
-        } else if managed.is_dir() {
-            // Drop-in directory: merge each *.json file inside. Sort the paths
-            // first — read_dir order is unspecified, and for equal-scope sources
-            // the last one wins a scalar, so an unsorted read would make the
-            // resolved winner nondeterministic across runs and machines.
-            if let Ok(entries) = std::fs::read_dir(&managed) {
-                let mut paths: Vec<PathBuf> = entries
-                    .flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
-                    .collect();
-                paths.sort();
-                for p in paths {
-                    if let Some(v) = read_json(&p) {
-                        sources.push((Scope::Managed, p, v));
-                    }
-                }
-            }
+    for managed in managed_settings_files() {
+        if let Some(v) = read_json(&managed) {
+            sources.push((Scope::Managed, managed, v));
         }
     }
 
@@ -435,11 +423,22 @@ fn parse_directive(line: &str) -> Option<(Polarity, String, String)> {
         return None;
     }
     let lower = trimmed.to_ascii_lowercase();
+    // Negations before their positive prefixes: "must not" would otherwise
+    // parse as a positive "must" and invert the directive's polarity. The
+    // typographic apostrophe variant shows up in prose-styled files.
     let (polarity, rest) = if let Some(rest) = lower.strip_prefix("never ") {
         (Polarity::Dont, rest)
-    } else if let Some(rest) = lower.strip_prefix("don't ") {
+    } else if let Some(rest) = lower
+        .strip_prefix("don't ")
+        .or_else(|| lower.strip_prefix("don’t "))
+    {
         (Polarity::Dont, rest)
     } else if let Some(rest) = lower.strip_prefix("do not ") {
+        (Polarity::Dont, rest)
+    } else if let Some(rest) = lower
+        .strip_prefix("must not ")
+        .or_else(|| lower.strip_prefix("must never "))
+    {
         (Polarity::Dont, rest)
     } else if let Some(rest) = lower.strip_prefix("always ") {
         (Polarity::Do, rest)
@@ -1018,6 +1017,44 @@ mod tests {
         assert_eq!(pol, Polarity::Do);
 
         assert!(parse_directive("This is a paragraph.").is_none());
+    }
+
+    #[test]
+    fn parse_directive_handles_negated_must() {
+        let (pol, kw, _) = parse_directive("- Must not commit directly to main").unwrap();
+        assert_eq!(pol, Polarity::Dont, "must not is a negation");
+        assert!(kw.starts_with("commit"), "keyword: {kw}");
+
+        let (pol, _, _) = parse_directive("must never push tags").unwrap();
+        assert_eq!(pol, Polarity::Dont);
+
+        // Typographic apostrophe, common in prose-styled CLAUDE.md files.
+        let (pol, _, _) = parse_directive("Don’t use tabs").unwrap();
+        assert_eq!(pol, Polarity::Dont);
+    }
+
+    #[test]
+    fn must_not_contradicts_always() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("A.md");
+        let b = dir.path().join("B.md");
+        std::fs::write(&a, "- Always use tabs.\n").unwrap();
+        std::fs::write(&b, "- Must not use tabs.\n").unwrap();
+        let files = vec![
+            ClaudeMd {
+                file: a,
+                scope: ClaudeMdScope::User,
+                bytes: 0,
+            },
+            ClaudeMd {
+                file: b,
+                scope: ClaudeMdScope::Project,
+                bytes: 0,
+            },
+        ];
+        let c = detect_contradictions(&files);
+        assert_eq!(c.len(), 1, "polarity must differ: {c:?}");
+        assert!(c[0].keyword.starts_with("use"));
     }
 
     #[test]

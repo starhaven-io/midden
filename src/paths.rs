@@ -118,5 +118,59 @@ pub fn managed_settings_paths() -> Vec<PathBuf> {
     }
 }
 
+/// Managed settings expanded to concrete files: plain files kept as-is,
+/// drop-in directories expanded to their `*.json` entries.
+pub fn managed_settings_files() -> Vec<PathBuf> {
+    expand_managed(managed_settings_paths())
+}
+
+/// Sorted expansion — read_dir order is unspecified, and the last equal-scope
+/// source wins a scalar, so an unsorted read would make the resolved winner
+/// nondeterministic across runs and machines.
+fn expand_managed(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for candidate in candidates {
+        if candidate.is_file() {
+            out.push(candidate);
+        } else if candidate.is_dir()
+            && let Ok(entries) = std::fs::read_dir(&candidate)
+        {
+            let mut files: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+                .collect();
+            files.sort();
+            out.extend(files);
+        }
+    }
+    out
+}
+
 /// The marker substring that identifies ephemeral worktree directories.
 pub const WORKTREE_MARKER: &str = "/.claude/worktrees/";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_managed_keeps_files_and_expands_dirs_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("managed-settings.json");
+        std::fs::write(&plain, "{}").unwrap();
+        let dropin = dir.path().join("managed-settings.d");
+        std::fs::create_dir(&dropin).unwrap();
+        std::fs::write(dropin.join("b.json"), "{}").unwrap();
+        std::fs::write(dropin.join("a.json"), "{}").unwrap();
+        std::fs::write(dropin.join("ignore.txt"), "").unwrap();
+        let missing = dir.path().join("nope.json");
+
+        let files = expand_managed(vec![plain.clone(), dropin.clone(), missing]);
+        assert_eq!(
+            files,
+            vec![plain, dropin.join("a.json"), dropin.join("b.json")],
+            "files kept, dirs expanded sorted, non-json and missing dropped"
+        );
+    }
+}

@@ -318,6 +318,18 @@ fn show_lists_skills_with_skill_md() {
 }
 
 #[test]
+fn nonexistent_target_path_is_an_error() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    fx.cmd()
+        .arg("show")
+        .arg("/no/such/target")
+        .assert()
+        .code(2)
+        .stderr(contains("target directory not found"));
+}
+
+#[test]
 fn json_output_emits_root_and_all_sections() {
     let fx = Fixture::new();
     fx.write_config(json!({}), json!({}));
