@@ -211,12 +211,28 @@ fn apply_fixes(env: &Env, findings: &[Finding], opts: &Options) -> Result<bool> 
 
     let mut config = ClaudeJson::load(&env.claude_json)?;
     let total = config.projects().map(|p| p.len()).unwrap_or(0);
-    if !opts.force && orphans::looks_like_wrong_host(prune_targets.len(), total) {
+    // Re-verify against the just-loaded state, exactly as prune's apply path
+    // does: a directory recreated since the scan must survive the fix.
+    let still_orphaned: HashSet<String> = match config.projects() {
+        Some(projects) => orphans::find(projects, false)
+            .into_iter()
+            .map(|o| o.path)
+            .collect(),
+        None => return Ok(false),
+    };
+    let targets: HashSet<&str> = prune_targets
+        .into_iter()
+        .filter(|k| still_orphaned.contains(*k))
+        .collect();
+    if targets.is_empty() {
+        return Ok(false);
+    }
+    if !opts.force && orphans::looks_like_wrong_host(targets.len(), total) {
         bail!(
             "{} of {} project entries resolve missing — this usually means you are on a \
              different machine or an unmounted volume, not that they are all dead. \
              Re-run with --force to prune them anyway.",
-            prune_targets.len(),
+            targets.len(),
             total
         );
     }
@@ -224,7 +240,7 @@ fn apply_fixes(env: &Env, findings: &[Finding], opts: &Options) -> Result<bool> 
         return Ok(false);
     };
     let before = map.len();
-    map.retain(|k, _| !prune_targets.contains(k.as_str()));
+    map.retain(|k, _| !targets.contains(k.as_str()));
     let removed = before - map.len();
     if removed == 0 {
         return Ok(false);
@@ -932,6 +948,58 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().any(|(k, _)| k == "credentials.user"));
         assert!(hits.iter().any(|(k, _)| k == "credentials.pass"));
+    }
+
+    #[test]
+    fn apply_fixes_keeps_entries_whose_directory_reappeared() {
+        let home = tempfile::tempdir().unwrap();
+        let config_path = home.path().join(".claude.json");
+        let live = tempfile::tempdir().unwrap();
+        let live_key = live.path().to_string_lossy().into_owned();
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&serde_json::json!({ "projects": { &live_key: {} } }))
+                .unwrap(),
+        )
+        .unwrap();
+        let env = Env::new(Some(config_path.clone()), Some(home.path().join(".claude")));
+
+        // A finding recorded while the directory was missing; it exists again
+        // by the time the fix runs and must survive.
+        let findings = vec![Finding {
+            id: "orphaned-project",
+            severity: Severity::Warn,
+            location: Location {
+                file: config_path.clone(),
+                key_path: Some(format!("projects.{live_key}")),
+            },
+            message: String::new(),
+            suggested_fix: None,
+            auto_fixable: true,
+        }];
+        let opts = Options {
+            path: PathBuf::from("."),
+            fix: true,
+            force: true,
+            show_secrets: false,
+            json: true,
+        };
+        let before = std::fs::read_to_string(&config_path).unwrap();
+
+        let changed = apply_fixes(&env, &findings, &opts).unwrap();
+
+        assert!(!changed, "a re-verified live directory must not be pruned");
+        assert_eq!(
+            before,
+            std::fs::read_to_string(&config_path).unwrap(),
+            "config must be untouched"
+        );
+        let backups = std::fs::read_dir(home.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".bak-"))
+            .count();
+        assert_eq!(backups, 0, "no backup when nothing is fixed");
     }
 
     #[test]
