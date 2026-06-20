@@ -380,6 +380,41 @@ fn flags_unreachable_mcp_server() {
 }
 
 #[test]
+fn flags_plaintext_remote_mcp_url() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    write_json(
+        &fx.root.path().join(".mcp.json"),
+        &json!({
+            "mcpServers": {
+                "remote": { "url": "http://mcp.example.com/sse" },
+                "local": { "url": "http://localhost:9999/sse" }
+            }
+        }),
+    );
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("doctor")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let findings = v["findings"].as_array().unwrap();
+    let plaintext: Vec<_> = findings
+        .iter()
+        .filter(|f| f["id"] == "mcp-server-plaintext-http")
+        .collect();
+    assert_eq!(plaintext.len(), 1, "findings: {findings:?}");
+    assert!(
+        plaintext[0]["message"].as_str().unwrap().contains("remote"),
+        "finding: {}",
+        plaintext[0]
+    );
+}
+
+#[test]
 fn flags_unreachable_local_scope_mcp_server() {
     let fx = Fixture::new();
     // Local scope: the server definition lives in the project's entry inside

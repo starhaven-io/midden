@@ -963,6 +963,22 @@ fn scan_mcp_servers(v: &Value, file: &Path, key_prefix: &str, out: &mut Vec<Find
                 auto_fixable: false,
             });
         }
+        if is_plaintext_remote_url(url) {
+            out.push(Finding {
+                id: "mcp-server-plaintext-http",
+                severity: Severity::Warn,
+                location: Location {
+                    file: file.to_path_buf(),
+                    key_path: Some(format!("{key_prefix}mcpServers.{name}")),
+                },
+                message: format!("MCP server `{name}` uses plaintext HTTP for a non-local URL"),
+                suggested_fix: Some(
+                    "use https for remote MCP servers, or bind to localhost for local-only servers"
+                        .into(),
+                ),
+                auto_fixable: false,
+            });
+        }
         if def.get("disabled").and_then(Value::as_bool) == Some(true) {
             out.push(Finding {
                 id: "mcp-server-disabled",
@@ -977,6 +993,30 @@ fn scan_mcp_servers(v: &Value, file: &Path, key_prefix: &str, out: &mut Vec<Find
             });
         }
     }
+}
+
+fn is_plaintext_remote_url(url: &str) -> bool {
+    // The scheme is case-insensitive (RFC 3986), so match http:// in any case —
+    // HTTP:// is exactly as plaintext as http://.
+    const SCHEME: &str = "http://";
+    let rest = match url.get(..SCHEME.len()) {
+        Some(prefix) if prefix.eq_ignore_ascii_case(SCHEME) => &url[SCHEME.len()..],
+        _ => return false,
+    };
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit('@')
+        .next()
+        .unwrap_or("");
+    let host = authority
+        .strip_prefix('[')
+        .and_then(|s| s.split_once(']').map(|(host, _)| host))
+        .or_else(|| authority.split_once(':').map(|(host, _)| host))
+        .unwrap_or(authority);
+    let host = host.to_ascii_lowercase();
+    !(host == "localhost" || host.starts_with("127.") || host == "::1")
 }
 
 /// `.mcp.json` servers are approved or rejected per project via the
@@ -1057,6 +1097,41 @@ mod tests {
         assert!(!is_ephemeral_slug("Some-Name"));
         assert!(!is_ephemeral_slug("singleword"));
         assert!(!is_ephemeral_slug("a-b"));
+    }
+
+    #[test]
+    fn plaintext_remote_url_detection() {
+        // Remote plaintext HTTP — flagged.
+        assert!(is_plaintext_remote_url("http://mcp.example.com/sse"));
+        assert!(is_plaintext_remote_url("http://example.com"));
+        assert!(is_plaintext_remote_url(
+            "http://example.com:8080/path?q=1#frag"
+        ));
+        // Userinfo is stripped before the host is read.
+        assert!(is_plaintext_remote_url("http://user:pass@example.com/x"));
+        assert!(is_plaintext_remote_url("http://user@host.example/x"));
+        // The scheme is matched case-insensitively, so an uppercased scheme
+        // can't evade the check.
+        assert!(is_plaintext_remote_url("HTTP://example.com"));
+        assert!(is_plaintext_remote_url("HtTp://mcp.example.com/sse"));
+
+        // HTTPS is never plaintext, in any case.
+        assert!(!is_plaintext_remote_url("https://example.com"));
+        assert!(!is_plaintext_remote_url("https://mcp.example.com/sse"));
+        assert!(!is_plaintext_remote_url("HTTPS://example.com"));
+
+        // Loopback hosts are local — not flagged.
+        assert!(!is_plaintext_remote_url("http://localhost"));
+        assert!(!is_plaintext_remote_url("http://localhost:9999/sse"));
+        assert!(!is_plaintext_remote_url("http://LOCALHOST:9999")); // host match is case-insensitive
+        assert!(!is_plaintext_remote_url("http://127.0.0.1:3000"));
+        assert!(!is_plaintext_remote_url("http://127.0.0.53/path")); // all of 127.0.0.0/8
+        assert!(!is_plaintext_remote_url("http://[::1]:8080/sse"));
+
+        // Empty url (stdio server), non-http schemes — not plaintext HTTP.
+        assert!(!is_plaintext_remote_url(""));
+        assert!(!is_plaintext_remote_url("npx some-server"));
+        assert!(!is_plaintext_remote_url("ws://example.com"));
     }
 
     #[test]
