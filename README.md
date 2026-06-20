@@ -170,6 +170,7 @@ An entry is a removal candidate only if its directory is provably absent from di
 | `missing-credential-deny` | Warn | no | No `permissions.deny` covers `.env` or `secrets/` paths |
 | `skill-missing-skill-md` | Warn | no | Skill directory missing its `SKILL.md` |
 | `empty-config-file` | Warn | no | Slash command or subagent markdown file is empty |
+| `missing-frontmatter` | Warn | no | Subagent markdown file missing the required `---` YAML frontmatter (slash commands don't need it) |
 | `mcp-server-unreachable` | Warn | no | MCP server defined with no `command` or `url` (any scope, including local) |
 | `mcp-server-disabled` | Info | no | MCP server defined but disabled — `disabled: true`, or listed in the project's `disabledMcpjsonServers` |
 | `stale-mcp-approval` | Info | no | `enabledMcpjsonServers`/`disabledMcpjsonServers` names a server `.mcp.json` no longer defines |
