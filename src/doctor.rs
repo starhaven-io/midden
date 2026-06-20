@@ -832,12 +832,14 @@ fn check_dead_skill_command_agent_refs(
         }
     }
 
-    // Commands and agents are bare markdown files. Flag empty files.
-    for (label, dir) in [
-        ("user command", env.user_commands_dir()),
-        ("project command", project.commands_dir()),
-        ("user agent", env.user_agents_dir()),
-        ("project agent", project.agents_dir()),
+    // Commands and agents are bare markdown files. Flag empty files, and flag
+    // subagents missing the YAML frontmatter their loader requires. Slash
+    // commands work without frontmatter, so only agents are checked for it.
+    for (label, dir, requires_frontmatter) in [
+        ("user command", env.user_commands_dir(), false),
+        ("project command", project.commands_dir(), false),
+        ("user agent", env.user_agents_dir(), true),
+        ("project agent", project.agents_dir(), true),
     ] {
         if !dir.is_dir() {
             continue;
@@ -874,10 +876,37 @@ fn check_dead_skill_command_agent_refs(
                     suggested_fix: Some("remove the file or add content".into()),
                     auto_fixable: false,
                 });
+            } else if requires_frontmatter && !has_frontmatter(&text) {
+                out.push(Finding {
+                    id: "missing-frontmatter",
+                    severity: Severity::Warn,
+                    location: Location {
+                        file: path.to_path_buf(),
+                        key_path: None,
+                    },
+                    message: format!("{label} file is missing frontmatter: {}", path.display()),
+                    suggested_fix: Some(
+                        "add YAML frontmatter delimited by `---` (subagents need at least \
+                         name and description), or remove the file"
+                            .into(),
+                    ),
+                    auto_fixable: false,
+                });
             }
         }
     }
     Ok(())
+}
+
+// Subagent files require leading YAML frontmatter (`---` … `---`); a missing
+// block means the loader can't read the agent's name/description. Slash
+// commands have no such requirement, so callers gate this on agent dirs.
+fn has_frontmatter(text: &str) -> bool {
+    let mut lines = text.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return false;
+    }
+    lines.any(|line| line.trim() == "---")
 }
 
 fn check_disabled_mcp_servers(

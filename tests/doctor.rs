@@ -663,6 +663,42 @@ fn flags_empty_command_file() {
 }
 
 #[test]
+fn flags_agent_file_missing_frontmatter() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let agent_dir = fx.root.path().join(".claude/agents");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    // A subagent body with no `---` frontmatter — the loader can't read its
+    // name/description.
+    std::fs::write(agent_dir.join("reviewer.md"), "You review code.\n").unwrap();
+
+    fx.cmd()
+        .arg("doctor")
+        .arg(fx.root.path())
+        .assert()
+        .success()
+        .stdout(contains("missing-frontmatter"));
+}
+
+#[test]
+fn command_file_without_frontmatter_is_not_flagged() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let cmd_dir = fx.root.path().join(".claude/commands");
+    std::fs::create_dir_all(&cmd_dir).unwrap();
+    // Slash commands are valid as a bare prompt body — frontmatter is optional,
+    // so this must NOT be flagged.
+    std::fs::write(cmd_dir.join("plain.md"), "Run the thing.\n").unwrap();
+
+    let out = fx.cmd().arg("doctor").arg(fx.root.path()).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("missing-frontmatter"),
+        "frontmatter-free command should not be flagged:\n{stdout}"
+    );
+}
+
+#[test]
 fn flags_disabled_mcp_server_distinctly_from_unreachable() {
     let fx = Fixture::new();
     fx.write_config(
