@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::{Map, Value};
 use std::io::Write;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Loaded `~/.claude.json` plus the raw text it was parsed from. The raw text
 /// is kept so we can report size deltas without re-serializing twice.
@@ -60,31 +61,35 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("claude.json");
-    let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
     // Close the handle (end of scope) before renaming.
-    {
-        let mut f = std::fs::File::create(&tmp)
-            .with_context(|| format!("create temp {}", tmp.display()))?;
+    let tmp = {
+        let (tmp, mut f) = create_temp_sibling(dir, name)?;
         // The rename publishes the temp's permissions as the target's, and
-        // `File::create` applies the umask (typically 0644) — which would
-        // silently broaden a 0600 target holding OAuth tokens. Mirror the
-        // target's current mode, owner-only for new files, before any content
-        // is written.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = match std::fs::metadata(path) {
-                Ok(m) => m.permissions().mode() & 0o7777,
-                Err(_) => 0o600,
-            };
-            f.set_permissions(std::fs::Permissions::from_mode(mode))
-                .with_context(|| format!("set mode on temp {}", tmp.display()))?;
+        // `OpenOptions` applies the umask. Mirror the target's current mode,
+        // owner-only for new files, before any content is written.
+        let write_result = (|| -> Result<()> {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = match std::fs::metadata(path) {
+                    Ok(m) => m.permissions().mode() & 0o7777,
+                    Err(_) => 0o600,
+                };
+                f.set_permissions(std::fs::Permissions::from_mode(mode))
+                    .with_context(|| format!("set mode on temp {}", tmp.display()))?;
+            }
+            f.write_all(contents.as_bytes())
+                .with_context(|| format!("write temp {}", tmp.display()))?;
+            f.sync_all()
+                .with_context(|| format!("sync temp {}", tmp.display()))?;
+            Ok(())
+        })();
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
         }
-        f.write_all(contents.as_bytes())
-            .with_context(|| format!("write temp {}", tmp.display()))?;
-        f.sync_all()
-            .with_context(|| format!("sync temp {}", tmp.display()))?;
-    }
+        tmp
+    };
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(anyhow!(
@@ -101,6 +106,36 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
         let _ = d.sync_all();
     }
     Ok(())
+}
+
+fn create_temp_sibling(dir: &Path, name: &str) -> Result<(std::path::PathBuf, std::fs::File)> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    for attempt in 0..100 {
+        let tmp = dir.join(format!(
+            ".{name}.tmp-{}-{nonce}-{attempt}",
+            std::process::id()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Start owner-only even when the target intentionally has a broader mode;
+        // we widen to the target's exact mode before writing content.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(anyhow!("create temp {}: {e}", tmp.display())),
+        }
+    }
+    Err(anyhow!(
+        "create temp in {}: exhausted collision retries",
+        dir.display()
+    ))
 }
 
 #[cfg(test)]
@@ -139,6 +174,28 @@ mod tests {
         std::fs::write(&path, "old").unwrap();
         write_atomic(&path, "new").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+    }
+
+    #[test]
+    fn write_atomic_removes_temp_file_after_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        write_atomic(&path, "{}").unwrap();
+
+        let temps = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".c.json.tmp-")
+            })
+            .count();
+        assert_eq!(
+            temps, 0,
+            "successful atomic write should publish or clean temp"
+        );
     }
 
     #[cfg(unix)]
