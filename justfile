@@ -2,11 +2,11 @@
 
 # Build the project
 build:
-    cargo build
+    cargo build --locked
 
 # Build in release mode
 build-release:
-    cargo build --release
+    cargo build --locked --release
 
 # Clean build artifacts
 clean:
@@ -16,7 +16,7 @@ clean:
 
 # Run tests
 test:
-    cargo test
+    cargo test --locked
 
 # Lint
 
@@ -26,7 +26,7 @@ audit:
 
 # Run clippy
 clippy:
-    cargo clippy --all-targets -- -D warnings
+    cargo clippy --locked --all-targets -- -D warnings
 
 # Check formatting
 fmt-check:
@@ -66,7 +66,7 @@ check:
         echo "--- $1 --- skipped ($2 not found)"
         skipped+=("$2 (brew install $3)")
     }
-    run cargo clippy --all-targets -- -D warnings
+    run cargo clippy --locked --all-targets -- -D warnings
     run cargo fmt -- --check
     if command -v typos &>/dev/null; then
         run typos
@@ -88,7 +88,7 @@ check:
     else
         skip lychee lychee lychee
     fi
-    run cargo test
+    run cargo test --locked
     if [ ${#skipped[@]} -gt 0 ]; then
         echo ""
         echo "Checks skipped due to missing tools:"
