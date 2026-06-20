@@ -8,7 +8,7 @@ midden is a Rust CLI for resolving, auditing, and garbage-collecting the state C
 - **Platforms:** macOS and Linux. Windows is out of scope for v0 (a `cfg(windows)` branch may exist but is untested/unsupported).
 - **License:** AGPL-3.0-only.
 - **Binary:** one CLI; subcommands `prune`, `doctor`, `show`, plus `completions` for shell completion.
-- **Deps:** clap/clap_complete, serde/serde_json (with `preserve_order`), walkdir, globset, colored, anyhow, time, sysinfo. Error handling is anyhow throughout — there are no `thiserror` types.
+- **Deps:** clap/clap_complete, serde/serde_json (with `preserve_order`), walkdir, colored, anyhow, time, sysinfo. Error handling is anyhow throughout — there are no `thiserror` types.
 
 ## Commands
 
