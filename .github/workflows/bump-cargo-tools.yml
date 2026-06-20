@@ -7,7 +7,8 @@ on:
 
 defaults:
   run:
-    shell: bash -xeuo pipefail {0}
+    # No -x: this workflow can mint and use short-lived app tokens.
+    shell: bash -euo pipefail {0}
 
 concurrency:
   group: bump-cargo-tools
@@ -42,6 +43,13 @@ jobs:
               echo "::warning::Could not resolve latest version for ${TOOL}, skipping"
               continue
             fi
+            # The version flows into the sed replacements below — reject anything
+            # that isn't plain X.Y.Z so a hostile registry response can't inject
+            # arbitrary content into ci.yml.
+            if [[ ! "${LATEST}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::warning::Unexpected version format for ${TOOL}: ${LATEST}, skipping"
+              continue
+            fi
 
             # Extract the currently pinned version, if any.
             CURRENT=$(grep -oE "cargo install ${TOOL} --locked --version [0-9]+\.[0-9]+\.[0-9]+" .github/workflows/ci.yml | awk '{print $NF}' | head -1 || true)
@@ -56,7 +64,8 @@ jobs:
               # Replace existing version pin.
               sed -i "s|cargo install ${TOOL} --locked --version ${CURRENT}|cargo install ${TOOL} --locked --version ${LATEST}|" .github/workflows/ci.yml
             else
-              # Add a version pin where there isn't one.
+              # Add a version pin where there isn't one. Match `cargo install TOOL --locked`
+              # at end of line (no trailing flags after --locked).
               sed -i "s|cargo install ${TOOL} --locked\$|cargo install ${TOOL} --locked --version ${LATEST}|" .github/workflows/ci.yml
             fi
             CHANGED=1
