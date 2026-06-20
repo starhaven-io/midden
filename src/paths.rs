@@ -74,10 +74,6 @@ impl ProjectPaths {
         self.root.join(".claude").join("managed-mcp.json")
     }
 
-    pub fn claude_md(&self) -> PathBuf {
-        self.root.join("CLAUDE.md")
-    }
-
     pub fn skills_dir(&self) -> PathBuf {
         self.root.join(".claude").join("skills")
     }

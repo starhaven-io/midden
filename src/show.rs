@@ -305,31 +305,6 @@ fn collect_claude_md(project: &ProjectPaths, env: &Env) -> Vec<ClaudeMd> {
             _ => break,
         }
     }
-    // Nested CLAUDE.md inside the project (subdirectories). Skip vendored and
-    // build-output dirs that pile up their own CLAUDE.md files but never get
-    // loaded by Claude Code.
-    let walker = WalkDir::new(&project.root)
-        .max_depth(4)
-        .into_iter()
-        .filter_entry(|e| !is_vendored_dir(e.path()));
-    let mut nested: Vec<ClaudeMd> = Vec::new();
-    for entry in walker.filter_map(|e| e.ok()) {
-        let p = entry.path();
-        if p.file_name().and_then(|n| n.to_str()) == Some("CLAUDE.md") && p != project.claude_md() {
-            if out.iter().any(|c| c.file == p) {
-                continue;
-            }
-            if let Ok(m) = entry.metadata() {
-                nested.push(ClaudeMd {
-                    file: p.to_path_buf(),
-                    scope: ClaudeMdScope::Project,
-                    bytes: m.len(),
-                });
-            }
-        }
-    }
-    nested.sort_by(|a, b| a.file.cmp(&b.file));
-    out.extend(nested);
     out
 }
 
@@ -1082,20 +1057,13 @@ mod tests {
     }
 
     #[test]
-    fn vendored_dirs_are_skipped() {
+    fn descendant_claude_md_files_are_not_active_for_the_root() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        // The project's own CLAUDE.md must still be found...
         std::fs::write(root.join("CLAUDE.md"), "ok").unwrap();
-        // ...but a CLAUDE.md vendored inside node_modules must NOT be.
         let vendor = root.join("node_modules").join("some-pkg");
         std::fs::create_dir_all(&vendor).unwrap();
         std::fs::write(vendor.join("CLAUDE.md"), "noise").unwrap();
-        // Nested vendor in a subdir as well.
-        let nested_vendor = root.join("apps").join("web").join("node_modules").join("x");
-        std::fs::create_dir_all(&nested_vendor).unwrap();
-        std::fs::write(nested_vendor.join("CLAUDE.md"), "noise").unwrap();
-        // And one legitimate nested CLAUDE.md that should be picked up.
         let nested_legit = root.join("apps").join("web");
         std::fs::create_dir_all(&nested_legit).unwrap();
         std::fs::write(nested_legit.join("CLAUDE.md"), "legit").unwrap();
@@ -1114,15 +1082,30 @@ mod tests {
             "expected project root CLAUDE.md, got: {paths:?}"
         );
         assert!(
-            paths.iter().any(|p| p == &nested_legit.join("CLAUDE.md")),
-            "expected nested legit CLAUDE.md, got: {paths:?}"
+            !paths.iter().any(|p| p == &nested_legit.join("CLAUDE.md")),
+            "descendant CLAUDE.md should apply only when that descendant is targeted: {paths:?}"
         );
-        assert!(
-            !paths
-                .iter()
-                .any(|p| p.to_string_lossy().contains("node_modules")),
-            "node_modules CLAUDE.md must not appear: {paths:?}"
+    }
+
+    #[test]
+    fn ancestor_claude_md_files_are_active_for_nested_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("CLAUDE.md"), "root").unwrap();
+        let nested = root.join("apps").join("web");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("CLAUDE.md"), "nested").unwrap();
+
+        let project = ProjectPaths::new(&nested);
+        let env = Env::new(
+            Some(root.join(".claude.json")),
+            Some(root.join(".claude-home")),
         );
+        let mds = collect_claude_md(&project, &env);
+        let paths: Vec<_> = mds.iter().map(|m| m.file.clone()).collect();
+
+        assert!(paths.iter().any(|p| p == &root.join("CLAUDE.md")));
+        assert!(paths.iter().any(|p| p == &nested.join("CLAUDE.md")));
     }
 
     #[test]
