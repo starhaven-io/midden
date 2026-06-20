@@ -69,6 +69,13 @@ jobs:
             MATRIX+=',{"name":"Test (Linux ARM)","check":"test","runner":"ubuntu-22.04-arm"}'
             MATRIX+=',{"name":"Test (macOS)","check":"test","runner":"macos-26"}'
             MATRIX+=',{"name":"Coverage","check":"coverage","runner":"ubuntu-latest","environment":"codecov"}'
+          elif echo "${CHANGED}" | grep -qE '^deny\.toml$|^_typos\.toml$|^justfile$'; then
+            MATRIX+=',{"name":"Lint","check":"lint","runner":"ubuntu-latest"}'
+          fi
+
+          # README or link-check config changes: verify links on the PR.
+          if echo "${CHANGED}" | grep -qE '^README\.md$|^lychee\.toml$|^\.github/workflows/(ci|link-check)\.yml$'; then
+            MATRIX+=',{"name":"Links","check":"links","runner":"ubuntu-latest"}'
           fi
 
           # Workflow changes: Actions security audit
@@ -217,6 +224,15 @@ jobs:
       - name: Cargo deny
         if: matrix.check == 'lint'
         run: cargo deny check
+
+      - name: Check links
+        if: matrix.check == 'links'
+        uses: lycheeverse/lychee-action@8646ba30535128ac92d33dfc9133794bfdd9b411 # v2.8.0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          args: --config lychee.toml README.md
+          fail: true
 
       - name: Save cargo build cache
         if: matrix.check == 'lint' && github.event_name == 'push' && steps.cargo-build-cache.outputs.cache-hit != 'true'
