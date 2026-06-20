@@ -54,7 +54,7 @@ CLAUDE.md does **not** follow settings precedence. All applicable files load sim
 - **Mass-deletion gate.** Refuses to prune when ≥90% of a non-trivial `projects` map resolves missing — that usually means the wrong host or an unmounted volume, not real orphans. `--force` overrides.
 - **Conservative deletion.** Removes only entries whose directory is provably absent; never guesses from value contents. Apply re-reads and re-derives immediately before writing, so concurrent edits to unrelated keys survive.
 - **Mask secrets by default.** Sensitive-named keys (`token`, `secret`, `password`, `apikey`, `auth`, `credential`, …) have their string values masked — including strings nested in arrays/objects under such a key. `--show-secrets` opts out.
-- `doctor`'s `secret-in-committed-settings` (the only `Error`) is suppressed for git-ignored files.
+- `doctor`'s `Error`-severity secret findings (`secret-in-committed-settings`, `secret-in-committed-mcp`, `secret-in-malformed-config`) are suppressed for git-ignored files.
 - **`--json` on every command** for CI/scripting.
 
 ## Build / test / lint

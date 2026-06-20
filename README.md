@@ -160,6 +160,9 @@ An entry is a removal candidate only if its directory is provably absent from di
 | `orphaned-project` | Warn | yes | `projects` entry whose directory no longer exists |
 | `claude-json-bloat` | Info | no | `~/.claude.json` over 512 KB (Claude Code never prunes it) |
 | `stale-worktree` | Info | no | Ephemeral worktree dir untouched for >30 days |
+| `config-path-inaccessible` | Warn | no | Config/worktree path could not be inspected because of permissions or filesystem errors |
+| `malformed-json-config` | Warn | no | Settings or MCP JSON could not be parsed, so key-aware checks were skipped |
+| `secret-in-malformed-config` | Error | no | Token-shaped secret appears in malformed committed JSON |
 | `secret-in-committed-settings` | Error | no | Suspect secret in a `settings.json` that git doesn't ignore — by key name or value shape (masked by default) |
 | `secret-in-committed-mcp` | Error | no | Suspect secret in a `.mcp.json` / `managed-mcp.json` that git doesn't ignore — by key name or value shape; pure `${VAR}` references are exempt |
 | `local-settings-tracked` | Warn | no | `settings.local.json` tracked by git (meant to stay machine-local) |
