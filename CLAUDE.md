@@ -60,8 +60,8 @@ CLAUDE.md does **not** follow settings precedence. All applicable files load sim
 ## Build / test / lint
 
 `just` recipes (raw command in parens):
-- `just build` / `just test` (`cargo build` / `cargo test`)
-- `just clippy` — `cargo clippy --all-targets -- -D warnings` (zero warnings required)
+- `just build` / `just test` (`cargo build --locked` / `cargo test --locked`)
+- `just clippy` — `cargo clippy --locked --all-targets -- -D warnings` (zero warnings required)
 - `just fmt` / `just fmt-check` — rustfmt, 2024 style edition (`rustfmt.toml`)
 - `just typos`, `just deny` (`cargo deny check`), `just lychee`, `just audit` (zizmor)
 - `just check` — run everything; skips tools that aren't installed
