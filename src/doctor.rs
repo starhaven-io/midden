@@ -352,8 +352,25 @@ fn check_stale_worktrees(project: &ProjectPaths, out: &mut Vec<Finding>) -> Resu
         return Ok(());
     }
     let now = SystemTime::now();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            push_inaccessible(out, dir, format!("could not read worktrees directory: {e}"));
+            return Ok(());
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                push_inaccessible(
+                    out,
+                    dir.clone(),
+                    format!("could not inspect an entry in {}: {e}", dir.display()),
+                );
+                continue;
+            }
+        };
         let path = entry.path();
         if !path.is_dir() {
             continue;
@@ -364,7 +381,17 @@ fn check_stale_worktrees(project: &ProjectPaths, out: &mut Vec<Finding>) -> Resu
         if !is_ephemeral_slug(name) {
             continue;
         }
-        let meta = entry.metadata()?;
+        let meta = match entry.metadata() {
+            Ok(meta) => meta,
+            Err(e) => {
+                push_inaccessible(
+                    out,
+                    path.clone(),
+                    format!("could not stat worktree {}: {e}", path.display()),
+                );
+                continue;
+            }
+        };
         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         let age = now.duration_since(mtime).unwrap_or_default();
         if age < WORKTREE_STALE_AFTER {
@@ -387,6 +414,20 @@ fn check_stale_worktrees(project: &ProjectPaths, out: &mut Vec<Finding>) -> Resu
         });
     }
     Ok(())
+}
+
+fn push_inaccessible(out: &mut Vec<Finding>, file: PathBuf, message: String) {
+    out.push(Finding {
+        id: "config-path-inaccessible",
+        severity: Severity::Warn,
+        location: Location {
+            file,
+            key_path: None,
+        },
+        message,
+        suggested_fix: Some("check the path permissions or remove the stale entry".into()),
+        auto_fixable: false,
+    });
 }
 
 fn is_ephemeral_slug(s: &str) -> bool {
@@ -445,8 +486,17 @@ fn scan_committed_secret_file(
     out: &mut Vec<Finding>,
     show_secrets: bool,
 ) -> Result<()> {
-    if !file.exists() {
-        return Ok(());
+    match file.try_exists() {
+        Ok(true) => {}
+        Ok(false) => return Ok(()),
+        Err(e) => {
+            push_inaccessible(
+                out,
+                file.to_path_buf(),
+                format!("could not check whether {} exists: {e}", file.display()),
+            );
+            return Ok(());
+        }
     }
     // A file git explicitly ignores is not "committed" — flagging it as an
     // Error (and exiting 1) is a false positive for the common pattern of
@@ -457,18 +507,53 @@ fn scan_committed_secret_file(
     if git::is_ignored(&project.root, rel) == Some(true) {
         return Ok(());
     }
-    let raw = std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
-    let Ok(value): Result<Value, _> = serde_json::from_str(&raw) else {
-        return Ok(());
-    };
-
-    let mut hits = Vec::new();
-    walk_for_secrets(&value, "", &mut hits);
-
     let name = file
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let raw = std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
+    let value: Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(e) => {
+            out.push(Finding {
+                id: "malformed-json-config",
+                severity: Severity::Warn,
+                location: Location {
+                    file: file.to_path_buf(),
+                    key_path: None,
+                },
+                message: format!(
+                    "{name} is not valid JSON; key-aware secret checks were skipped: {e}"
+                ),
+                suggested_fix: Some(
+                    "fix the JSON syntax, then re-run `midden doctor` before trusting the file"
+                        .into(),
+                ),
+                auto_fixable: false,
+            });
+            if secrets::value_looks_sensitive(&raw) {
+                out.push(Finding {
+                    id: "secret-in-malformed-config",
+                    severity: Severity::Error,
+                    location: Location {
+                        file: file.to_path_buf(),
+                        key_path: None,
+                    },
+                    message: format!(
+                        "possible token-shaped secret in malformed committed {name}; inspect manually"
+                    ),
+                    suggested_fix: Some(
+                        "remove the credential, repair the JSON, and re-run `midden doctor`".into(),
+                    ),
+                    auto_fixable: false,
+                });
+            }
+            return Ok(());
+        }
+    };
+
+    let mut hits = Vec::new();
+    walk_for_secrets(&value, "", &mut hits);
     for (key_path, raw_value) in hits {
         // A pure `${VAR}` reference resolves at load time and commits nothing
         // — it's the very fix we recommend, so don't flag it.
@@ -703,8 +788,25 @@ fn check_dead_skill_command_agent_refs(
         if !dir.is_dir() {
             continue;
         }
-        for entry in std::fs::read_dir(&dir)? {
-            let entry = entry?;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                push_inaccessible(out, dir.clone(), format!("could not read {label} dir: {e}"));
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    push_inaccessible(
+                        out,
+                        dir.clone(),
+                        format!("could not inspect an entry in {}: {e}", dir.display()),
+                    );
+                    continue;
+                }
+            };
             let path = entry.path();
             if !path.is_dir() {
                 continue;
@@ -730,8 +832,7 @@ fn check_dead_skill_command_agent_refs(
         }
     }
 
-    // Commands and agents are bare markdown files. Flag empty files or files
-    // missing the frontmatter that the loader expects.
+    // Commands and agents are bare markdown files. Flag empty files.
     for (label, dir) in [
         ("user command", env.user_commands_dir()),
         ("project command", project.commands_dir()),
@@ -750,8 +851,18 @@ fn check_dead_skill_command_agent_refs(
             if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("md") {
                 continue;
             }
-            let Ok(meta) = path.metadata() else { continue };
-            if meta.len() == 0 {
+            let text = match std::fs::read_to_string(path) {
+                Ok(text) => text,
+                Err(e) => {
+                    push_inaccessible(
+                        out,
+                        path.to_path_buf(),
+                        format!("could not read {label} file {}: {e}", path.display()),
+                    );
+                    continue;
+                }
+            };
+            if text.is_empty() {
                 out.push(Finding {
                     id: "empty-config-file",
                     severity: Severity::Warn,

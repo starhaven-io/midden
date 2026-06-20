@@ -557,7 +557,39 @@ fn skips_malformed_settings_json_but_still_runs_other_checks() {
         .arg(fx.root.path())
         .assert()
         .success()
-        .stdout(contains("orphaned-project"));
+        .stdout(contains("orphaned-project"))
+        .stdout(contains("malformed-json-config"));
+}
+
+#[test]
+fn flags_token_shaped_secret_in_malformed_json() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let project_settings = fx.root.path().join(".claude/settings.json");
+    std::fs::create_dir_all(project_settings.parent().unwrap()).unwrap();
+    std::fs::write(
+        &project_settings,
+        format!(
+            r#"{{ "env": {{ "ANTHROPIC_API_KEY": "{}" }} "#,
+            "sk-malformed-json-secret-ABC123"
+        ),
+    )
+    .unwrap();
+
+    let out = fx.cmd().arg("doctor").arg(fx.root.path()).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("malformed-json-config"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("secret-in-malformed-config"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("sk-malformed-json-secret-ABC123"),
+        "malformed secret leaked:\n{stdout}"
+    );
 }
 
 #[test]
