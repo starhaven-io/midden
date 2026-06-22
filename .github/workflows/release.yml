@@ -30,6 +30,10 @@ jobs:
             runner: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-22.04-arm
           - target: aarch64-apple-darwin
             runner: macos-26
             sign: true
@@ -74,10 +78,35 @@ jobs:
           rm -f "${RUNNER_TEMP}/certificate.p12"
           security list-keychain -d user -s "${RUNNER_TEMP}/${TEMPORARY_KEYCHAIN_FILE}"
 
+      - name: Set up Rust target toolchain
+        if: runner.os == 'Linux'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          # midden is pure Rust with no C deps, so musl needs only the target —
+          # no musl-tools/cmake; Rust's self-contained linking handles the rest.
+          rustup target add "${TARGET}"
+
       - name: Build
         env:
           TARGET: ${{ matrix.target }}
         run: cargo build --locked --release --target "${TARGET}"
+
+      - name: Validate binary
+        if: runner.os == 'Linux'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          BINARY="target/${TARGET}/release/midden"
+          "${BINARY}" --version
+          # musl artifacts must be static — a dynamic-loader entry would break on Alpine.
+          if [[ "${TARGET}" == *-musl ]]; then
+            file "${BINARY}"
+            if readelf -l "${BINARY}" | grep -q 'Requesting program interpreter'; then
+              echo "::error::${TARGET} binary is not statically linked"
+              exit 1
+            fi
+          fi
 
       - name: Codesign binary
         if: matrix.sign
