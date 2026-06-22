@@ -29,7 +29,15 @@ cargo install midden
 
 ### From releases
 
-Download a prebuilt binary from [GitHub Releases](https://github.com/starhaven-io/midden/releases).
+Download a prebuilt binary from [GitHub Releases](https://github.com/starhaven-io/midden/releases). Binaries are available for:
+
+- Linux amd64, glibc — `x86_64-unknown-linux-gnu`
+- Linux arm64, glibc — `aarch64-unknown-linux-gnu`
+- Linux amd64, musl (static) — `x86_64-unknown-linux-musl`
+- Linux arm64, musl (static) — `aarch64-unknown-linux-musl`
+- macOS Apple Silicon — `aarch64-apple-darwin`
+
+The `gnu` builds link against the system glibc. They are built on Ubuntu 24.04, so they require **glibc 2.39 or newer** (Ubuntu 24.04+, Debian 13+, Fedora 40+). On older releases — Ubuntu 22.04, Debian 12, RHEL 9 and the like — use the statically linked `musl` builds instead. The `musl` builds carry no glibc requirement and also run on musl-based distributions such as Alpine, as well as minimal or distroless containers.
 
 ### From git (unreleased HEAD)
 
