@@ -45,7 +45,7 @@ jobs:
           # Push to main: run lint to warm the cache, and coverage so
           # Codecov has a baseline for PR comparisons.
           if [[ "${EVENT_NAME}" == "push" ]]; then
-            echo 'matrix=[{"name":"Lint","check":"lint","runner":"ubuntu-latest"},{"name":"Coverage","check":"coverage","runner":"ubuntu-latest","environment":"codecov"}]' >> "${GITHUB_OUTPUT}"
+            echo 'matrix=[{"name":"Lint","check":"lint","runner":"ubuntu-24.04"},{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04","environment":"codecov"}]' >> "${GITHUB_OUTPUT}"
             echo "zizmor=false" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
@@ -64,18 +64,18 @@ jobs:
 
           # Rust or build workflow changes: lint + test on all platforms
           if echo "${CHANGED}" | grep -qE '\.rs$|^Cargo\.(toml|lock)$|^clippy\.toml$|^rustfmt\.toml$|^\.github/workflows/(ci|release)\.yml$'; then
-            MATRIX+=',{"name":"Lint","check":"lint","runner":"ubuntu-latest"}'
-            MATRIX+=',{"name":"Test (Linux)","check":"test","runner":"ubuntu-latest"}'
-            MATRIX+=',{"name":"Test (Linux ARM)","check":"test","runner":"ubuntu-22.04-arm"}'
+            MATRIX+=',{"name":"Lint","check":"lint","runner":"ubuntu-24.04"}'
+            MATRIX+=',{"name":"Test (Linux)","check":"test","runner":"ubuntu-24.04"}'
+            MATRIX+=',{"name":"Test (Linux ARM)","check":"test","runner":"ubuntu-24.04-arm"}'
             MATRIX+=',{"name":"Test (macOS)","check":"test","runner":"macos-26"}'
-            MATRIX+=',{"name":"Coverage","check":"coverage","runner":"ubuntu-latest","environment":"codecov"}'
+            MATRIX+=',{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04","environment":"codecov"}'
           elif echo "${CHANGED}" | grep -qE '^deny\.toml$|^_typos\.toml$|^justfile$'; then
-            MATRIX+=',{"name":"Lint","check":"lint","runner":"ubuntu-latest"}'
+            MATRIX+=',{"name":"Lint","check":"lint","runner":"ubuntu-24.04"}'
           fi
 
           # README or link-check config changes: verify links on the PR.
           if echo "${CHANGED}" | grep -qE '^README\.md$|^lychee\.toml$|^\.github/workflows/(ci|link-check)\.yml$'; then
-            MATRIX+=',{"name":"Links","check":"links","runner":"ubuntu-latest"}'
+            MATRIX+=',{"name":"Links","check":"links","runner":"ubuntu-24.04"}'
           fi
 
           # Workflow changes: Actions security audit
@@ -312,7 +312,7 @@ jobs:
     name: zizmor
     needs: generate-matrix
     if: needs.generate-matrix.outputs.zizmor == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       security-events: write # required for zizmor SARIF upload
