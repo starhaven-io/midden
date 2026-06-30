@@ -110,7 +110,7 @@ jobs:
       - name: Restore cargo build cache
         id: cargo-build-cache
         if: matrix.check == 'lint' || matrix.check == 'test' || matrix.check == 'coverage'
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index/
@@ -122,7 +122,7 @@ jobs:
       - name: Restore coverage tools cache
         id: cov-tools-cache
         if: matrix.check == 'coverage'
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/bin/cargo-nextest
@@ -135,7 +135,7 @@ jobs:
       - name: Restore lint tools cache
         id: lint-tools-cache
         if: matrix.check == 'lint'
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/bin/typos
@@ -235,7 +235,7 @@ jobs:
 
       - name: Save cargo build cache
         if: matrix.check == 'lint' && github.event_name == 'push' && steps.cargo-build-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index/
@@ -246,7 +246,7 @@ jobs:
 
       - name: Save lint tools cache
         if: matrix.check == 'lint' && github.event_name == 'push' && steps.lint-tools-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/bin/typos
@@ -298,7 +298,7 @@ jobs:
 
       - name: Save coverage tools cache
         if: matrix.check == 'coverage' && github.event_name == 'push' && steps.cov-tools-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/bin/cargo-nextest
