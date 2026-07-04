@@ -6,7 +6,10 @@
 use assert_cmd::Command;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
+
+static SESSION_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
 /// A scratch directory holding a fixture `.claude.json` and a fake home.
 ///
@@ -45,6 +48,42 @@ impl Fixture {
         let p = self.root.path().join(rel);
         std::fs::create_dir_all(&p).unwrap();
         p.to_string_lossy().into_owned()
+    }
+
+    pub fn transcript_project_dir(&self, slug: &str) -> PathBuf {
+        let dir = self.claude_home.join("projects").join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    pub fn write_transcript(&self, slug: &str, cwd: &str) -> PathBuf {
+        let id = SESSION_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let session = format!("00000000-0000-4000-8000-{id:012}");
+        let dir = self.transcript_project_dir(slug);
+        let path = dir.join(format!("{session}.jsonl"));
+        std::fs::write(
+            &path,
+            format!("{{\"type\":\"summary\",\"cwd\":{}}}\n", json!(cwd)),
+        )
+        .unwrap();
+        path
+    }
+
+    pub fn write_transcript_line(&self, slug: &str, name: &str, line: &str) -> PathBuf {
+        let dir = self.transcript_project_dir(slug);
+        let path = dir.join(name);
+        std::fs::write(&path, line).unwrap();
+        path
+    }
+
+    pub fn session_artifact_dir(&self, slug: &str) -> PathBuf {
+        let id = SESSION_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = self
+            .transcript_project_dir(slug)
+            .join(format!("00000000-0000-4000-8000-{id:012}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("artifact.txt"), "artifact").unwrap();
+        dir
     }
 
     /// Write a fixture .claude.json from a `projects` map and extra top-level keys.

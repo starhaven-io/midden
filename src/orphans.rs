@@ -38,7 +38,7 @@ pub fn find(projects: &Map<String, Value>, worktrees_only: bool) -> Vec<Orphan> 
 /// non-directory (`NotADirectory`), or exists but is not a directory. Any
 /// other stat failure — permission denied, I/O error, an unresponsive mount —
 /// means "can't tell", and an entry we can't check must never be pruned.
-fn provably_absent(path: &Path) -> bool {
+pub(crate) fn provably_absent(path: &Path) -> bool {
     match std::fs::metadata(path) {
         Ok(meta) => !meta.is_dir(),
         Err(e) => matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory),
@@ -57,7 +57,18 @@ pub fn counts(orphans: &[Orphan]) -> (usize, usize) {
 /// Existence alone can't distinguish the two, so mass deletions are gated
 /// behind `--force`.
 pub fn looks_like_wrong_host(removing: usize, total: usize) -> bool {
-    total >= 5 && removing * 100 >= total * 90
+    looks_like_wrong_host_with_scope(removing, total, total)
+}
+
+/// Variant for surfaces where the wrong-host ratio and the minimum engagement
+/// count need different denominators. For transcript dirs, skipped dirs should
+/// help engage the safety gate, but not dilute the dead/resolvable ratio.
+pub fn looks_like_wrong_host_with_scope(
+    removing: usize,
+    ratio_total: usize,
+    engagement_total: usize,
+) -> bool {
+    removing > 0 && engagement_total >= 5 && removing * 100 >= ratio_total * 90
 }
 
 #[cfg(test)]
@@ -172,6 +183,18 @@ mod tests {
         assert!(!looks_like_wrong_host(0, 10), "nothing missing");
         assert!(looks_like_wrong_host(9, 10), "90% missing");
         assert!(looks_like_wrong_host(10, 10), "all missing");
+    }
+
+    #[test]
+    fn wrong_host_heuristic_can_engage_on_a_larger_scope() {
+        assert!(
+            looks_like_wrong_host_with_scope(4, 4, 5),
+            "skipped transcript dirs should count toward the engagement minimum"
+        );
+        assert!(
+            !looks_like_wrong_host_with_scope(3, 4, 5),
+            "ratio still uses the resolvable denominator"
+        );
     }
 
     #[test]

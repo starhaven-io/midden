@@ -9,6 +9,7 @@ mod process;
 mod prune;
 mod secrets;
 mod show;
+mod transcripts;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
@@ -58,6 +59,10 @@ enum Command {
         /// Actually remove entries (default is a dry run)
         #[arg(long)]
         apply: bool,
+
+        /// Also garbage-collect orphaned transcript artifacts under ~/.claude/projects/
+        #[arg(long)]
+        transcripts: bool,
 
         /// Only consider entries under a .claude/worktrees/ path
         #[arg(long = "worktrees-only")]
@@ -120,12 +125,14 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Prune {
             apply,
+            transcripts,
             worktrees_only,
             force,
         } => prune::run(
             &env,
             prune::Options {
                 apply,
+                transcripts,
                 worktrees_only,
                 force,
                 json: cli.json,
