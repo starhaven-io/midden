@@ -317,3 +317,562 @@ fn json_output_apply_emits_backup_path() {
         "backup file should exist: {backup}"
     );
 }
+
+#[test]
+fn transcripts_dry_run_reports_dead_artifacts_and_deletes_nothing() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), standard_extras());
+    let dead_cwd = fx.root.path().join("missing-project");
+    let dead_cwd = dead_cwd.to_string_lossy().into_owned();
+    let jsonl = fx.write_transcript("dead-project", &dead_cwd);
+    let artifact_dir = fx.session_artifact_dir("dead-project");
+
+    fx.cmd()
+        .arg("prune")
+        .arg("--transcripts")
+        .assert()
+        .success()
+        .stdout(contains("transcripts"))
+        .stdout(contains("dead-project"))
+        .stdout(contains("delete"))
+        .stdout(contains("dry run"));
+
+    assert!(jsonl.exists(), "dry run must not remove transcript jsonl");
+    assert!(
+        artifact_dir.exists(),
+        "dry run must not remove session artifact dirs"
+    );
+    assert!(
+        fx.claude_home.join("projects/dead-project").exists(),
+        "dry run must keep the transcript project dir"
+    );
+}
+
+#[test]
+fn transcripts_apply_removes_dead_artifacts_and_keeps_live_dirs() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), standard_extras());
+    let dead_cwd = fx.root.path().join("missing-project");
+    let dead_cwd = dead_cwd.to_string_lossy().into_owned();
+    let live_cwd = fx.touch_dir("live-project");
+
+    let dead_jsonl = fx.write_transcript("dead-project", &dead_cwd);
+    let dead_artifact = fx.session_artifact_dir("dead-project");
+    let live_jsonl = fx.write_transcript("live-project", &live_cwd);
+
+    fx.cmd()
+        .arg("prune")
+        .arg("--transcripts")
+        .arg("--apply")
+        .arg("--force")
+        .assert()
+        .success()
+        .stdout(contains("directory removed"));
+
+    assert!(!dead_jsonl.exists(), "dead transcript jsonl removed");
+    assert!(!dead_artifact.exists(), "dead session artifact dir removed");
+    assert!(
+        !fx.claude_home.join("projects/dead-project").exists(),
+        "empty dead transcript project dir removed"
+    );
+    assert!(live_jsonl.exists(), "live transcript jsonl kept");
+    assert!(
+        fx.claude_home.join("projects/live-project").exists(),
+        "live transcript project dir kept"
+    );
+    assert!(
+        fx.backup_paths().is_empty(),
+        "transcript deletion does not create .claude.json backups"
+    );
+}
+
+#[test]
+fn transcripts_apply_preserves_memory_dir() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), standard_extras());
+    let dead_cwd = fx.root.path().join("missing-project");
+    let dead_cwd = dead_cwd.to_string_lossy().into_owned();
+
+    let jsonl = fx.write_transcript("dead-with-memory", &dead_cwd);
+    let project_dir = fx.claude_home.join("projects/dead-with-memory");
+    let memory = project_dir.join("memory");
+    std::fs::create_dir_all(&memory).unwrap();
+    std::fs::write(memory.join("MEMORY.md"), "durable user data").unwrap();
+
+    fx.cmd()
+        .arg("prune")
+        .arg("--transcripts")
+        .arg("--apply")
+        .arg("--force")
+        .assert()
+        .success()
+        .stdout(contains("memory preserved"));
+
+    assert!(!jsonl.exists(), "transcript jsonl removed");
+    assert!(project_dir.exists(), "project dir kept for memory/");
+    assert!(memory.join("MEMORY.md").exists(), "memory files preserved");
+}
+
+#[test]
+fn transcripts_apply_reports_partial_clean_when_unknown_entries_remain() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), standard_extras());
+    let dead_cwd = fx.root.path().join("missing-project");
+    let dead_cwd = dead_cwd.to_string_lossy().into_owned();
+
+    let jsonl = fx.write_transcript("dead-with-extra", &dead_cwd);
+    let project_dir = fx.claude_home.join("projects/dead-with-extra");
+    std::fs::write(project_dir.join("notes.txt"), "not ours").unwrap();
+
+    fx.cmd()
+        .arg("prune")
+        .arg("--transcripts")
+        .arg("--apply")
+        .arg("--force")
+        .assert()
+        .success()
+        .stdout(contains("partially cleaned"));
+
+    assert!(!jsonl.exists(), "transcript jsonl removed");
+    assert!(project_dir.join("notes.txt").exists(), "unknown file kept");
+    assert!(project_dir.exists(), "project dir kept for unknown entry");
+}
+
+#[test]
+fn transcripts_disagreement_is_skipped() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), standard_extras());
+    let cwd_a = fx
+        .root
+        .path()
+        .join("missing-a")
+        .to_string_lossy()
+        .into_owned();
+    let cwd_b = fx
+        .root
+        .path()
+        .join("missing-b")
+        .to_string_lossy()
+        .into_owned();
+    let first = fx.write_transcript_line(
+        "disagree",
+        "00000000-0000-4000-8000-000000000001.jsonl",
+        &format!("{{\"cwd\":{}}}\n", json!(cwd_a)),
+    );
+    let second = fx.write_transcript_line(
+        "disagree",
+        "00000000-0000-4000-8000-000000000002.jsonl",
+        &format!("{{\"cwd\":{}}}\n", json!(cwd_b)),
+    );
+
+    fx.cmd()
+        .arg("prune")
+        .arg("--transcripts")
+        .arg("--apply")
+        .arg("--force")
+        .assert()
+        .success()
+        .stdout(contains("cwd-disagreement"));
+
+    assert!(first.exists(), "disagreed transcript kept");
+    assert!(second.exists(), "disagreed transcript kept");
+}
+
+#[test]
+fn transcripts_no_jsonl_dir_is_skipped() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), standard_extras());
+    let dir = fx.transcript_project_dir("no-jsonl");
+    std::fs::write(dir.join("README.txt"), "not a transcript").unwrap();
+
+    fx.cmd()
+        .arg("prune")
+        .arg("--transcripts")
+        .arg("--apply")
+        .arg("--force")
+        .assert()
+        .success()
+        .stdout(contains("no-jsonl"));
+
+    assert!(dir.join("README.txt").exists(), "skipped dir left intact");
+}
+
+#[cfg(unix)]
+#[test]
+fn transcripts_stat_failure_is_kept() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = Fixture::new();
+    fx.write_config(json!({}), standard_extras());
+    let locked = fx.root.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    let uncertain = locked.join("missing");
+    let jsonl = fx.write_transcript("uncertain", &uncertain.to_string_lossy());
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let result = fx
+        .cmd()
+        .arg("prune")
+        .arg("--transcripts")
+        .arg("--apply")
+        .arg("--force")
+        .assert()
+        .success();
+
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    result.stdout(contains("0 dead"));
+    assert!(
+        jsonl.exists(),
+        "permission-denied cwd stat is not provably absent"
+    );
+}
+
+#[test]
+fn transcripts_mass_deletion_gate_trips_and_force_overrides() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), standard_extras());
+    let live = fx.touch_dir("live-project");
+    fx.write_transcript("live-project", &live);
+    for i in 0..9 {
+        let dead = fx.root.path().join(format!("missing-{i}"));
+        fx.write_transcript(&format!("dead-{i}"), &dead.to_string_lossy());
+    }
+
+    fx.cmd()
+        .arg("prune")
+        .arg("--transcripts")
+        .arg("--apply")
+        .assert()
+        .failure()
+        .stderr(contains("different machine"));
+    assert!(
+        fx.claude_home.join("projects/dead-0").exists(),
+        "gate must refuse before deleting"
+    );
+
+    fx.cmd()
+        .arg("prune")
+        .arg("--transcripts")
+        .arg("--apply")
+        .arg("--force")
+        .assert()
+        .success();
+    assert!(
+        !fx.claude_home.join("projects/dead-0").exists(),
+        "--force overrides transcript mass-deletion gate"
+    );
+    assert!(fx.claude_home.join("projects/live-project").exists());
+}
+
+#[test]
+fn transcript_gate_refuses_before_config_prune_writes() {
+    let fx = Fixture::new();
+    let mut projects = serde_json::Map::new();
+    for i in 0..4 {
+        projects.insert(fx.touch_dir(&format!("live-{i}")), json!({}));
+    }
+    projects.insert("/config/orphan".to_string(), json!({}));
+    fx.write_config(Value::Object(projects), standard_extras());
+    let before = std::fs::read_to_string(&fx.config).unwrap();
+
+    for i in 0..4 {
+        let dead = fx.root.path().join(format!("missing-transcript-{i}"));
+        fx.write_transcript(&format!("dead-{i}"), &dead.to_string_lossy());
+    }
+    fx.transcript_project_dir("skipped-no-jsonl");
+
+    fx.cmd()
+        .arg("prune")
+        .arg("--transcripts")
+        .arg("--apply")
+        .assert()
+        .code(2)
+        .stderr(contains("resolvable transcript dirs"));
+
+    assert_eq!(
+        before,
+        std::fs::read_to_string(&fx.config).unwrap(),
+        "transcript gate must fire before .claude.json is rewritten"
+    );
+    assert!(
+        fx.backup_paths().is_empty(),
+        "no backup should be created when upfront gates refuse"
+    );
+}
+
+#[test]
+fn transcripts_apply_prunes_config_and_transcripts_together_without_force() {
+    let fx = Fixture::new();
+    let mut projects = serde_json::Map::new();
+    let mut live_projects = Vec::new();
+    for i in 0..4 {
+        let live = fx.touch_dir(&format!("live-{i}"));
+        projects.insert(
+            live.clone(),
+            json!({ "lastVisited": "2026-07-04T00:00:00Z" }),
+        );
+        live_projects.push(live);
+    }
+    let orphan = fx
+        .root
+        .path()
+        .join("missing-config-project")
+        .to_string_lossy()
+        .into_owned();
+    projects.insert(
+        orphan.clone(),
+        json!({ "lastVisited": "2026-07-03T00:00:00Z" }),
+    );
+    fx.write_config(Value::Object(projects), standard_extras());
+
+    let dead_cwd = fx
+        .root
+        .path()
+        .join("missing-transcript-project")
+        .to_string_lossy()
+        .into_owned();
+    let live_cwd = fx.touch_dir("live-transcript-project");
+    let dead_jsonl = fx.write_transcript("dead-transcript-project", &dead_cwd);
+    let dead_artifact = fx.session_artifact_dir("dead-transcript-project");
+    let live_jsonl = fx.write_transcript("live-transcript-project", &live_cwd);
+
+    let mut cmd = fx.cmd();
+    cmd.env("MIDDEN_TEST_ASSUME_NO_CLAUDE_PROCESS", &fx.config)
+        .arg("prune")
+        .arg("--transcripts")
+        .arg("--apply")
+        .assert()
+        .success();
+
+    let after = fx.read_config();
+    let after_projects = after["projects"].as_object().unwrap();
+    assert!(
+        !after_projects.contains_key(&orphan),
+        "config orphan should be pruned"
+    );
+    for live in live_projects {
+        assert!(
+            after_projects.contains_key(&live),
+            "live project entry should remain: {live}"
+        );
+    }
+
+    assert_eq!(
+        fx.backup_paths().len(),
+        1,
+        "combined apply should create exactly the config backup"
+    );
+    assert!(!dead_jsonl.exists(), "dead transcript jsonl removed");
+    assert!(!dead_artifact.exists(), "dead session artifact dir removed");
+    assert!(
+        !fx.claude_home
+            .join("projects/dead-transcript-project")
+            .exists(),
+        "empty dead transcript project dir removed"
+    );
+    assert!(live_jsonl.exists(), "live transcript jsonl kept");
+    assert!(
+        fx.claude_home
+            .join("projects/live-transcript-project")
+            .exists(),
+        "live transcript project dir kept"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn inaccessible_transcript_dir_is_skipped_without_aborting() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = Fixture::new();
+    fx.write_config(json!({}), standard_extras());
+    let live = fx.touch_dir("live-project");
+    let dead = fx.root.path().join("missing-project");
+    fx.write_transcript("live-project", &live);
+    fx.write_transcript("dead-project", &dead.to_string_lossy());
+
+    let locked = fx.transcript_project_dir("locked");
+    std::fs::write(locked.join("note.txt"), "hidden").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let result = fx
+        .cmd()
+        .arg("prune")
+        .arg("--transcripts")
+        .assert()
+        .success();
+
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    result
+        .stdout(contains("locked"))
+        .stdout(contains("skipped: inaccessible"))
+        .stdout(contains("dead-project"))
+        .stdout(contains("1 dead"))
+        .stdout(contains("1 kept"));
+}
+
+#[test]
+fn transcripts_worktrees_only_filters_by_derived_cwd() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), standard_extras());
+    let normal = fx.root.path().join("missing-normal");
+    let worktree = fx
+        .root
+        .path()
+        .join("repo/.claude/worktrees/witty-curie/checkout");
+    fx.write_transcript("normal-dead", &normal.to_string_lossy());
+    fx.write_transcript("worktree-dead", &worktree.to_string_lossy());
+
+    fx.cmd()
+        .arg("prune")
+        .arg("--transcripts")
+        .arg("--worktrees-only")
+        .arg("--apply")
+        .arg("--force")
+        .assert()
+        .success();
+
+    assert!(
+        fx.claude_home.join("projects/normal-dead").exists(),
+        "non-worktree derived cwd is filtered out"
+    );
+    assert!(
+        !fx.claude_home.join("projects/worktree-dead").exists(),
+        "worktree derived cwd is pruned"
+    );
+}
+
+#[test]
+fn transcripts_worktrees_only_reports_unclassified_skips() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), standard_extras());
+    let normal = fx.root.path().join("missing-normal");
+    let worktree = fx
+        .root
+        .path()
+        .join("repo/.claude/worktrees/witty-curie/checkout");
+    fx.write_transcript("normal-dead", &normal.to_string_lossy());
+    fx.write_transcript("worktree-dead", &worktree.to_string_lossy());
+    fx.transcript_project_dir("no-jsonl");
+
+    let out = fx
+        .cmd()
+        .arg("prune")
+        .arg("--transcripts")
+        .arg("--worktrees-only")
+        .output()
+        .expect("run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(stdout.contains("worktree-dead"), "{stdout}");
+    assert!(stdout.contains("no-jsonl"), "{stdout}");
+    assert!(stdout.contains("skipped: no-jsonl"), "{stdout}");
+    assert!(
+        !stdout.contains("normal-dead"),
+        "resolvable non-worktree dirs stay filtered: {stdout}"
+    );
+}
+
+#[test]
+fn transcripts_json_output_includes_dir_statuses() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), standard_extras());
+    let live = fx.touch_dir("live-project");
+    let dead = fx.root.path().join("missing-project");
+    fx.write_transcript("live-project", &live);
+    fx.write_transcript("dead-project", &dead.to_string_lossy());
+    fx.transcript_project_dir("no-jsonl");
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("prune")
+        .arg("--transcripts")
+        .output()
+        .expect("run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["transcripts"]["total"], json!(3));
+    assert_eq!(v["transcripts"]["kept"], json!(1));
+    assert_eq!(v["transcripts"]["dead"], json!(1));
+    assert_eq!(v["transcripts"]["skipped"], json!(1));
+    assert_eq!(v["transcripts"]["applied"], json!(false));
+
+    let dirs = v["transcripts"]["dirs"].as_array().unwrap();
+    assert!(
+        dirs.iter()
+            .any(|d| d["status"] == json!("dead") && d["delete"].as_array().unwrap().len() == 1)
+    );
+    assert!(
+        dirs.iter()
+            .any(|d| d["status"] == json!("skipped") && d["reason"] == json!("no-jsonl"))
+    );
+}
+
+#[test]
+fn transcripts_apply_deletes_exactly_reported_set() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), standard_extras());
+    let dead = fx.root.path().join("missing-project");
+    fx.write_transcript("dead-project", &dead.to_string_lossy());
+    fx.session_artifact_dir("dead-project");
+
+    let dry = fx
+        .cmd()
+        .arg("--json")
+        .arg("prune")
+        .arg("--transcripts")
+        .output()
+        .expect("dry run");
+    assert!(
+        dry.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    let dry_json: Value = serde_json::from_slice(&dry.stdout).expect("dry json");
+    let mut reported = dry_json["transcripts"]["dirs"][0]["delete"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    reported.sort();
+
+    let applied = fx
+        .cmd()
+        .arg("--json")
+        .arg("prune")
+        .arg("--transcripts")
+        .arg("--apply")
+        .arg("--force")
+        .output()
+        .expect("apply");
+    assert!(
+        applied.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let applied_json: Value = serde_json::from_slice(&applied.stdout).expect("apply json");
+    let mut deleted = applied_json["transcripts"]["dirs"][0]["deleted"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    deleted.sort();
+
+    assert_eq!(deleted, reported, "--apply deletes the dry-run set");
+    assert_eq!(applied_json["transcripts"]["applied"], json!(true));
+    assert_eq!(applied_json["backup"], json!(null));
+    assert!(fx.backup_paths().is_empty());
+}

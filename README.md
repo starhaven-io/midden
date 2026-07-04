@@ -70,6 +70,12 @@ midden prune
 # Apply the prune
 midden prune --apply
 
+# Also report orphaned transcript artifacts under ~/.claude/projects/
+midden prune --transcripts
+
+# Remove dead project entries and orphaned transcript artifacts
+midden prune --transcripts --apply
+
 # Only consider ephemeral worktree entries
 midden prune --worktrees-only --apply
 
@@ -160,6 +166,10 @@ quit all Claude Code sessions first; it rewrites this file live.
 ```
 
 An entry is a removal candidate only if its directory is provably absent from disk — a path that merely *fails to stat* (permission denied, an unreachable mount) is kept, and midden never guesses from value contents. `--worktrees-only` restricts to entries under a `.claude/worktrees/` path. If nearly all entries resolve missing — usually a sign you are on a different machine or an unmounted volume rather than that they are all dead — `prune --apply` refuses unless you pass `--force`.
+
+Pass `--transcripts` to also inspect `~/.claude/projects/`, where Claude Code stores per-project session transcripts. These directories are named with lossy path slugs, so midden never decodes the directory name. Instead it reads only the head of each `*.jsonl` transcript and uses the first `cwd` field it can derive. A transcript directory is skipped if its transcripts disagree, no `cwd` can be derived, or it has no `*.jsonl` files.
+
+When a derived `cwd` is provably absent, `prune --transcripts` reports the session artifacts it would remove: `*.jsonl` files and bare UUID-named session artifact directories. `memory/` is durable user data and is never deleted. If only `memory/` remains, the transcript project directory is kept and reported as memory preserved; unknown entries are left in place and reported as partially cleaned. Unlike `.claude.json` rewrites, transcript deletion does not create `.bak` copies, because copying hundreds of MB of append-only logs would make cleanup impractical; the same dry-run, running-`claude`, mass-deletion, and `--force` gates still apply.
 
 ## What doctor checks
 

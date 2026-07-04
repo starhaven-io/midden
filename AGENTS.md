@@ -14,7 +14,7 @@ midden is a Rust CLI for resolving, auditing, and garbage-collecting the state C
 
 ### Commands
 
-- `prune [--apply] [--worktrees-only] [--force]` — GC dead `projects` entries from `~/.claude.json`. Dry-run by default; removes only entries whose directory is provably absent. `--apply` backs up then writes; `--worktrees-only` restricts to `.claude/worktrees/` paths; `--force` overrides the write gates.
+- `prune [--apply] [--transcripts] [--worktrees-only] [--force]` — GC dead `projects` entries from `~/.claude.json`. Dry-run by default; removes only entries whose directory is provably absent. `--transcripts` additionally cleans orphaned session artifacts under `~/.claude/projects/` by deriving cwd from JSONL heads, never from lossy slugs. `--apply` backs up then writes `.claude.json`; transcript deletion deliberately does not create backups. `--worktrees-only` restricts to `.claude/worktrees/` paths; `--force` overrides the write gates.
 - `doctor [PATH] [--fix] [--force] [--show-secrets]` — emit structured `Finding { id, severity, location, message, suggested_fix, auto_fixable }`. `--fix` applies the `auto_fixable` findings under the same backup + atomic-write discipline as prune (today only `orphaned-project` is auto-fixable). See the README for the full check list.
 - `show [PATH] [--show-secrets]` — resolve every config surface for a directory with provenance: settings (with shadow/merge tags), every contributing `CLAUDE.md`, skills, commands, subagents, hooks, MCP servers (user/local/project/managed — local being the per-project `mcpServers` map inside `~/.claude.json`), worktrees.
 
@@ -27,6 +27,7 @@ Global flags: `--json` (machine output; disables color), `--color auto|always|ne
 - `doctor.rs` — doctor command: the `Finding` lint and its checks.
 - `show.rs` — show command. `resolve_settings` is the single source of truth for settings precedence + provenance.
 - `orphans.rs` — orphan detection (shared by prune + doctor) and `looks_like_wrong_host` (the mass-deletion heuristic).
+- `transcripts.rs` — transcript cwd derivation and artifact cleanup under `~/.claude/projects/`; deletes only `*.jsonl` and UUID session dirs, never `memory/`.
 - `claude_json.rs` — read/render `~/.claude.json` (order-preserving) and `write_atomic`.
 - `paths.rs` — user/project/managed path helpers. `managed_settings_paths()` are hardcoded system paths (not overridable — so managed-scope file discovery isn't reachable from integration tests yet).
 - `backup.rs` — timestamped sibling copy taken before any write.
@@ -51,6 +52,7 @@ CLAUDE.md does **not** follow settings precedence. All applicable files load sim
 
 - **Read-only by default.** Mutation requires an explicit flag (`--apply` / `--fix`).
 - **Backup before every write.** `backup::timestamped_copy` writes a `.bak-YYYYMMDD-HHMMSS` sibling (suffix-bumped on a same-second collision) before any mutation.
+- **Transcript deletion is the backup exception.** `prune --transcripts --apply` deletes append-only `*.jsonl` logs and UUID session artifact dirs without making `.bak` copies, because backing up hundreds of MB defeats GC. It never deletes `memory/` and still uses dry-run, running-`claude`, and mass-deletion gates.
 - **Atomic writes.** `claude_json::write_atomic` streams to a temp sibling, fsyncs, then renames over the target — never an in-place truncating write of `~/.claude.json`. The temp mirrors the target's file mode (owner-only `0600` for new files) so a rewrite never broadens permissions on a credential-bearing file; backups are clamped to `0600` likewise.
 - **Running-`claude` gate.** Refuses to write while a `claude` process runs (Claude Code rewrites the file live). `--force` overrides.
 - **Mass-deletion gate.** Refuses to prune when ≥90% of a non-trivial `projects` map resolves missing — that usually means the wrong host or an unmounted volume, not real orphans. `--force` overrides.
