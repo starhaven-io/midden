@@ -153,7 +153,13 @@ jobs:
           mkdir -p staging
           cp "target/${TARGET}/release/midden" staging/
           cp LICENSE staging/
-          /usr/bin/tar --no-mac-metadata --no-xattrs -czf "${ARTIFACT}.tar.gz" -C staging .
+          # --no-mac-metadata is a BSD/macOS tar flag; GNU tar on the Linux
+          # runners rejects it. Only add it when packaging on macOS.
+          tar_flags=(--no-xattrs)
+          if [[ "$(uname)" == "Darwin" ]]; then
+            tar_flags+=(--no-mac-metadata)
+          fi
+          /usr/bin/tar "${tar_flags[@]}" -czf "${ARTIFACT}.tar.gz" -C staging .
           echo "ARTIFACT=${ARTIFACT}" >> "${GITHUB_ENV}"
 
       - name: Generate build provenance
