@@ -1,7 +1,9 @@
 # midden
 
+<!-- fleet:block badges -->
 [![CI](https://github.com/starhaven-io/midden/actions/workflows/ci.yml/badge.svg)](https://github.com/starhaven-io/midden/actions/workflows/ci.yml)
 [![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](LICENSE)
+<!-- fleet:end -->
 
 A CLI tool that resolves, audits, and garbage-collects the heap of state Claude Code accumulates.
 
@@ -237,8 +239,10 @@ just install-hooks  # Install git hooks: pre-push check + DCO sign-off (once per
 
 Commits must follow [Conventional Commits](https://www.conventionalcommits.org/) format and include a DCO sign-off (`git commit -s`). Run `just install-hooks` once per clone to enable the git hooks (a pre-push `just check` and DCO sign-off enforcement).
 
+<!-- fleet:block license-section -->
 ## License
 
 This project is licensed under the [GNU Affero General Public License v3.0](LICENSE) (`AGPL-3.0-only`).
 
 Copyright (C) 2026 Patrick Linnane
+<!-- fleet:end -->
