@@ -20,6 +20,17 @@ midden is a Rust CLI for resolving, auditing, and garbage-collecting the state C
 
 Global flags: `--json` (machine output; disables color), `--color auto|always|never`, `--config <PATH>` (override `~/.claude.json`), `--claude-home <PATH>` (override `~/.claude`). The two override flags exist for testing — integration tests point them at fixture dirs.
 
+### Gotchas
+
+- `~/.claude.json` is the central, live file Claude Code rewrites constantly — the highest-stakes thing midden touches. All mutations go through backup → atomic write → the running-claude gate.
+- Orphan detection is existence-only (`fs::metadata`): only `NotFound` / `NotADirectory` (or an existing non-directory) count as provably absent — any other stat failure (permission denied, I/O error, dead mount) means "can't tell" and the entry is kept. "Not visible on this host" ≠ "dead", which is why the mass-deletion gate also exists.
+- `git.rs` shells out; treat `None` as "can't tell" (not a repo / no git), never as "false".
+- Integration tests isolate `HOME`, `XDG_CONFIG_HOME`, and `GIT_CONFIG_NOSYSTEM` so a developer's global gitignore can't sway doctor's git checks — preserve that in `tests/common/mod.rs`.
+
+### CI workflows (`.github/workflows/`)
+
+`ci.yml` (dynamic matrix: conventional-commit check, lint, test on Linux/Linux-ARM/macOS, coverage to Codecov, zizmor on workflow changes); `release.yml` (manual dispatch: cross-platform signed + notarized binaries, build-provenance attestation, crates.io publish via OIDC, Homebrew cask bump); `codeql.yml`, `zizmor.yml`, `pinprick-audit.yml` (dogfood), `link-check.yml`; `cargo-deny.yml` (Monday scheduled/dispatch advisory drift scan that opens or updates a tracking issue when the result flips); weekly `bump-cargo-tools.yml`. Third-party actions are SHA-pinned and workflows are least-privilege (`permissions: {}` at the top, granted per-job). `release.yml` deliberately omits shell `-x` so secrets don't leak into public logs.
+
 ## Repository structure
 
 - `main.rs` — clap CLI definition and dispatch.
@@ -69,6 +80,8 @@ CLAUDE.md does **not** follow settings precedence. All applicable files load sim
 - `just fmt` / `just fmt-check` — rustfmt, 2024 style edition (`rustfmt.toml`)
 - `just typos`, `just deny` (`cargo deny check`), `just lychee`, `just audit` (zizmor)
 - `just check` — run everything; skips tools that aren't installed
+- Errors: anyhow throughout (`Result`, `.with_context`, `bail!`). Flat modules.
+  Comments explain *why*, not *what*.
 
 ### Exit codes
 
@@ -76,19 +89,15 @@ CLAUDE.md does **not** follow settings precedence. All applicable files load sim
 
 ## Commit and PR conventions
 
-- Conventional Commits: `type(scope): description` (feat, fix, refactor, docs, ci, chore, perf, test, style, build). The PR title and every commit are checked in CI.
-- Sign off every commit with `git commit -s` for DCO (enforced by the `.githooks/commit-msg` hook — run `just install-hooks` once per clone to enable it).
-- When authored with an AI coding agent, add a `Co-Authored-By` trailer after `Signed-off-by`, naming the agent and model. Current examples: `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>` or `Co-Authored-By: Codex GPT-5 <noreply@openai.com>`. Bump the model version as newer ones ship.
-- Never commit to `main` — branch and open a PR. PR descriptions contain a summary of changes only: no test-plan sections, no bot attribution, no generated-with footers.
-- Errors: anyhow throughout (`Result`, `.with_context`, `bail!`). Flat modules. Comments explain *why*, not *what*.
-
-### Gotchas
-
-- `~/.claude.json` is the central, live file Claude Code rewrites constantly — the highest-stakes thing midden touches. All mutations go through backup → atomic write → the running-claude gate.
-- Orphan detection is existence-only (`fs::metadata`): only `NotFound` / `NotADirectory` (or an existing non-directory) count as provably absent — any other stat failure (permission denied, I/O error, dead mount) means "can't tell" and the entry is kept. "Not visible on this host" ≠ "dead", which is why the mass-deletion gate also exists.
-- `git.rs` shells out; treat `None` as "can't tell" (not a repo / no git), never as "false".
-- Integration tests isolate `HOME`, `XDG_CONFIG_HOME`, and `GIT_CONFIG_NOSYSTEM` so a developer's global gitignore can't sway doctor's git checks — preserve that in `tests/common/mod.rs`.
-
-### CI workflows (`.github/workflows/`)
-
-`ci.yml` (dynamic matrix: conventional-commit check, lint, test on Linux/Linux-ARM/macOS, coverage to Codecov, zizmor on workflow changes); `release.yml` (manual dispatch: cross-platform signed + notarized binaries, build-provenance attestation, crates.io publish via OIDC, Homebrew cask bump); `codeql.yml`, `zizmor.yml`, `pinprick-audit.yml` (dogfood), `link-check.yml`; weekly `bump-cargo-tools.yml`. Third-party actions are SHA-pinned and workflows are least-privilege (`permissions: {}` at the top, granted per-job). `release.yml` deliberately omits shell `-x` so secrets don't leak into public logs.
+- Conventional Commits: `type(scope): description`. Valid types: `feat`,
+  `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`.
+- Sign off every commit with `git commit -s` for DCO (enforced by the
+  `.githooks/commit-msg` hook; run `just install-hooks` once per clone to
+  enable it).
+- When authored with an AI coding agent, add a `Co-Authored-By` trailer after
+  `Signed-off-by`, naming the agent and model. Current example:
+  `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`. Bump the model
+  version as newer ones ship.
+- Never commit directly to `main`; create a feature branch and open a PR.
+- PR descriptions should contain only a concise summary of changes. Do not add
+  test-plan sections, bot attribution, or generated-with footers.
