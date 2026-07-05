@@ -88,6 +88,7 @@ CLAUDE.md does **not** follow settings precedence. All applicable files load sim
 `0` clean / successful apply · `1` doctor found an `Error`-severity finding · `2` error (bad input, missing file, or a write blocked by a gate).
 
 <!-- fleet:block commit-and-pr-conventions -->
+
 ## Commit and PR conventions
 
 - Conventional Commits: `type(scope): description`. Valid types: `feat`,
@@ -105,4 +106,5 @@ CLAUDE.md does **not** follow settings precedence. All applicable files load sim
 - Comments must earn their keep: a comment states a constraint or rationale the
   code cannot express. Never add comments that narrate what the code does,
   restate names, or explain a change to its reviewer.
+
 <!-- fleet:end -->
