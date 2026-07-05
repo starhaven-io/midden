@@ -10,7 +10,6 @@ updates:
       github-actions:
         patterns:
           - "*"
-
   - package-ecosystem: "cargo"
     directory: "/"
     allow:
