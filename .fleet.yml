@@ -2,14 +2,14 @@ schema: 1
 license: "agpl"
 params:
   dependabot:
-    - package-ecosystem: "github-actions"
-      group: "github-actions"
-      directory: "/"
     - package-ecosystem: "cargo"
       group: "cargo-dependencies"
       directory: "/"
       allow:
         - dependency-type: "all"
+    - package-ecosystem: "github-actions"
+      group: "github-actions"
+      directory: "/"
   link-check:
     targets: "--config lychee.toml README.md"
     build-site: false
