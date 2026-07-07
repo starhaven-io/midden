@@ -4,7 +4,7 @@ midden is a Rust CLI for resolving, auditing, and garbage-collecting the state C
 
 ## Project overview
 
-- **Language:** Rust, 2024 edition, MSRV 1.88.
+- **Language:** Rust, 2024 edition, MSRV 1.95.
 - **Platforms:** macOS and Linux. Windows is out of scope for v0 (a `cfg(windows)` branch may exist but is untested/unsupported).
 - **License:** AGPL-3.0-only.
 - **Binary:** one CLI; subcommands `prune`, `doctor`, `show`, plus `completions` for shell completion.

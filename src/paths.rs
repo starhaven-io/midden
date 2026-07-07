@@ -40,7 +40,7 @@ impl Env {
 }
 
 fn home_dir() -> PathBuf {
-    // std::env::home_dir was un-deprecated in Rust 1.87 (< this crate's 1.88
+    // std::env::home_dir was un-deprecated in Rust 1.87 (< this crate's 1.95
     // MSRV) and resolves $HOME, then /etc/passwd, on the Unix platforms this
     // tool targets. Fall back to the current directory only if no home exists.
     std::env::home_dir().unwrap_or_else(|| PathBuf::from("."))
