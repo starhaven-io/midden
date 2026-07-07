@@ -2,7 +2,7 @@
 name = "midden"
 version = "0.6.0"
 edition = "2024"
-rust-version = "1.88.0"
+rust-version = "1.95.0"
 description = "Resolve, audit, and garbage-collect Claude Code's accumulated state"
 license = "AGPL-3.0-only"
 repository = "https://github.com/starhaven-io/midden"
@@ -23,7 +23,7 @@ walkdir = "2"
 colored = "3"
 anyhow = "1"
 time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
-sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 assert_cmd = "2"
