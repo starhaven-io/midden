@@ -16,9 +16,11 @@ use crate::output;
 use crate::paths::{Env, ProjectPaths, managed_settings_files};
 use crate::process;
 use crate::secrets;
+use crate::transcripts;
 
 const WORKTREE_STALE_AFTER: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const CLAUDE_JSON_BLOAT_THRESHOLD_KB: usize = 512;
+const TRANSCRIPT_STORAGE_BLOAT_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
 const CREDENTIAL_DENY_HINTS: &[&str] = &[".env", "secrets"];
 
 pub struct Options {
@@ -79,6 +81,7 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
 
     check_orphaned_projects(env, claude_json.as_ref(), &mut findings);
     check_claude_json_size(env, claude_json.as_ref(), &mut findings);
+    check_transcript_storage(env, &mut findings);
     check_stale_worktrees(&project, &mut findings)?;
     check_secrets_in_committed_settings(&project, &mut findings, opts.show_secrets)?;
     check_local_settings_in_git(&project, &mut findings)?;
@@ -325,6 +328,92 @@ fn check_claude_json_size(env: &Env, config: Option<&ClaudeJson>, out: &mut Vec<
         suggested_fix: Some(
             "`midden prune --apply` reclaims orphaned project entries; the rest is \
              cache and metrics Claude Code rewrites, not safe to hand-prune"
+                .into(),
+        ),
+        auto_fixable: false,
+    });
+}
+
+fn check_transcript_storage(env: &Env, out: &mut Vec<Finding>) {
+    let report = match transcripts::discover(&env.claude_home, false) {
+        Ok(report) => report,
+        Err(e) => {
+            let projects_dir = env.claude_home.join("projects");
+            push_inaccessible(
+                out,
+                projects_dir.clone(),
+                format!(
+                    "could not inspect transcript project dirs under {}: {e}",
+                    projects_dir.display()
+                ),
+            );
+            return;
+        }
+    };
+
+    for dir in report.dirs.iter().filter(|d| d.is_dead()) {
+        out.push(Finding {
+            id: "orphaned-transcript",
+            severity: Severity::Warn,
+            location: Location {
+                file: dir.path.clone(),
+                key_path: None,
+            },
+            message: format!(
+                "transcript directory points at missing project: {} (reclaim ~{})",
+                dir.derived_cwd.as_deref().unwrap_or("<unknown>"),
+                output::human_bytes(dir.bytes),
+            ),
+            suggested_fix: Some(
+                "remove orphaned transcript artifacts with `midden prune --transcripts --apply`"
+                    .into(),
+            ),
+            auto_fixable: false,
+        });
+    }
+
+    let kept_bytes = report.kept_storage_bytes();
+    if kept_bytes < TRANSCRIPT_STORAGE_BLOAT_THRESHOLD_BYTES {
+        return;
+    }
+
+    let largest = report
+        .top_kept_by_storage(3)
+        .into_iter()
+        .map(|dir| {
+            format!(
+                "{} ({})",
+                dir.derived_cwd.as_deref().unwrap_or_else(|| {
+                    dir.path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("<unknown>")
+                }),
+                output::human_bytes(dir.storage_bytes)
+            )
+        })
+        .collect::<Vec<_>>();
+    let suffix = if largest.is_empty() {
+        String::new()
+    } else {
+        format!("; largest: {}", largest.join(", "))
+    };
+
+    out.push(Finding {
+        id: "claude-transcript-storage",
+        severity: Severity::Info,
+        location: Location {
+            file: report.projects_dir.clone(),
+            key_path: None,
+        },
+        message: format!(
+            "kept transcript history uses ~{} across {} dirs{}",
+            output::human_bytes(kept_bytes),
+            report.kept_count(),
+            suffix,
+        ),
+        suggested_fix: Some(
+            "`midden prune --transcripts` shows dead transcript artifacts and the largest kept dirs"
                 .into(),
         ),
         auto_fixable: false,

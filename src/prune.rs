@@ -285,12 +285,13 @@ fn print_transcript_preview(report: &transcripts::Report) {
     }
 
     println!(
-        "  {} dirs; {} dead, {} kept, {} skipped; would reclaim ~{}.",
+        "  {} dirs; {} dead, {} kept, {} skipped; would reclaim ~{}; kept uses ~{}.",
         report.total(),
         report.dead_count().to_string().yellow(),
         report.kept_count(),
         report.skipped_count(),
-        output::kb(report.bytes() as usize),
+        output::human_bytes(report.bytes()),
+        output::human_bytes(report.kept_storage_bytes()),
     );
 
     for dir in &report.dirs {
@@ -300,7 +301,7 @@ fn print_transcript_preview(report: &transcripts::Report) {
                     "  - {} -> {} ({})",
                     dir.path.display(),
                     dir.derived_cwd.as_deref().unwrap_or("<unknown>"),
-                    output::kb(dir.bytes as usize)
+                    output::human_bytes(dir.bytes)
                 );
                 for target in &dir.delete {
                     println!("      delete {}", target.display());
@@ -317,6 +318,25 @@ fn print_transcript_preview(report: &transcripts::Report) {
             transcripts::DirStatus::Kept => {}
         }
     }
+
+    print_kept_transcript_storage(report);
+}
+
+fn print_kept_transcript_storage(report: &transcripts::Report) {
+    let dirs = report.top_kept_by_storage(5);
+    if dirs.is_empty() {
+        return;
+    }
+
+    println!("  largest kept transcript dirs:");
+    for dir in dirs {
+        println!(
+            "    - {} -> {} ({})",
+            dir.path.display(),
+            dir.derived_cwd.as_deref().unwrap_or("<unknown>"),
+            output::human_bytes(dir.storage_bytes),
+        );
+    }
 }
 
 fn print_transcript_apply(report: &transcripts::Report) {
@@ -331,7 +351,7 @@ fn print_transcript_apply(report: &transcripts::Report) {
         "  removed {} artifacts from {} dead dirs; reclaimed ~{}.",
         report.dirs.iter().map(|d| d.deleted.len()).sum::<usize>(),
         report.dead_count(),
-        output::kb(report.bytes() as usize),
+        output::human_bytes(report.bytes()),
     );
     for dir in report.dirs.iter().filter(|d| d.is_dead()) {
         println!("  - {}", dir.path.display());

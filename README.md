@@ -175,12 +175,16 @@ Pass `--transcripts` to also inspect `~/.claude/projects/`, where Claude Code st
 
 When a derived `cwd` is provably absent, `prune --transcripts` reports the session artifacts it would remove: `*.jsonl` files and bare UUID-named session artifact directories. `memory/` is durable user data and is never deleted. If only `memory/` remains, the transcript project directory is kept and reported as memory preserved; unknown entries are left in place and reported as partially cleaned. Unlike `.claude.json` rewrites, transcript deletion does not create `.bak` copies, because copying hundreds of MB of append-only logs would make cleanup impractical; the same dry-run, running-`claude`, mass-deletion, and `--force` gates still apply.
 
+`prune --transcripts` also reports the largest kept transcript directories. Those are not removal candidates today because their project directories still exist, but the inventory shows where live Claude Code history is consuming disk so retention-policy work can be deliberate rather than guesswork.
+
 ## What doctor checks
 
 | ID | Severity | Auto-fixable | What it catches |
 |----|----------|--------------|-----------------|
 | `orphaned-project` | Warn | yes | `projects` entry whose directory no longer exists |
 | `claude-json-bloat` | Info | no | `~/.claude.json` over 512 KB (Claude Code never prunes it) |
+| `orphaned-transcript` | Warn | no | Transcript directory whose derived cwd no longer exists |
+| `claude-transcript-storage` | Info | no | Kept transcript history under `~/.claude/projects/` exceeds 64 MiB |
 | `stale-worktree` | Info | no | Ephemeral worktree dir untouched for >30 days |
 | `config-path-inaccessible` | Warn | no | Config/worktree path could not be inspected because of permissions or filesystem errors |
 | `malformed-json-config` | Warn | no | Settings or MCP JSON could not be parsed, so key-aware checks were skipped |
