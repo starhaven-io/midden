@@ -31,6 +31,7 @@ jobs:
       contents: read
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
+      links: ${{ steps.matrix.outputs.links }}
       zizmor: ${{ steps.matrix.outputs.zizmor }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -47,8 +48,11 @@ jobs:
           # Push to main: run lint to warm the cache, and coverage so
           # Codecov has a baseline for PR comparisons.
           if [[ "${EVENT_NAME}" == "push" ]]; then
-            echo 'matrix=[{"name":"Lint","check":"lint","runner":"ubuntu-24.04"},{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04","environment":"codecov"}]' >> "${GITHUB_OUTPUT}"
-            echo "zizmor=false" >> "${GITHUB_OUTPUT}"
+            {
+              echo 'matrix=[{"name":"Lint","check":"lint","runner":"ubuntu-24.04"},{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04","environment":"codecov"}]'
+              echo "links=false"
+              echo "zizmor=false"
+            } >> "${GITHUB_OUTPUT}"
             exit 0
           fi
 
@@ -61,6 +65,7 @@ jobs:
               MATRIX="${MATRIX%]},${entry}]"
             fi
           }
+          LINKS=false
           ZIZMOR=false
 
           # `edited` (title/body/base) also runs the full path-derived matrix. The
@@ -84,7 +89,7 @@ jobs:
 
           # README or link-check config changes: verify links on the PR.
           if echo "${CHANGED}" | grep -qE '^README\.md$|^lychee\.toml$|^\.github/workflows/(ci|link-check)\.yml$'; then
-            add_check '{"name":"Links","check":"links","runner":"ubuntu-24.04"}'
+            LINKS=true
           fi
 
           # Workflow changes: Actions security audit
@@ -92,8 +97,11 @@ jobs:
             ZIZMOR=true
           fi
 
-          echo "matrix=${MATRIX}" >> "${GITHUB_OUTPUT}"
-          echo "zizmor=${ZIZMOR}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "matrix=${MATRIX}"
+            echo "links=${LINKS}"
+            echo "zizmor=${ZIZMOR}"
+          } >> "${GITHUB_OUTPUT}"
 
   commits:
     name: Conventional Commits
@@ -192,15 +200,6 @@ jobs:
         if: matrix.check == 'lint'
         run: cargo deny check
 
-      - name: Check links
-        if: matrix.check == 'links'
-        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        with:
-          args: --config lychee.toml README.md
-          fail: true
-
       - name: Save cargo build cache
         if: matrix.check == 'lint' && github.event_name == 'push' && steps.cargo-build-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -287,6 +286,19 @@ jobs:
             ~/.cargo/.crates2.json
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-cov-tools-${{ hashFiles('.github/workflows/ci.yml') }}
 
+  links:
+    name: Links
+    needs: generate-matrix
+    if: needs.generate-matrix.outputs.links == 'true'
+    permissions:
+      contents: read
+    uses: starhaven-io/.github/.github/workflows/reusable-link-check.yml@03a3794cb337d13703059eb02b44a8d419833ebd # v2026.07.08.1
+    with:
+      args: "--config lychee.toml README.md"
+      build-site: false
+      site-directory: ""
+      authenticated-github: true
+
   zizmor:
     name: zizmor
     needs: generate-matrix
@@ -298,7 +310,7 @@ jobs:
 
   conclusion:
     name: conclusion
-    needs: [commits, check, zizmor]
+    needs: [commits, check, links, zizmor]
     runs-on: ubuntu-slim
     timeout-minutes: 15
     if: always()
@@ -307,8 +319,10 @@ jobs:
         env:
           COMMITS_RESULT: ${{ needs.commits.result }}
           CHECK_RESULT: ${{ needs.check.result }}
+          LINKS_RESULT: ${{ needs.links.result }}
           ZIZMOR_RESULT: ${{ needs.zizmor.result }}
         run: |
           test "${COMMITS_RESULT}" = "success" || test "${COMMITS_RESULT}" = "skipped"
           test "${CHECK_RESULT}" = "success" || test "${CHECK_RESULT}" = "skipped"
+          test "${LINKS_RESULT}" = "success" || test "${LINKS_RESULT}" = "skipped"
           test "${ZIZMOR_RESULT}" = "success" || test "${ZIZMOR_RESULT}" = "skipped"
