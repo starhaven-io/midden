@@ -821,6 +821,80 @@ fn bloat_finding_names_the_largest_key() {
 }
 
 #[test]
+fn doctor_reports_orphaned_transcript_dirs() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let dead = fx.root.path().join("missing-transcript-project");
+    fx.write_transcript("dead-transcript-project", &dead.to_string_lossy());
+
+    fx.cmd()
+        .arg("doctor")
+        .arg(fx.root.path())
+        .assert()
+        .success()
+        .stdout(contains("orphaned-transcript"))
+        .stdout(contains("midden prune --transcripts --apply"));
+}
+
+#[test]
+fn doctor_does_not_report_live_transcript_dirs_as_orphaned() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let live = fx.touch_dir("live-transcript-project");
+    fx.write_transcript("live-transcript-project", &live);
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("doctor")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        !v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "orphaned-transcript"),
+        "live transcript dir should not be orphaned: {v}"
+    );
+}
+
+#[test]
+fn doctor_reports_large_kept_transcript_history_with_scaled_units() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let live = fx.touch_dir("large-live-transcript-project");
+    let jsonl = fx.write_transcript("large-live-transcript-project", &live);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&jsonl)
+        .unwrap()
+        .set_len(70 * 1024 * 1024)
+        .unwrap();
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("doctor")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let finding = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "claude-transcript-storage")
+        .expect("large kept transcript history should be reported");
+    let msg = finding["message"].as_str().unwrap();
+    assert!(msg.contains("kept transcript history"), "message: {msg}");
+    assert!(msg.contains("70.0 MiB"), "message: {msg}");
+    assert!(msg.contains(&live), "message: {msg}");
+}
+
+#[test]
 fn clean_config_reports_no_findings() {
     let fx = Fixture::new();
     let live = fx.touch_dir("alive");

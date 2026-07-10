@@ -780,6 +780,32 @@ fn transcripts_worktrees_only_reports_unclassified_skips() {
 }
 
 #[test]
+fn transcripts_dry_run_lists_largest_kept_dirs_with_scaled_units() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), standard_extras());
+    let large = fx.touch_dir("large-live");
+    let small = fx.touch_dir("small-live");
+    let large_jsonl = fx.write_transcript("large-live", &large);
+    fx.write_transcript("small-live", &small);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&large_jsonl)
+        .unwrap()
+        .set_len(2 * 1024 * 1024)
+        .unwrap();
+
+    fx.cmd()
+        .arg("prune")
+        .arg("--transcripts")
+        .assert()
+        .success()
+        .stdout(contains("kept uses"))
+        .stdout(contains("2.0 MiB"))
+        .stdout(contains("largest kept transcript dirs"))
+        .stdout(contains("large-live"));
+}
+
+#[test]
 fn transcripts_json_output_includes_dir_statuses() {
     let fx = Fixture::new();
     fx.write_config(json!({}), standard_extras());
@@ -807,6 +833,10 @@ fn transcripts_json_output_includes_dir_statuses() {
     assert_eq!(v["transcripts"]["dead"], json!(1));
     assert_eq!(v["transcripts"]["skipped"], json!(1));
     assert_eq!(v["transcripts"]["applied"], json!(false));
+    assert!(
+        v["transcripts"]["storage_bytes"].as_u64().unwrap() > 0,
+        "transcript storage should be reported"
+    );
 
     let dirs = v["transcripts"]["dirs"].as_array().unwrap();
     assert!(
@@ -816,6 +846,59 @@ fn transcripts_json_output_includes_dir_statuses() {
     assert!(
         dirs.iter()
             .any(|d| d["status"] == json!("skipped") && d["reason"] == json!("no-jsonl"))
+    );
+}
+
+#[test]
+fn skipped_transcript_dirs_keep_storage_bytes() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), standard_extras());
+    let one = fx.root.path().join("one").to_string_lossy().into_owned();
+    let two = fx.root.path().join("two").to_string_lossy().into_owned();
+    let first = fx.write_transcript_line(
+        "disagree",
+        "first.jsonl",
+        &format!("{{\"cwd\":{}}}\n", json!(one)),
+    );
+    fx.write_transcript_line(
+        "disagree",
+        "second.jsonl",
+        &format!("{{\"cwd\":{}}}\n", json!(two)),
+    );
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&first)
+        .unwrap()
+        .set_len(5 * 1024 * 1024)
+        .unwrap();
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("prune")
+        .arg("--transcripts")
+        .output()
+        .expect("run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json");
+    let report_bytes = v["transcripts"]["storage_bytes"].as_u64().unwrap();
+    assert!(
+        report_bytes >= 5 * 1024 * 1024,
+        "report storage should include skipped dir bytes: {v}"
+    );
+    let skipped = v["transcripts"]["dirs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["reason"] == json!("cwd-disagreement"))
+        .expect("cwd disagreement should be skipped");
+    assert!(
+        skipped["storage_bytes"].as_u64().unwrap() >= 5 * 1024 * 1024,
+        "skipped dir storage should be retained: {skipped}"
     );
 }
 

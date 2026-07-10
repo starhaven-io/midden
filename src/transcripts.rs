@@ -55,6 +55,7 @@ pub struct DirReport {
     pub derived_cwd: Option<String>,
     pub status: DirStatus,
     pub reason: Option<&'static str>,
+    pub storage_bytes: u64,
     pub bytes: u64,
     pub delete: Vec<PathBuf>,
     pub deleted: Vec<PathBuf>,
@@ -73,6 +74,7 @@ impl DirReport {
             "derived_cwd": self.derived_cwd,
             "status": self.status.as_str(),
             "reason": self.reason,
+            "storage_bytes": self.storage_bytes,
             "bytes": self.bytes,
             "delete": self.delete.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
             "deleted": self.deleted.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
@@ -123,6 +125,33 @@ impl Report {
         self.dirs.iter().map(|d| d.bytes).sum()
     }
 
+    pub fn storage_bytes(&self) -> u64 {
+        self.dirs.iter().map(|d| d.storage_bytes).sum()
+    }
+
+    pub fn kept_storage_bytes(&self) -> u64 {
+        self.dirs
+            .iter()
+            .filter(|d| d.status == DirStatus::Kept)
+            .map(|d| d.storage_bytes)
+            .sum()
+    }
+
+    pub fn top_kept_by_storage(&self, limit: usize) -> Vec<&DirReport> {
+        let mut dirs = self
+            .dirs
+            .iter()
+            .filter(|d| d.status == DirStatus::Kept && d.storage_bytes > 0)
+            .collect::<Vec<_>>();
+        dirs.sort_by(|a, b| {
+            b.storage_bytes
+                .cmp(&a.storage_bytes)
+                .then(a.path.cmp(&b.path))
+        });
+        dirs.truncate(limit);
+        dirs
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
             "projects_dir": self.projects_dir.display().to_string(),
@@ -131,6 +160,7 @@ impl Report {
             "kept": self.kept_count(),
             "dead": self.dead_count(),
             "skipped": self.skipped_count(),
+            "storage_bytes": self.storage_bytes(),
             "bytes": self.bytes(),
             "applied": self.applied,
             "dirs": self.dirs.iter().map(DirReport::to_json).collect::<Vec<_>>(),
@@ -202,8 +232,9 @@ pub fn delete_dead(mut report: Report) -> Result<Report> {
 
 fn inspect_dir(path: &Path) -> Result<DirReport> {
     let scan = scan_dir(path)?;
+    let storage_bytes = scan.storage_bytes()?;
     if scan.jsonl_files.is_empty() {
-        return Ok(skipped(path, "no-jsonl"));
+        return Ok(skipped_with_storage(path, "no-jsonl", storage_bytes));
     }
 
     let mut cwds = BTreeSet::new();
@@ -213,15 +244,25 @@ fn inspect_dir(path: &Path) -> Result<DirReport> {
                 cwds.insert(cwd);
             }
             Ok(None) => {}
-            Err(_) => return Ok(skipped(path, "inaccessible-jsonl")),
+            Err(_) => {
+                return Ok(skipped_with_storage(
+                    path,
+                    "inaccessible-jsonl",
+                    storage_bytes,
+                ));
+            }
         }
     }
 
     let Some(cwd) = cwds.iter().next().cloned() else {
-        return Ok(skipped(path, "no-cwd"));
+        return Ok(skipped_with_storage(path, "no-cwd", storage_bytes));
     };
     if cwds.len() > 1 {
-        return Ok(skipped(path, "cwd-disagreement"));
+        return Ok(skipped_with_storage(
+            path,
+            "cwd-disagreement",
+            storage_bytes,
+        ));
     }
 
     let status = if orphans::provably_absent(Path::new(&cwd)) {
@@ -245,6 +286,7 @@ fn inspect_dir(path: &Path) -> Result<DirReport> {
         derived_cwd: Some(cwd),
         status,
         reason: None,
+        storage_bytes,
         bytes,
         delete,
         deleted: Vec::new(),
@@ -254,11 +296,16 @@ fn inspect_dir(path: &Path) -> Result<DirReport> {
 }
 
 fn skipped(path: &Path, reason: &'static str) -> DirReport {
+    skipped_with_storage(path, reason, 0)
+}
+
+fn skipped_with_storage(path: &Path, reason: &'static str, storage_bytes: u64) -> DirReport {
     DirReport {
         path: path.to_path_buf(),
         derived_cwd: None,
         status: DirStatus::Skipped,
         reason: Some(reason),
+        storage_bytes,
         bytes: 0,
         delete: Vec::new(),
         deleted: Vec::new(),
@@ -292,6 +339,13 @@ impl DirScan {
     fn delete_bytes(&self) -> Result<u64> {
         self.delete.iter().try_fold(0_u64, |sum, artifact| {
             artifact.size().map(|bytes| sum.saturating_add(bytes))
+        })
+    }
+
+    fn storage_bytes(&self) -> Result<u64> {
+        let delete_bytes = self.delete_bytes()?;
+        self.remaining.iter().try_fold(delete_bytes, |sum, path| {
+            dir_size(path).map(|bytes| sum.saturating_add(bytes))
         })
     }
 }
@@ -571,5 +625,20 @@ mod tests {
         assert!(looks_like_uuid("123e4567e89b12d3a456426614174000"));
         assert!(!looks_like_uuid("memory"));
         assert!(!looks_like_uuid("123e4567-e89b-12d3-a456"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_size_does_not_follow_directory_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let link = root.path().join("link");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("large.txt"), vec![b'x'; 4096]).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let link_meta_len = std::fs::symlink_metadata(&link).unwrap().len();
+
+        assert_eq!(dir_size(&link).unwrap(), link_meta_len);
     }
 }
