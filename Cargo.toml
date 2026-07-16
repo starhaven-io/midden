@@ -11,6 +11,7 @@ keywords = ["claude-code", "config", "audit", "cli", "lint"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = [
     "/.github/",
+    "/rust-toolchain.toml",
     "/scripts/",
 ]
 
