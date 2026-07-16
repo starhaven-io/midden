@@ -74,6 +74,10 @@ CLAUDE.md does **not** follow settings precedence. All applicable files load sim
 
 ## Required checks
 
+`rust-toolchain.toml` pins CI and rustup-based workstations to the reviewed
+stable toolchain. Homebrew's standalone Rust does not honor that file, so verify
+`rustc --version` matches its `channel` before running the required checks.
+
 `just` recipes (raw command in parens):
 - `just build` / `just test` (`cargo build --locked` / `cargo test --locked`)
 - `just clippy` — `cargo clippy --locked --all-targets -- -D warnings` (zero warnings required)

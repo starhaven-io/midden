@@ -417,10 +417,9 @@ fn parse_directive(line: &str) -> Option<(Polarity, String, String)> {
         (Polarity::Dont, rest)
     } else if let Some(rest) = lower.strip_prefix("always ") {
         (Polarity::Do, rest)
-    } else if let Some(rest) = lower.strip_prefix("must ") {
-        (Polarity::Do, rest)
     } else {
-        return None;
+        let rest = lower.strip_prefix("must ")?;
+        (Polarity::Do, rest)
     };
     let keyword: String = rest
         .split_whitespace()
@@ -990,6 +989,10 @@ mod tests {
 
         let (pol, _, _) = parse_directive("Always run cargo fmt").unwrap();
         assert_eq!(pol, Polarity::Do);
+
+        let (pol, kw, _) = parse_directive("- Must sign every commit").unwrap();
+        assert_eq!(pol, Polarity::Do, "bare must is positive");
+        assert!(kw.starts_with("sign"));
 
         assert!(parse_directive("This is a paragraph.").is_none());
     }
