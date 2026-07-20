@@ -109,7 +109,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read # required to read PR titles
-    uses: starhaven-io/.github/.github/workflows/reusable-conventional-commits.yml@0cffea358b31930d0068ad1419e7522d1ea37764 # v2026.07.16.3
+    uses: starhaven-io/.github/.github/workflows/reusable-conventional-commits.yml@ca53feb55a6153eb56aec343972368432fdbc5c3 # v2026.07.20.1
 
   check:
     name: ${{ matrix.name }}
@@ -287,7 +287,7 @@ jobs:
     if: needs.generate-matrix.outputs.links == 'true'
     permissions:
       contents: read
-    uses: starhaven-io/.github/.github/workflows/reusable-link-check.yml@0cffea358b31930d0068ad1419e7522d1ea37764 # v2026.07.16.3
+    uses: starhaven-io/.github/.github/workflows/reusable-link-check.yml@ca53feb55a6153eb56aec343972368432fdbc5c3 # v2026.07.20.1
     with:
       args: "--config lychee.toml README.md"
       build-site: false
@@ -301,7 +301,7 @@ jobs:
     permissions:
       contents: read
       security-events: write # required for zizmor SARIF upload
-    uses: starhaven-io/.github/.github/workflows/reusable-zizmor.yml@0cffea358b31930d0068ad1419e7522d1ea37764 # v2026.07.16.3
+    uses: starhaven-io/.github/.github/workflows/reusable-zizmor.yml@ca53feb55a6153eb56aec343972368432fdbc5c3 # v2026.07.20.1
 
   conclusion:
     name: conclusion
