@@ -7,15 +7,15 @@
 
 <!-- fleet:end -->
 
-A CLI tool that resolves, audits, and garbage-collects the heap of state Claude Code accumulates.
+A CLI tool that resolves, audits, visualizes, and cleans the heap of context and state Codex and Claude Code accumulate.
 
-The name: **midden**, an archaeological term for a refuse heap — kitchen scraps, broken pottery, lost things — that tells you what life was like in the layer below. `~/.claude.json` is exactly that.
+The name: **midden**, an archaeological term for a refuse heap — kitchen scraps, broken pottery, lost things — that tells you what life was like in the layer below. Agent memory and `~/.claude.json` are exactly that.
 
 ## Why
 
 For installing skills, managing MCP server lists, or browsing the marketplace, plenty of tools already exist. Use those.
 
-midden picks up where they leave off. Claude Code writes a lot of state across many files — `~/.claude.json`'s `projects` map appended to on every visit and never pruned, settings layered across user/project/local/managed scopes with non-obvious precedence, ephemeral worktrees with adjective-scientist names, memory files (`CLAUDE.md`) loading from many locations simultaneously — and almost nothing in the loop *removes* any of it. midden surfaces what's actually active for a given directory with provenance, flags what's stale or leaking, and prunes the state nothing else cleans up.
+midden picks up where they leave off. Coding agents accumulate generated memories, layered repository instructions, session evidence, project mappings, local settings, and ephemeral worktrees, while almost nothing in the loop makes that state legible or removes it. midden surfaces what's actually active for a directory with provenance, flags what's stale or leaking, and prunes the state nothing else cleans up.
 
 ## Installation
 
@@ -53,9 +53,18 @@ cargo install --git https://github.com/starhaven-io/midden
 
 ## Usage
 
-All commands default to safe modes: dry-run for prune, read-only for show, and report-only for doctor. Writes always require an explicit flag, create a timestamped backup first, and replace the file atomically, preserving its file mode. Use `--json` for machine-readable output.
+All commands default to safe modes: dry-run for prune, read-only for show and memory inventory, and report-only for doctor. Writes always require an explicit flag, create a timestamped backup first, and replace the file atomically, preserving its file mode. Use `--json` for machine-readable output.
 
 ```bash
+# Compare Codex and Claude memory sources for this repo
+midden memory show
+
+# Inspect only one provider
+midden memory show --provider codex
+
+# Include unrelated and unassociated memory sources
+midden memory show --all
+
 # Show what's actually active for a directory with provenance
 midden show
 
@@ -92,6 +101,39 @@ midden show --show-secrets
 # Generate shell completions
 midden completions zsh
 ```
+
+### Memory show
+
+`memory show` resolves Codex and Claude Code through one normalized, read-only inventory while preserving each provider's native loading behavior:
+
+```text
+$ midden memory show .
+memory for /Users/me/myproject
+
+codex  memory enabled  management read-only
+  instructions
+    [repository; loaded] /Users/me/myproject/AGENTS.md (2.4 KiB)
+  retained memory
+    [global; loaded] /Users/me/.codex/memories/memory_summary.md (1.1 KiB)
+
+claude  memory enabled  management read-only
+  instructions
+    [repository; loaded] /Users/me/myproject/CLAUDE.md (31 B)
+    [repository; loaded] /Users/me/myproject/AGENTS.md (2.4 KiB)
+      imported by /Users/me/myproject/CLAUDE.md
+  retained memory
+    [repository; loaded] /Users/me/.claude/projects/example/memory/MEMORY.md (3.2 KiB)
+
+provider coverage
+  codex: 1 instruction, 1 retained memory
+  claude: 2 instructions, 1 retained memory
+```
+
+Codex discovery follows `AGENTS.override.md`, `AGENTS.md`, configured fallback names, and the combined instruction byte limit. It inventories the generated summary, durable-memory index, and evidence stores under the configured Codex home without recursively reading rollout history.
+
+Claude discovery includes managed, user, ancestor, project, local, imported, and path-scoped instruction sources. It associates per-repository auto-memory with the target from transcript `cwd` evidence rather than decoding Claude's lossy project-directory slugs, and reports `MEMORY.md` as startup context with topic files available on demand.
+
+The default provider is `all`. `--provider codex` or `--provider claude` filters the same schema to one adapter. `--all` additionally includes unrelated and unassociated sources for forensic work. Memory content is not printed; JSON output contains source metadata, loading state, association, capabilities, and warnings.
 
 ### Show
 
@@ -210,6 +252,7 @@ midden does not yet have a config file — all behavior is controlled by CLI fla
 |------|---------|
 | `--config <PATH>` | Override the path to `~/.claude.json` (for testing) |
 | `--claude-home <PATH>` | Override the path to `~/.claude/` (for testing) |
+| `--codex-home <PATH>` | Override `$CODEX_HOME` / `~/.codex/` (for testing) |
 | `--json` | Emit machine-readable JSON instead of styled text |
 | `--color auto\|always\|never` | Control color output |
 | `--show-secrets` | Unmask secret-looking values in `show` / `doctor` output |

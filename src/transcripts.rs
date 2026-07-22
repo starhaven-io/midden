@@ -230,6 +230,31 @@ pub fn delete_dead(mut report: Report) -> Result<Report> {
     Ok(report)
 }
 
+pub(crate) fn project_cwds(path: &Path, limit: usize) -> Result<(Vec<PathBuf>, bool)> {
+    let entries = fs::read_dir(path)
+        .with_context(|| format!("read {}", path.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("read {}", path.display()))?;
+    let mut jsonl_files = entries
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
+        })
+        .collect::<Vec<_>>();
+    jsonl_files.sort();
+    let truncated = jsonl_files.len() > limit;
+    jsonl_files.truncate(limit);
+    let mut cwds = BTreeSet::new();
+    for jsonl in &jsonl_files {
+        if let Some(cwd) = cwd_from_jsonl(jsonl)? {
+            cwds.insert(PathBuf::from(cwd));
+        }
+    }
+    Ok((cwds.into_iter().collect(), truncated))
+}
+
 fn inspect_dir(path: &Path) -> Result<DirReport> {
     let scan = scan_dir(path)?;
     let storage_bytes = scan.storage_bytes()?;

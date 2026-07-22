@@ -24,6 +24,7 @@ pub struct Fixture {
     /// shared between user-scope and project-scope, breaking resolution.
     home: TempDir,
     pub claude_home: PathBuf,
+    pub codex_home: PathBuf,
     pub config: PathBuf,
 }
 
@@ -33,11 +34,14 @@ impl Fixture {
         let home = tempfile::tempdir().expect("tempdir-home");
         let claude_home = home.path().join(".claude");
         std::fs::create_dir_all(&claude_home).unwrap();
+        let codex_home = home.path().join(".codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
         let config = home.path().join(".claude.json");
         Self {
             root,
             home,
             claude_home,
+            codex_home,
             config,
         }
     }
@@ -106,6 +110,10 @@ impl Fixture {
     }
 
     pub fn cmd(&self) -> Command {
+        self.cmd_with_color("never")
+    }
+
+    pub fn cmd_with_color(&self, color: &str) -> Command {
         let mut cmd = Command::cargo_bin("midden").expect("binary");
         cmd.env_remove("NO_COLOR")
             .env("CLICOLOR", "0")
@@ -116,11 +124,13 @@ impl Fixture {
             .env("XDG_CONFIG_HOME", self.home.path().join(".config"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .arg("--color")
-            .arg("never")
+            .arg(color)
             .arg("--config")
             .arg(&self.config)
             .arg("--claude-home")
-            .arg(&self.claude_home);
+            .arg(&self.claude_home)
+            .arg("--codex-home")
+            .arg(&self.codex_home);
         cmd
     }
 

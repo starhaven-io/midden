@@ -3,11 +3,11 @@ name = "midden"
 version = "0.7.0"
 edition = "2024"
 rust-version = "1.95.0"
-description = "Resolve, audit, and garbage-collect Claude Code's accumulated state"
+description = "Resolve, audit, visualize, and clean coding-agent context and state"
 license = "AGPL-3.0-only"
 repository = "https://github.com/starhaven-io/midden"
 homepage = "https://midden.rs"
-keywords = ["claude-code", "config", "audit", "cli", "lint"]
+keywords = ["codex", "claude-code", "agent-memory", "audit", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = [
     "/.github/",
@@ -18,8 +18,10 @@ exclude = [
 [dependencies]
 clap = { version = "4", features = ["derive", "color"] }
 clap_complete = "4"
+globset = { version = "0.4.19", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+toml = { version = "1.1.3", default-features = false, features = ["parse", "serde", "std"] }
 walkdir = "2"
 colored = "3"
 anyhow = "1"

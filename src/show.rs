@@ -66,21 +66,7 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     }
     let project = ProjectPaths::new(&root);
 
-    let mut sources: Vec<(Scope, PathBuf, Value)> = Vec::new();
-    if let Some(v) = read_json(&env.user_settings()) {
-        sources.push((Scope::User, env.user_settings(), v));
-    }
-    if let Some(v) = read_json(&project.settings()) {
-        sources.push((Scope::Project, project.settings(), v));
-    }
-    if let Some(v) = read_json(&project.local_settings()) {
-        sources.push((Scope::Local, project.local_settings(), v));
-    }
-    for managed in managed_settings_files() {
-        if let Some(v) = read_json(&managed) {
-            sources.push((Scope::Managed, managed, v));
-        }
-    }
+    let sources = settings_sources(env, &project);
 
     let mut hooks = collect_hooks(&sources);
     let resolved: Vec<Resolved> = resolve_settings(&sources)
@@ -150,6 +136,32 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
 fn read_json(path: &Path) -> Option<Value> {
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
+}
+
+pub(crate) fn settings_sources(env: &Env, project: &ProjectPaths) -> Vec<(Scope, PathBuf, Value)> {
+    let mut sources = Vec::new();
+    if let Some(value) = read_json(&env.user_settings()) {
+        sources.push((Scope::User, env.user_settings(), value));
+    }
+    if let Some(value) = read_json(&project.settings()) {
+        sources.push((Scope::Project, project.settings(), value));
+    }
+    if let Some(value) = read_json(&project.local_settings()) {
+        sources.push((Scope::Local, project.local_settings(), value));
+    }
+    for managed in managed_settings_files() {
+        if let Some(value) = read_json(&managed) {
+            sources.push((Scope::Managed, managed, value));
+        }
+    }
+    sources
+}
+
+pub(crate) fn effective_setting(sources: &[(Scope, PathBuf, Value)], key: &str) -> Option<Value> {
+    resolve_settings(sources)
+        .into_iter()
+        .find(|resolved| resolved.key == key)
+        .map(|resolved| resolved.effective)
 }
 
 /// Merge the same key across scopes with provenance tracking. Scalars: highest

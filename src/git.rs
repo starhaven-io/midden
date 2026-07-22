@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Exit code of `git -C root <args> -- <path>`, or None if git can't be spawned.
@@ -37,6 +37,36 @@ pub fn is_ignored(root: &Path, path: &Path) -> Option<bool> {
         1 => Some(false),
         _ => None,
     }
+}
+
+fn git_path(root: &Path, args: &[&str]) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let path = PathBuf::from(value.trim());
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    absolute.canonicalize().ok()
+}
+
+pub fn repository_root(path: &Path) -> Option<PathBuf> {
+    git_path(path, &["rev-parse", "--show-toplevel"])
+}
+
+/// The common Git directory is shared by every worktree, unlike the worktree
+/// root, so it is the repository identity Claude's shared memory needs.
+pub fn repository_identity(path: &Path) -> Option<PathBuf> {
+    git_path(path, &["rev-parse", "--git-common-dir"])
 }
 
 #[cfg(test)]
@@ -84,5 +114,17 @@ mod tests {
         let rel = Path::new("x.json");
         assert_eq!(is_tracked(dir.path(), rel), None);
         assert_eq!(is_ignored(dir.path(), rel), None);
+    }
+
+    #[test]
+    fn root_and_identity_are_canonical() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "--quiet"]);
+
+        assert_eq!(repository_root(dir.path()), dir.path().canonicalize().ok());
+        assert_eq!(
+            repository_identity(dir.path()),
+            dir.path().join(".git").canonicalize().ok()
+        );
     }
 }
