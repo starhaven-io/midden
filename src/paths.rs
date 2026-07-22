@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 pub struct Env {
     pub claude_json: PathBuf,
     pub claude_home: PathBuf,
+    pub codex_home: PathBuf,
 }
 
 impl Env {
@@ -15,7 +16,17 @@ impl Env {
         Self {
             claude_json: config.unwrap_or_else(|| home.join(".claude.json")),
             claude_home: claude_home.unwrap_or_else(|| home.join(".claude")),
+            codex_home: std::env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".codex")),
         }
+    }
+
+    pub fn with_codex_home(mut self, codex_home: Option<PathBuf>) -> Self {
+        if let Some(codex_home) = codex_home {
+            self.codex_home = codex_home;
+        }
+        self
     }
 
     pub fn user_settings(&self) -> PathBuf {
@@ -37,9 +48,17 @@ impl Env {
     pub fn user_agents_dir(&self) -> PathBuf {
         self.claude_home.join("agents")
     }
+
+    pub fn codex_config(&self) -> PathBuf {
+        self.codex_home.join("config.toml")
+    }
+
+    pub fn codex_memories_dir(&self) -> PathBuf {
+        self.codex_home.join("memories")
+    }
 }
 
-fn home_dir() -> PathBuf {
+pub(crate) fn home_dir() -> PathBuf {
     // std::env::home_dir was un-deprecated in Rust 1.87 (< this crate's 1.95
     // MSRV) and resolves $HOME, then /etc/passwd, on the Unix platforms this
     // tool targets. Fall back to the current directory only if no home exists.

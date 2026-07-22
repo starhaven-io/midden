@@ -2,6 +2,7 @@ mod backup;
 mod claude_json;
 mod doctor;
 mod git;
+mod memory;
 mod orphans;
 mod output;
 mod paths;
@@ -27,7 +28,7 @@ enum ColorMode {
 #[derive(Parser)]
 #[command(
     name = "midden",
-    about = "Resolve, audit, and garbage-collect Claude Code's accumulated state",
+    about = "Resolve, audit, and clean coding-agent context and accumulated state",
     version,
     propagate_version = true
 )]
@@ -47,6 +48,10 @@ struct Cli {
     /// Path to the Claude user-scope directory (default: $HOME/.claude)
     #[arg(long, global = true, value_name = "PATH")]
     claude_home: Option<PathBuf>,
+
+    /// Path to the Codex user-scope directory (default: $CODEX_HOME or $HOME/.codex)
+    #[arg(long, global = true, value_name = "PATH")]
+    codex_home: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -100,10 +105,33 @@ enum Command {
         #[arg(long = "show-secrets")]
         show_secrets: bool,
     },
+    /// Inspect and manage persistent agent memory
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
         shell: Shell,
+    },
+}
+
+#[derive(Subcommand)]
+enum MemoryCommand {
+    /// Show Codex and Claude memory sources for a target directory
+    Show {
+        /// Target directory
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Provider to inspect
+        #[arg(long, value_enum, default_value = "all")]
+        provider: memory::ProviderFilter,
+
+        /// Include unrelated and unassociated memory sources
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -120,7 +148,8 @@ fn main() -> ExitCode {
         }
     }
 
-    let env = paths::Env::new(cli.config.clone(), cli.claude_home.clone());
+    let env = paths::Env::new(cli.config.clone(), cli.claude_home.clone())
+        .with_codex_home(cli.codex_home.clone());
 
     let result = match cli.command {
         Command::Prune {
@@ -161,6 +190,22 @@ fn main() -> ExitCode {
             show::Options {
                 path: path.clone(),
                 show_secrets,
+                json: cli.json,
+            },
+        ),
+        Command::Memory {
+            command:
+                MemoryCommand::Show {
+                    ref path,
+                    provider,
+                    all,
+                },
+        } => memory::run_show(
+            &env,
+            memory::ShowOptions {
+                path: path.clone(),
+                provider,
+                include_unassociated: all,
                 json: cli.json,
             },
         ),
