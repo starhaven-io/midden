@@ -1,5 +1,10 @@
 mod claude;
 mod codex;
+#[allow(
+    dead_code,
+    reason = "the item contract is consumed by the next memory diff slice"
+)]
+mod items;
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
