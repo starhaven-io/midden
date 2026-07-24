@@ -28,7 +28,7 @@ enum ColorMode {
 #[derive(Parser)]
 #[command(
     name = "midden",
-    about = "Resolve, audit, and clean coding-agent context and accumulated state",
+    about = "Resolve, audit, visualize, and clean coding-agent context and state",
     version,
     propagate_version = true
 )]
