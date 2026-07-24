@@ -1,24 +1,25 @@
 # Agent Instructions for midden
 
-midden is a Rust CLI for resolving, auditing, and garbage-collecting the state Claude Code accumulates. Claude Code writes a lot and prunes almost none of it: `~/.claude.json`'s `projects` map grows on every visit, settings sprawl across four scopes with non-obvious precedence, ephemeral worktrees pile up, and MCP servers / skills / commands / subagents each live in their own place. midden does the three things other tools don't: **resolve** (what's active for a directory, with provenance), **audit** (what's stale, misconfigured, or leaking), **clean** (GC what Claude Code never prunes). It is deliberately *not* another MCP-server-list editor.
+midden is a Rust CLI for resolving, auditing, visualizing, and cleaning the context and state Codex and Claude Code accumulate. Its provider-neutral memory inventory makes generated memories, repository instructions, and session evidence legible with provenance while preserving each provider's native behavior. Its existing Claude-specific commands resolve layered configuration, audit hygiene, and garbage-collect `~/.claude.json` project entries and orphaned transcript artifacts. It is deliberately *not* another MCP-server-list editor.
 
 ## Project overview
 
 - **Language:** Rust, 2024 edition, MSRV 1.95.
 - **Platforms:** macOS and Linux. Windows is out of scope for v0 (a `cfg(windows)` branch may exist but is untested/unsupported).
 - **License:** AGPL-3.0-only.
-- **Binary:** one CLI; subcommands `prune`, `doctor`, `show`, plus `completions` for shell completion.
+- **Binary:** one CLI; subcommands `memory show`, `prune`, `doctor`, `show`, plus `completions` for shell completion.
 - **Deps:** clap/clap_complete, serde/serde_json (with `preserve_order`), walkdir, colored, anyhow, time, sysinfo. Error handling is anyhow throughout — there are no `thiserror` types.
 
 ## Project-specific notes
 
 ### Commands
 
+- `memory show [PATH] [--provider all|codex|claude] [--all]` — inventory Codex and Claude Code instructions, retained memory, and evidence stores through one normalized read-only schema while preserving provider-native loading behavior. The default provider is `all`; `--all` includes unrelated and unassociated sources.
 - `prune [--apply] [--transcripts] [--worktrees-only] [--force]` — GC dead `projects` entries from `~/.claude.json`. Dry-run by default; removes only entries whose directory is provably absent. `--transcripts` additionally cleans orphaned session artifacts under `~/.claude/projects/` by deriving cwd from JSONL heads, never from lossy slugs. `--apply` backs up then writes `.claude.json`; transcript deletion deliberately does not create backups. `--worktrees-only` restricts to `.claude/worktrees/` paths; `--force` overrides the write gates.
 - `doctor [PATH] [--fix] [--force] [--show-secrets]` — emit structured `Finding { id, severity, location, message, suggested_fix, auto_fixable }`. `--fix` applies the `auto_fixable` findings under the same backup + atomic-write discipline as prune (today only `orphaned-project` is auto-fixable). See the README for the full check list.
 - `show [PATH] [--show-secrets]` — resolve every config surface for a directory with provenance: settings (with shadow/merge tags), every contributing `CLAUDE.md`, skills, commands, subagents, hooks, MCP servers (user/local/project/managed — local being the per-project `mcpServers` map inside `~/.claude.json`), worktrees.
 
-Global flags: `--json` (machine output; disables color), `--color auto|always|never`, `--config <PATH>` (override `~/.claude.json`), `--claude-home <PATH>` (override `~/.claude`). The two override flags exist for testing — integration tests point them at fixture dirs.
+Global flags: `--json` (machine output; disables color), `--color auto|always|never`, `--config <PATH>` (override `~/.claude.json`), `--claude-home <PATH>` (override `~/.claude`), `--codex-home <PATH>` (override `$CODEX_HOME` / `~/.codex`). The three override flags exist for testing — integration tests point them at fixture dirs.
 
 ### Gotchas
 
