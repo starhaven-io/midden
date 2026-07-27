@@ -32,6 +32,18 @@ Global flags: `--json` (machine output; disables color), `--color auto|always|ne
 
 `ci.yml` (dynamic matrix: conventional-commit check, lint, test on Linux/Linux-ARM/macOS, coverage to Codecov, zizmor on workflow changes); `release.yml` (manual dispatch: cross-platform signed + notarized binaries, build-provenance attestation, crates.io publish via OIDC, Homebrew cask bump); `codeql.yml`, `zizmor.yml`, `pinprick-audit.yml` (dogfood), `link-check.yml`; `cargo-deny.yml` (Monday scheduled/dispatch advisory drift scan that opens or updates a tracking issue when the result flips); weekly `bump-cargo-tools.yml`. Third-party actions are SHA-pinned and workflows are least-privilege (`permissions: {}` at the top, granted per-job). `release.yml` deliberately omits shell `-x` so secrets don't leak into public logs.
 
+### Dependency automation
+
+Dependency automation is deliberately split. `.github/dependabot.yml` is fleet-rendered and owns Cargo manifests and GitHub Actions. `renovate.json` opts this repository into the shared preset at a pinned `local>starhaven-io/.github:renovate-config#<fleet-release>` reference, which owns the pins no Dependabot ecosystem covers: the `rust-toolchain.toml` channel and the `cargo install <tool> --locked --version <version>` pins in `ci.yml` and `cargo-deny.yml`. midden is the pilot consumer — the first repository to adopt Renovate in the estate.
+
+`bump-cargo-tools.yml` is a **temporary parallel fallback**, not dead code. It keeps running on its existing weekly Monday schedule until the repository maintainer records pilot signoff in a separate removal PR. Signoff requires a hosted run log extracting Rust plus all five cargo-pin occurrences, a merged and passing `rust-toolchain` PR, a merged and passing cargo-install PR, and proof that both `cargo-deny` occurrences move together. Until then expect overlap: the bump workflow has no cooldown, so it can beat Renovate's seven-day minimum release age to a new version and can conflict with a Renovate branch on the same lines. "Renovate opened no PR this week" is therefore not on its own evidence of a Renovate fault. Do not resolve a Renovate PR by editing `bump-cargo-tools.yml`, and do not extend that workflow to cover new tools.
+
+Three standing constraints:
+
+- The preset pin moves only through a pull request here. A change to `renovate-config.json` in `starhaven-io/.github` reaches this repository only once a fleet release tags it and a pull request advances the `#<fleet-release>` reference to that exact tag. Never drop the tag or point the reference at a branch: an unpinned preset would let hub `main` change dependency behavior with no review. Revalidate with `renovate-config-validator --strict --no-global renovate.json` whenever the pin moves, remembering that validation does not resolve the reference and so cannot tell you the tag exists or contains the preset.
+- The hosted Mend app must stay installed with **Only select repositories**. Expand that selection one adopter at a time; an org-wide installation would onboard every repository at once, including private `orrery`.
+- Before a second repository adopts Renovate, the consumer stub should become a fleet-rendered file rather than a hand-copied one. Do not hand-copy this `renovate.json` into another repository.
+
 ## Repository structure
 
 - `main.rs` — clap CLI definition and dispatch.
