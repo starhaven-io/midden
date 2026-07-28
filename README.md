@@ -33,7 +33,7 @@ cargo install midden
 
 ### From releases
 
-Download a prebuilt binary from [GitHub Releases](https://github.com/starhaven-io/midden/releases). Binaries are available for:
+Download a prebuilt binary from [GitHub Releases](https://github.com/starhaven-io/midden/releases). There is no committed CHANGELOG — release notes live on the GitHub Releases page. Binaries are available for:
 
 - Linux amd64, glibc — `x86_64-unknown-linux-gnu`
 - Linux arm64, glibc — `aarch64-unknown-linux-gnu`
