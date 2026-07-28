@@ -29,6 +29,14 @@ anyhow = "1"
 time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
+[lints.rust]
+# The single sanctioned unsafe block (SIGPIPE reset in main.rs) carries an
+# #[expect]; anything new fails the build until explicitly justified.
+unsafe_code = "deny"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"

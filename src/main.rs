@@ -135,7 +135,28 @@ enum MemoryCommand {
     },
 }
 
+/// Restore the default SIGPIPE disposition. The Rust runtime ignores SIGPIPE,
+/// so `midden ... | head` would otherwise panic with a broken-pipe I/O error
+/// once the reader closes; dying of SIGPIPE like any other Unix filter is the
+/// contract downstream tools expect.
+#[cfg(unix)]
+#[expect(
+    unsafe_code,
+    reason = "restoring the default SIGPIPE disposition requires libc::signal"
+)]
+fn reset_sigpipe() {
+    // SAFETY: installing SIG_DFL registers no handler code, and this runs
+    // before any thread or I/O exists.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_sigpipe() {}
+
 fn main() -> ExitCode {
+    reset_sigpipe();
     let cli = Cli::parse();
 
     match cli.color {
