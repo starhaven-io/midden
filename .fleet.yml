@@ -1,6 +1,7 @@
 schema: 1
 license: "agpl"
 params:
+  renovate: true
   dependabot:
     - package-ecosystem: "cargo"
       group: "cargo-dependencies"
