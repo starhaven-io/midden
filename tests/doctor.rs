@@ -388,7 +388,11 @@ fn flags_plaintext_remote_mcp_url() {
         &json!({
             "mcpServers": {
                 "remote": { "url": "http://mcp.example.com/sse" },
-                "local": { "url": "http://localhost:9999/sse" }
+                "remote-ws": { "url": "ws://mcp.example.com/socket" },
+                "local": { "url": "http://localhost:9999/sse" },
+                "local-tld": { "url": "http://app.localhost:3000/sse" },
+                "local-any": { "url": "http://0.0.0.0:8080/sse" },
+                "secure-ws": { "url": "wss://mcp.example.com/socket" }
             }
         }),
     );
@@ -406,12 +410,17 @@ fn flags_plaintext_remote_mcp_url() {
         .iter()
         .filter(|f| f["id"] == "mcp-server-plaintext-http")
         .collect();
-    assert_eq!(plaintext.len(), 1, "findings: {findings:?}");
-    assert!(
-        plaintext[0]["message"].as_str().unwrap().contains("remote"),
-        "finding: {}",
-        plaintext[0]
+    assert_eq!(
+        plaintext.len(),
+        2,
+        "only the remote plaintext servers: {findings:?}"
     );
+    for finding in &plaintext {
+        assert!(
+            finding["message"].as_str().unwrap().contains("remote"),
+            "finding: {finding}"
+        );
+    }
 }
 
 #[test]

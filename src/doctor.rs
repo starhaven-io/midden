@@ -1060,9 +1060,12 @@ fn scan_mcp_servers(v: &Value, file: &Path, key_prefix: &str, out: &mut Vec<Find
                     file: file.to_path_buf(),
                     key_path: Some(format!("{key_prefix}mcpServers.{name}")),
                 },
-                message: format!("MCP server `{name}` uses plaintext HTTP for a non-local URL"),
+                message: format!(
+                    "MCP server `{name}` uses a plaintext protocol for a non-local URL"
+                ),
                 suggested_fix: Some(
-                    "use https for remote MCP servers, or bind to localhost for local-only servers"
+                    "use https/wss for remote MCP servers, or bind to localhost for local-only \
+                     servers"
                         .into(),
                 ),
                 auto_fixable: false,
@@ -1085,12 +1088,15 @@ fn scan_mcp_servers(v: &Value, file: &Path, key_prefix: &str, out: &mut Vec<Find
 }
 
 fn is_plaintext_remote_url(url: &str) -> bool {
-    // The scheme is case-insensitive (RFC 3986), so match http:// in any case —
-    // HTTP:// is exactly as plaintext as http://.
-    const SCHEME: &str = "http://";
-    let rest = match url.get(..SCHEME.len()) {
-        Some(prefix) if prefix.eq_ignore_ascii_case(SCHEME) => &url[SCHEME.len()..],
-        _ => return false,
+    // The scheme is case-insensitive (RFC 3986), and ws:// is exactly as
+    // plaintext as http:// — only their TLS variants are exempt.
+    const PLAINTEXT_SCHEMES: [&str; 2] = ["http://", "ws://"];
+    let Some(rest) = PLAINTEXT_SCHEMES.iter().find_map(|scheme| {
+        url.get(..scheme.len())
+            .filter(|prefix| prefix.eq_ignore_ascii_case(scheme))
+            .map(|_| &url[scheme.len()..])
+    }) else {
+        return false;
     };
     let authority = rest
         .split(['/', '?', '#'])
@@ -1105,7 +1111,14 @@ fn is_plaintext_remote_url(url: &str) -> bool {
         .or_else(|| authority.split_once(':').map(|(host, _)| host))
         .unwrap_or(authority);
     let host = host.to_ascii_lowercase();
-    !(host == "localhost" || host.starts_with("127.") || host == "::1")
+    // localhost and *.localhost are loopback by RFC 6761; 0.0.0.0 and [::]
+    // are bindable only on this machine.
+    !(host == "localhost"
+        || host.ends_with(".localhost")
+        || host.starts_with("127.")
+        || host == "::1"
+        || host == "::"
+        || host == "0.0.0.0")
 }
 
 /// `.mcp.json` servers are approved or rejected per project via the
@@ -1216,11 +1229,24 @@ mod tests {
         assert!(!is_plaintext_remote_url("http://127.0.0.1:3000"));
         assert!(!is_plaintext_remote_url("http://127.0.0.53/path")); // all of 127.0.0.0/8
         assert!(!is_plaintext_remote_url("http://[::1]:8080/sse"));
+        // RFC 6761: *.localhost is loopback; 0.0.0.0 / [::] bind this machine.
+        assert!(!is_plaintext_remote_url("http://app.localhost:3000"));
+        assert!(!is_plaintext_remote_url("http://0.0.0.0:8080"));
+        assert!(!is_plaintext_remote_url("http://[::]:8080/sse"));
 
-        // Empty url (stdio server), non-http schemes — not plaintext HTTP.
+        // ws:// is plaintext exactly like http://; wss:// is TLS.
+        assert!(is_plaintext_remote_url("ws://example.com"));
+        assert!(is_plaintext_remote_url("WS://mcp.example.com/socket"));
+        assert!(!is_plaintext_remote_url("ws://localhost:9999"));
+        assert!(!is_plaintext_remote_url("wss://example.com"));
+
+        // A hostname that merely starts like "localhost" is still remote.
+        assert!(is_plaintext_remote_url("http://localhost.evil.example"));
+        assert!(is_plaintext_remote_url("http://notlocalhost"));
+
+        // Empty url (stdio server), other schemes — not plaintext HTTP.
         assert!(!is_plaintext_remote_url(""));
         assert!(!is_plaintext_remote_url("npx some-server"));
-        assert!(!is_plaintext_remote_url("ws://example.com"));
     }
 
     #[test]

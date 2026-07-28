@@ -240,7 +240,7 @@ When a derived `cwd` is provably absent, `prune --transcripts` reports the sessi
 | `empty-config-file` | Warn | no | Slash command or subagent markdown file is empty |
 | `missing-frontmatter` | Warn | no | Subagent markdown file missing the required `---` YAML frontmatter (slash commands don't need it) |
 | `mcp-server-unreachable` | Warn | no | MCP server defined with no `command` or `url` (any scope, including local) |
-| `mcp-server-plaintext-http` | Warn | no | MCP server uses plaintext HTTP for a non-local URL |
+| `mcp-server-plaintext-http` | Warn | no | MCP server uses plaintext `http://` or `ws://` for a non-local URL (`localhost`, `*.localhost`, loopback, `0.0.0.0`, and `[::]` are local) |
 | `mcp-server-disabled` | Info | no | MCP server defined but disabled — `disabled: true`, or listed in the project's `disabledMcpjsonServers` |
 | `stale-mcp-approval` | Info | no | `enabledMcpjsonServers`/`disabledMcpjsonServers` names a server `.mcp.json` no longer defines |
 
