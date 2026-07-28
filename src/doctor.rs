@@ -19,7 +19,7 @@ use crate::secrets;
 use crate::transcripts;
 
 const WORKTREE_STALE_AFTER: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-const CLAUDE_JSON_BLOAT_THRESHOLD_KB: usize = 512;
+const CLAUDE_JSON_BLOAT_THRESHOLD_KIB: usize = 512;
 const TRANSCRIPT_STORAGE_BLOAT_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
 const CREDENTIAL_DENY_HINTS: &[&str] = &[".env", "secrets"];
 
@@ -301,7 +301,7 @@ fn check_claude_json_size(env: &Env, config: Option<&ClaudeJson>, out: &mut Vec<
     };
     // `raw` is the file's text as read, so its byte length is the on-disk size.
     let kb = config.raw.len() / 1024;
-    if kb < CLAUDE_JSON_BLOAT_THRESHOLD_KB {
+    if kb < CLAUDE_JSON_BLOAT_THRESHOLD_KIB {
         return;
     }
     // Point at the actual culprits. prune only reclaims orphaned `projects`
@@ -324,7 +324,7 @@ fn check_claude_json_size(env: &Env, config: Option<&ClaudeJson>, out: &mut Vec<
             file: env.claude_json.clone(),
             key_path: None,
         },
-        message: format!("{} is {} KB{}", env.claude_json.display(), kb, breakdown),
+        message: format!("{} is {} KiB{}", env.claude_json.display(), kb, breakdown),
         suggested_fix: Some(
             "`midden prune --apply` reclaims orphaned project entries; the rest is \
              cache and metrics Claude Code rewrites, not safe to hand-prune"

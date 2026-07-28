@@ -205,7 +205,7 @@ $ midden prune
   - /Users/me/Developer/macOSdb
   …
 
-would shrink .claude.json by ~20.0 KB (69.9 KB -> 49.8 KB).
+would shrink .claude.json by ~20.0 KiB (69.9 KiB -> 49.8 KiB).
 
 dry run. re-run with --apply to remove these entries.
 quit all Claude Code sessions first; it rewrites this file live.
@@ -224,7 +224,7 @@ When a derived `cwd` is provably absent, `prune --transcripts` reports the sessi
 | ID | Severity | Auto-fixable | What it catches |
 |----|----------|--------------|-----------------|
 | `orphaned-project` | Warn | yes | `projects` entry whose directory no longer exists |
-| `claude-json-bloat` | Info | no | `~/.claude.json` over 512 KB (Claude Code never prunes it) |
+| `claude-json-bloat` | Info | no | `~/.claude.json` over 512 KiB (Claude Code never prunes it) |
 | `orphaned-transcript` | Warn | no | Transcript directory whose derived cwd no longer exists |
 | `claude-transcript-storage` | Info | no | Kept transcript history under `~/.claude/projects/` exceeds 64 MiB |
 | `stale-worktree` | Info | no | Ephemeral worktree dir untouched for >30 days |
