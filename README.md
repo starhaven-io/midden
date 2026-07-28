@@ -266,6 +266,10 @@ midden does not yet have a config file — all behavior is controlled by CLI fla
 | 1 | Findings present (doctor with errors) |
 | 2 | Error — bad input, missing file, write blocked by running claude |
 
+When output is piped and the reader exits early (`midden show | head`), midden
+dies of SIGPIPE like any other Unix filter — shells report that as 141, never
+as a panic.
+
 ## Building
 
 A [justfile](https://github.com/casey/just) provides common tasks:
