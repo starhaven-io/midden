@@ -54,7 +54,7 @@ Never drop the `#<fleet-release>` tag or point the reference at a branch: an unp
 - `process.rs` — detect a running `claude` process for the write gate.
 - `secrets.rs` — sensitive-key detection (`key_looks_sensitive`) and masking (`mask`, `mask_value`).
 - `git.rs` — `is_tracked` / `is_ignored` via the `git` CLI; both return `None` when git is unavailable or the path isn't in a repo.
-- `output.rs` — KB formatting.
+- `output.rs` — KiB formatting.
 
 Tests: `tests/{prune,doctor,show}.rs` (integration, via `assert_cmd`) + `tests/common/mod.rs` (the `Fixture` helper) + `#[cfg(test)]` unit modules in `src/`.
 

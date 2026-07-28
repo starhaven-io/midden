@@ -1,7 +1,8 @@
-/// Format a byte count for human consumption. Always KB at one decimal, since
-/// we only use this for `.claude.json` size deltas.
+/// Format a byte count for human consumption. Always KiB at one decimal,
+/// since we only use this for `.claude.json` size deltas. The divisor is
+/// 1024, so the label says KiB — human_bytes already does.
 pub fn kb(bytes: usize) -> String {
-    format!("{:.1} KB", bytes as f64 / 1024.0)
+    format!("{:.1} KiB", bytes as f64 / 1024.0)
 }
 
 pub fn human_bytes(bytes: u64) -> String {
