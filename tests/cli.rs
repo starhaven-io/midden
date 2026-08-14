@@ -1,5 +1,6 @@
 mod common;
 
+use assert_cmd::Command;
 use common::Fixture;
 use serde_json::json;
 
@@ -50,4 +51,15 @@ fn early_closed_stdout_pipe_kills_with_sigpipe_instead_of_panicking() {
         Some(SIGPIPE),
         "expected death by SIGPIPE, got {status:?}"
     );
+}
+
+#[test]
+fn bash_completions_are_generated() {
+    Command::cargo_bin("midden")
+        .unwrap()
+        .arg("completions")
+        .arg("bash")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("_midden()"));
 }

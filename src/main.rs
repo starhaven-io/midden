@@ -25,6 +25,15 @@ enum ColorMode {
     Never,
 }
 
+fn color_override(mode: ColorMode, json: bool) -> Option<bool> {
+    match mode {
+        ColorMode::Always => Some(true),
+        ColorMode::Never => Some(false),
+        ColorMode::Auto if json => Some(false),
+        ColorMode::Auto => None,
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "midden",
@@ -159,14 +168,8 @@ fn main() -> ExitCode {
     reset_sigpipe();
     let cli = Cli::parse();
 
-    match cli.color {
-        ColorMode::Always => control::set_override(true),
-        ColorMode::Never => control::set_override(false),
-        ColorMode::Auto => {
-            if cli.json {
-                control::set_override(false);
-            }
-        }
+    if let Some(enabled) = color_override(cli.color, cli.json) {
+        control::set_override(enabled);
     }
 
     let env = paths::Env::new(cli.config.clone(), cli.claude_home.clone())
@@ -247,5 +250,18 @@ fn main() -> ExitCode {
             }
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_disables_color_in_auto_mode() {
+        assert_eq!(color_override(ColorMode::Auto, true), Some(false));
+        assert_eq!(color_override(ColorMode::Auto, false), None);
+        assert_eq!(color_override(ColorMode::Always, true), Some(true));
+        assert_eq!(color_override(ColorMode::Never, false), Some(false));
     }
 }
