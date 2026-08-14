@@ -483,7 +483,19 @@ fn ensure_transcript_wrong_host_gate(opts: &Options, report: &transcripts::Repor
 }
 
 fn ensure_claude_not_running(env: &Env, opts: &Options, live_state: String) -> Result<()> {
-    if !opts.force && !fixture_assumes_no_claude_process(env) && process::claude_is_running() {
+    ensure_claude_not_running_state(
+        opts.force,
+        || !fixture_assumes_no_claude_process(env) && process::claude_is_running(),
+        live_state,
+    )
+}
+
+fn ensure_claude_not_running_state(
+    force: bool,
+    running: impl FnOnce() -> bool,
+    live_state: String,
+) -> Result<()> {
+    if !force && running() {
         bail!(
             "a `claude` process is running — quit it first, or pass --force \
              ({live_state})"
@@ -607,6 +619,26 @@ mod tests {
         assert_eq!(
             both,
             "Claude Code rewrites /tmp/test/.claude.json and may add transcripts under /tmp/test/.claude/projects live"
+        );
+    }
+
+    #[test]
+    fn running_claude_gate_blocks_unforced_writes() {
+        let error = ensure_claude_not_running_state(false, || true, "live state".into())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "a `claude` process is running — quit it first, or pass --force (live state)"
+        );
+        assert!(ensure_claude_not_running_state(false, || false, String::new()).is_ok());
+        assert!(
+            ensure_claude_not_running_state(
+                true,
+                || panic!("must not scan when forced"),
+                String::new(),
+            )
+            .is_ok()
         );
     }
 

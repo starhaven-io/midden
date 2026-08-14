@@ -994,3 +994,63 @@ fn gitignored_local_settings_is_clean() {
         "gitignored local settings should not be flagged; ids: {ids:?}"
     );
 }
+
+#[test]
+fn doctor_reports_only_stale_ephemeral_worktrees() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let worktrees = fx.root.path().join(".claude/worktrees");
+    let stale = worktrees.join("amber-curie");
+    let fresh = worktrees.join("brisk-newton");
+    let ordinary = worktrees.join("checkout");
+    let flat = worktrees.join("flat-dirac");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::create_dir_all(&fresh).unwrap();
+    std::fs::create_dir_all(&ordinary).unwrap();
+    std::fs::write(&flat, "not a directory").unwrap();
+    for path in [&stale, &ordinary, &flat] {
+        std::fs::File::open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
+    }
+    let stale = stale.canonicalize().unwrap();
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("doctor")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let stale_findings = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["id"] == "stale-worktree")
+        .collect::<Vec<_>>();
+
+    assert_eq!(stale_findings.len(), 1, "report: {report:#}");
+    let finding = stale_findings[0];
+    assert_eq!(finding["severity"], "info");
+    assert_eq!(finding["location"]["file"], stale.display().to_string());
+    assert_eq!(finding["auto_fixable"], false);
+    assert!(
+        finding["message"]
+            .as_str()
+            .unwrap()
+            .contains("worktree amber-curie has been idle")
+    );
+    assert!(
+        finding["suggested_fix"]
+            .as_str()
+            .unwrap()
+            .contains(&stale.display().to_string())
+    );
+}

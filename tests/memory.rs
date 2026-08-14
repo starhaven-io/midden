@@ -415,6 +415,89 @@ fn malformed_provider_configuration_is_visible() {
 }
 
 #[test]
+fn invalid_claude_memory_setting_types_and_exclusions_are_explicit() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let claude_md = fx.root.path().join("CLAUDE.md");
+    write(&claude_md, "Project instructions.\n");
+    write_json(
+        fx.claude_home.join("settings.json"),
+        json!({
+            "autoMemoryEnabled": "yes",
+            "autoMemoryDirectory": 42,
+            "claudeMdExcludes": [42, "[", "**/CLAUDE.md"]
+        }),
+    );
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("memory")
+        .arg("show")
+        .arg(fx.root.path())
+        .arg("--provider")
+        .arg("claude")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let inventory: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let claude = provider(&inventory, "claude");
+    assert_eq!(claude["memory_state"], "unknown");
+    let warning_codes = claude["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|warning| warning["code"].as_str())
+        .collect::<Vec<_>>();
+    assert!(warning_codes.contains(&"invalid-auto-memory-enabled"));
+    assert!(warning_codes.contains(&"invalid-auto-memory-directory"));
+    assert_eq!(
+        warning_codes
+            .iter()
+            .filter(|code| **code == "invalid-claude-md-exclude")
+            .count(),
+        2
+    );
+    let instruction = source(claude, &claude_md);
+    assert_eq!(instruction["load_state"], "disabled");
+    assert_eq!(instruction["detail"], "excluded by claudeMdExcludes");
+}
+
+#[test]
+fn relative_claude_memory_directory_and_non_array_exclusions_are_rejected() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    write_json(
+        fx.claude_home.join("settings.json"),
+        json!({
+            "autoMemoryDirectory": "relative/memory",
+            "claudeMdExcludes": "**/CLAUDE.md"
+        }),
+    );
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("memory")
+        .arg("show")
+        .arg(fx.root.path())
+        .arg("--provider")
+        .arg("claude")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let inventory: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let warning_codes = provider(&inventory, "claude")["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|warning| warning["code"].as_str())
+        .collect::<Vec<_>>();
+    assert!(warning_codes.contains(&"invalid-auto-memory-directory"));
+    assert!(warning_codes.contains(&"invalid-claude-md-excludes"));
+}
+
+#[test]
 fn claude_exclusions_and_external_imports_preserve_unknown_state() {
     let fx = Fixture::new();
     fx.write_config(json!({}), json!({}));
@@ -997,4 +1080,75 @@ fn bad_target_uses_error_exit_lane() {
             .unwrap()
             .contains("target directory not found")
     );
+}
+
+#[test]
+fn all_includes_unrecognized_codex_memory_sources() {
+    let (fx, codex_memory, _) = paired_fixture();
+    let unknown_file = codex_memory.join("notes.md");
+    let unknown_directory = codex_memory.join("archive");
+    write(&unknown_file, "unrecognized memory\n");
+    write(unknown_directory.join("entry.md"), "archived memory\n");
+    for known_directory in [".git", "rollout_summaries", "skills"] {
+        std::fs::create_dir_all(codex_memory.join(known_directory)).unwrap();
+    }
+
+    let base = fx
+        .cmd()
+        .arg("--json")
+        .arg("memory")
+        .arg("show")
+        .arg(fx.root.path())
+        .arg("--provider")
+        .arg("codex")
+        .output()
+        .unwrap();
+    assert!(base.status.success());
+    let base: Value = serde_json::from_slice(&base.stdout).unwrap();
+    let base_sources = provider(&base, "codex")["sources"].as_array().unwrap();
+    assert!(base_sources.iter().all(|source| {
+        source["path"] != unknown_file.display().to_string()
+            && source["path"] != unknown_directory.display().to_string()
+    }));
+
+    let all = fx
+        .cmd()
+        .arg("--json")
+        .arg("memory")
+        .arg("show")
+        .arg(fx.root.path())
+        .arg("--provider")
+        .arg("codex")
+        .arg("--all")
+        .output()
+        .unwrap();
+    assert!(
+        all.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&all.stderr)
+    );
+    let all: Value = serde_json::from_slice(&all.stdout).unwrap();
+    let codex = provider(&all, "codex");
+    for path in [&unknown_file, &unknown_directory] {
+        let source = source(codex, path);
+        assert_eq!(source["role"], "unknown");
+        assert_eq!(source["kind"], "unknown");
+        assert_eq!(source["scope"], "unknown");
+        assert_eq!(source["load_state"], "unknown");
+        assert_eq!(source["association"], "unknown");
+        assert_eq!(source["detail"], "unrecognized Codex memory source");
+    }
+    let source_paths = codex["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|source| source["path"].as_str())
+        .collect::<Vec<_>>();
+    for known_directory in [".git", "rollout_summaries", "skills"] {
+        let known = codex_memory.join(known_directory).display().to_string();
+        assert_eq!(
+            source_paths.iter().filter(|path| **path == known).count(),
+            usize::from(known_directory != ".git")
+        );
+    }
 }

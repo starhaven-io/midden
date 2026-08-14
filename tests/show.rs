@@ -12,6 +12,13 @@ fn write_json(path: &Path, value: &Value) {
     std::fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
 }
 
+fn write(path: &Path, contents: &str) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(path, contents).unwrap();
+}
+
 #[test]
 fn resolved_settings_show_provenance_and_shadowing() {
     let fx = Fixture::new();
@@ -461,4 +468,110 @@ fn json_output_includes_hooks_array() {
     assert_eq!(hooks[0]["scope"], "user");
     assert_eq!(hooks[0]["matcher"], "Bash");
     assert_eq!(hooks[0]["command"], "x");
+}
+
+#[test]
+fn show_inventories_commands_agents_and_worktrees() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    write(
+        &fx.claude_home.join("commands/deploy.md"),
+        "Deploy the project.\n",
+    );
+    write(
+        &fx.root.path().join(".claude/commands/nested/review.md"),
+        "Review the change.\n",
+    );
+    write(
+        &fx.root
+            .path()
+            .join(".claude/commands/node_modules/hidden.md"),
+        "This vendored command must be ignored.\n",
+    );
+    write(
+        &fx.claude_home.join("agents/researcher.md"),
+        "---\nname: researcher\n---\n",
+    );
+    write(
+        &fx.root.path().join(".claude/agents/nested/reviewer.md"),
+        "---\nname: reviewer\n---\n",
+    );
+    write(
+        &fx.root.path().join(".claude/agents/ignored.txt"),
+        "not markdown\n",
+    );
+    std::fs::create_dir_all(fx.root.path().join(".claude/worktrees/zesty-newton")).unwrap();
+    std::fs::create_dir_all(fx.root.path().join(".claude/worktrees/amber-curie")).unwrap();
+    write(
+        &fx.root.path().join(".claude/worktrees/not-a-directory"),
+        "ignored\n",
+    );
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("show")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let command_names = report["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|command| {
+            (
+                command["name"].as_str().unwrap(),
+                command["scope"].as_str().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        command_names,
+        vec![("deploy", "user"), ("review", "project")]
+    );
+    let agent_names = report["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|agent| {
+            (
+                agent["name"].as_str().unwrap(),
+                agent["scope"].as_str().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        agent_names,
+        vec![("researcher", "user"), ("reviewer", "project")]
+    );
+    let worktree_names = report["worktrees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|worktree| worktree["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(worktree_names, vec!["amber-curie", "zesty-newton"]);
+
+    let human = fx.cmd().arg("show").arg(fx.root.path()).output().unwrap();
+    assert!(human.status.success());
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    for expected in [
+        "deploy",
+        "review",
+        "researcher",
+        "reviewer",
+        "amber-curie",
+        "zesty-newton",
+        "[user]",
+        "[project]",
+    ] {
+        assert!(stdout.contains(expected), "missing {expected:?}:\n{stdout}");
+    }
+    assert!(!stdout.contains("hidden"), "stdout:\n{stdout}");
 }

@@ -2281,6 +2281,55 @@ mod tests {
     }
 
     #[test]
+    fn codex_raw_memory_limits_and_unrecognized_layout_are_explicit() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw_path = dir.path().join("raw_memories.md");
+        let raw_source = || {
+            source(
+                raw_path.clone(),
+                Provider::Codex,
+                SourceRole::Evidence,
+                SourceKind::EvidenceStore,
+                Scope::Global,
+                Association::Global,
+            )
+        };
+
+        fs::write(&raw_path, CODEX_RAW_MEMORIES).unwrap();
+        let limited = extract_source_with_limits(
+            &raw_source(),
+            ReadLimits {
+                max_items: 0,
+                ..ReadLimits::default()
+            },
+        )
+        .unwrap();
+        assert!(limited.items.is_empty());
+        assert!(!limited.complete);
+        assert_eq!(
+            limited
+                .issues
+                .iter()
+                .map(|issue| issue.code)
+                .collect::<Vec<_>>(),
+            ["memory-item-count-limit"]
+        );
+
+        fs::write(&raw_path, "# Evidence without thread records\n").unwrap();
+        let unrecognized = extract_source(&raw_source()).unwrap();
+        assert!(unrecognized.items.is_empty());
+        assert!(!unrecognized.complete);
+        assert_eq!(
+            unrecognized
+                .issues
+                .iter()
+                .map(|issue| issue.code)
+                .collect::<Vec<_>>(),
+            ["codex-memory-thread-format-unrecognized"]
+        );
+    }
+
+    #[test]
     fn unsupported_sources_are_not_read_or_silently_reclassified() {
         let source = Source {
             id: "claude:/missing/unknown.bin".to_string(),

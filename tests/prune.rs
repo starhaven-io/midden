@@ -497,6 +497,48 @@ fn transcripts_no_jsonl_dir_is_skipped() {
     assert!(dir.join("README.txt").exists(), "skipped dir left intact");
 }
 
+#[test]
+fn transcripts_without_cwd_evidence_are_preserved() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), standard_extras());
+    let jsonl = fx.write_transcript_line(
+        "no-cwd",
+        "00000000-0000-4000-8000-000000000001.jsonl",
+        r#"{"type":"summary"}"#,
+    );
+    let artifact = fx.session_artifact_dir("no-cwd");
+    let memory = fx.transcript_project_dir("no-cwd").join("memory");
+    std::fs::create_dir_all(&memory).unwrap();
+    std::fs::write(memory.join("MEMORY.md"), "retained memory\n").unwrap();
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("prune")
+        .arg("--transcripts")
+        .arg("--apply")
+        .arg("--force")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let dir = report["transcripts"]["dirs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|dir| dir["path"].as_str().unwrap().contains("no-cwd"))
+        .unwrap();
+    assert_eq!(dir["status"], "skipped");
+    assert_eq!(dir["reason"], "no-cwd");
+    assert!(jsonl.exists(), "unassociated transcript must be preserved");
+    assert!(artifact.exists(), "session artifacts must be preserved");
+    assert!(memory.exists(), "retained memory must be preserved");
+}
+
 #[cfg(unix)]
 #[test]
 fn transcripts_stat_failure_is_kept() {

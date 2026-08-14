@@ -199,13 +199,7 @@ fn apply_fixes(env: &Env, findings: &[Finding], opts: &Options) -> Result<bool> 
         }
         return Ok(false);
     }
-    if !opts.force && process::claude_is_running() {
-        bail!(
-            "a `claude` process is running — quit it first, or pass --force \
-             (Claude Code rewrites {} live and may overwrite our changes)",
-            env.claude_json.display()
-        );
-    }
+    ensure_claude_not_running(opts.force, process::claude_is_running, &env.claude_json)?;
 
     let prune_targets: HashSet<&str> = auto
         .iter()
@@ -265,6 +259,21 @@ fn apply_fixes(env: &Env, findings: &[Finding], opts: &Options) -> Result<bool> 
         println!("backed up to {}", backup_path.display());
     }
     Ok(true)
+}
+
+fn ensure_claude_not_running(
+    force: bool,
+    running: impl FnOnce() -> bool,
+    config: &Path,
+) -> Result<()> {
+    if !force && running() {
+        bail!(
+            "a `claude` process is running — quit it first, or pass --force \
+             (Claude Code rewrites {} live and may overwrite our changes)",
+            config.display()
+        );
+    }
+    Ok(())
 }
 
 // -- checks ------------------------------------------------------------------
@@ -1343,6 +1352,22 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".bak-"))
             .count();
         assert_eq!(backups, 0, "no backup when nothing is fixed");
+    }
+
+    #[test]
+    fn running_claude_gate_blocks_unforced_fixes() {
+        let config = Path::new("/tmp/test/.claude.json");
+        let error = ensure_claude_not_running(false, || true, config)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "a `claude` process is running — quit it first, or pass --force (Claude Code rewrites /tmp/test/.claude.json live and may overwrite our changes)"
+        );
+        assert!(ensure_claude_not_running(false, || false, config).is_ok());
+        assert!(
+            ensure_claude_not_running(true, || panic!("must not scan when forced"), config).is_ok()
+        );
     }
 
     #[test]
