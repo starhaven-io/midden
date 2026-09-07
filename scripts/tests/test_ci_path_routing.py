@@ -61,7 +61,11 @@ class CiPathRoutingTests(unittest.TestCase):
         )[0]
 
         self.assertIn("id-token: write", codecov_job)
-        self.assertEqual(codecov_job.count("use_oidc: true"), 2)
+        self.assertIn("python3 -I codecov-uploader/scripts/upload-codecov.py", codecov_job)
+        self.assertIn("--coverage reports/lcov.info", codecov_job)
+        self.assertIn("--junit reports/target/nextest/ci/junit.xml", codecov_job)
+        self.assertIn("github.event.pull_request.base.sha || github.sha", codecov_job)
+        self.assertNotIn("codecov/codecov-action", codecov_job)
         self.assertNotIn("CODECOV_TOKEN", codecov_job)
         self.assertNotIn("secrets.", codecov_job)
         self.assertNotIn("environment:", codecov_job)

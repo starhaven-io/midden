@@ -48,6 +48,12 @@ class ReleaseWorkflowTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.source = WORKFLOW.read_text()
 
+    def test_distinct_release_requests_are_retained(self) -> None:
+        concurrency = self.source.split("concurrency:\n", 1)[1].split("\n\n", 1)[0]
+        self.assertEqual(dict(line.strip().split(": ", 1) for line in concurrency.splitlines()), {
+            "group": "release", "cancel-in-progress": "false", "queue": "max",
+        })
+
     def test_standalone_notarization_uses_designated_requirement(self) -> None:
         signing = job(self.source, "sign-macos")
         self.assertIn("jq -e '.status == \"Accepted\"'", signing)

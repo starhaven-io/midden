@@ -274,7 +274,7 @@ midden does not have a config file — all behavior is controlled by CLI flags. 
 
 | Code | Meaning |
 |------|---------|
-| 0 | Clean — no findings, or successful apply |
+| 0 | Successful read, dry-run, or apply; doctor has no error-severity findings |
 | 1 | Findings present (doctor with errors) |
 | 2 | Error — bad input, missing file, write blocked by running claude |
 
