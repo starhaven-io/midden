@@ -11,6 +11,7 @@ defaults:
 concurrency:
   group: release
   cancel-in-progress: false
+  queue: max
 
 permissions: {}
 
@@ -126,6 +127,7 @@ jobs:
           name: ${{ env.ARTIFACT }}
           path: "${{ env.ARTIFACT }}.tar.gz"
           if-no-files-found: error
+          retention-days: 7
 
   attest-linux:
     name: Attest Linux artifacts
@@ -312,6 +314,7 @@ jobs:
           name: ${{ env.ARTIFACT }}
           path: "${{ env.ARTIFACT }}.tar.gz"
           if-no-files-found: error
+          retention-days: 7
 
   generate-notes:
     name: Generate release notes
@@ -340,6 +343,7 @@ jobs:
           name: raw-release-notes
           path: raw-notes.md
           if-no-files-found: error
+          retention-days: 7
 
   format-notes:
     name: Format release notes
@@ -373,6 +377,7 @@ jobs:
           name: formatted-release-notes
           path: formatted-notes.md
           if-no-files-found: error
+          retention-days: 7
 
   release:
     name: Publish GitHub release
