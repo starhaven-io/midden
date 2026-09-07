@@ -8,8 +8,10 @@ mod output;
 mod paths;
 mod process;
 mod prune;
+mod safe_io;
 mod secrets;
 mod show;
+mod terminal;
 mod transcripts;
 
 use clap::{CommandFactory, Parser, Subcommand};
@@ -164,6 +166,15 @@ fn reset_sigpipe() {
 #[cfg(not(unix))]
 fn reset_sigpipe() {}
 
+fn emit_error(error: &str, json: bool) {
+    let safe = secrets::mask_free_text(error);
+    if json {
+        eprintln!("{}", serde_json::json!({ "error": safe }));
+    } else {
+        eprintln!("error: {}", terminal::escape(&safe));
+    }
+}
+
 fn main() -> ExitCode {
     reset_sigpipe();
     let cli = Cli::parse();
@@ -172,8 +183,17 @@ fn main() -> ExitCode {
         control::set_override(enabled);
     }
 
-    let env = paths::Env::new(cli.config.clone(), cli.claude_home.clone())
-        .with_codex_home(cli.codex_home.clone());
+    let env = match paths::Env::try_new(
+        cli.config.clone(),
+        cli.claude_home.clone(),
+        cli.codex_home.clone(),
+    ) {
+        Ok(env) => env,
+        Err(error) => {
+            emit_error(&error.to_string(), cli.json);
+            return ExitCode::from(2);
+        }
+    };
 
     let result = match cli.command {
         Command::Prune {
@@ -242,12 +262,7 @@ fn main() -> ExitCode {
     match result {
         Ok(code) => code,
         Err(e) => {
-            if cli.json {
-                let err = serde_json::json!({ "error": format!("{e:#}") });
-                eprintln!("{err}");
-            } else {
-                eprintln!("error: {e:#}");
-            }
+            emit_error(&format!("{e:#}"), cli.json);
             ExitCode::from(2)
         }
     }

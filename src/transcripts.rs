@@ -5,11 +5,21 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use rustix::fs::{
+    AtFlags, CWD, Dir, FileType, Mode, OFlags, RenameFlags, fchmod, fstat, mkdirat, openat,
+    renameat_with, statat, unlinkat,
+};
+
 use crate::orphans;
 use crate::paths::WORKTREE_MARKER;
+use crate::safe_io;
 
 const MAX_CWD_SCAN_LINES: usize = 64;
 const MAX_JSONL_LINE_BYTES: usize = 1024 * 1024;
+const MAX_PROJECT_TRANSCRIPT_ENTRIES: usize = 4096;
+#[cfg(unix)]
+const QUARANTINE_ATTEMPTS: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirStatus {
@@ -61,6 +71,8 @@ pub struct DirReport {
     pub deleted: Vec<PathBuf>,
     pub memory_preserved: bool,
     pub cleanup: Cleanup,
+    identity: Option<FileIdentity>,
+    delete_artifacts: Vec<DeleteArtifact>,
 }
 
 impl DirReport {
@@ -89,6 +101,7 @@ pub struct Report {
     pub projects_dir: PathBuf,
     pub dirs: Vec<DirReport>,
     pub applied: bool,
+    projects_identity: Option<FileIdentity>,
 }
 
 impl Report {
@@ -169,16 +182,32 @@ impl Report {
 }
 
 pub fn discover(claude_home: &Path, worktrees_only: bool) -> Result<Report> {
-    let projects_dir = claude_home.join("projects");
+    let configured_projects_dir = claude_home.join("projects");
     let mut dirs = Vec::new();
 
-    if !projects_dir.exists() {
+    if !configured_projects_dir.exists() {
         return Ok(Report {
-            projects_dir,
+            projects_dir: configured_projects_dir,
             dirs,
             applied: false,
+            projects_identity: None,
         });
     }
+
+    // Anchor mutation to the directory Claude's configured path resolved to at
+    // discovery time. This supports a symlinked state root without relaxing
+    // the O_NOFOLLOW checks used for every child and revalidates the target's
+    // identity immediately before deletion.
+    let projects_dir = configured_projects_dir.canonicalize().with_context(|| {
+        format!(
+            "resolve transcript state root {}",
+            configured_projects_dir.display()
+        )
+    })?;
+
+    let projects_identity = fs::metadata(&projects_dir)
+        .ok()
+        .map(FileIdentity::from_metadata);
 
     let mut entries = fs::read_dir(&projects_dir)
         .with_context(|| format!("read {}", projects_dir.display()))?
@@ -209,42 +238,54 @@ pub fn discover(claude_home: &Path, worktrees_only: bool) -> Result<Report> {
         projects_dir,
         dirs,
         applied: false,
+        projects_identity,
     })
 }
 
 pub fn delete_dead(mut report: Report) -> Result<Report> {
+    #[cfg(unix)]
+    let projects = open_verified_directory(&report.projects_dir, report.projects_identity)
+        .with_context(|| format!("re-open {}", report.projects_dir.display()))?;
     for dir in &mut report.dirs {
         if !dir.is_dead() {
             continue;
         }
 
-        for target in dir.delete.clone() {
-            remove_artifact(&target).with_context(|| format!("delete {}", target.display()))?;
-            dir.deleted.push(target);
+        #[cfg(unix)]
+        delete_dir_artifacts(&projects, &report.projects_dir, dir)?;
+        #[cfg(not(unix))]
+        {
+            for target in dir.delete.clone() {
+                remove_artifact(&target).with_context(|| format!("delete {}", target.display()))?;
+                dir.deleted.push(target);
+            }
+            dir.memory_preserved = has_memory_dir(&dir.path);
+            dir.cleanup = cleanup_after_delete(&dir.path, &dir.delete)?;
         }
-
-        dir.memory_preserved = has_memory_dir(&dir.path);
-        dir.cleanup = cleanup_after_delete(&dir.path, &dir.delete)?;
     }
     report.applied = true;
     Ok(report)
 }
 
 pub(crate) fn project_cwds(path: &Path, limit: usize) -> Result<(Vec<PathBuf>, bool)> {
-    let entries = fs::read_dir(path)
-        .with_context(|| format!("read {}", path.display()))?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("read {}", path.display()))?;
-    let mut jsonl_files = entries
-        .into_iter()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_file()
-                && path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
-        })
-        .collect::<Vec<_>>();
+    let entries = fs::read_dir(path).with_context(|| format!("read {}", path.display()))?;
+    let mut jsonl_files = Vec::new();
+    let mut entry_limit_reached = false;
+    for (index, entry) in entries.enumerate() {
+        if index == MAX_PROJECT_TRANSCRIPT_ENTRIES {
+            entry_limit_reached = true;
+            break;
+        }
+        let entry = entry.with_context(|| format!("read {}", path.display()))?;
+        let path = entry.path();
+        if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file())
+            && path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
+        {
+            jsonl_files.push(path);
+        }
+    }
     jsonl_files.sort();
-    let truncated = jsonl_files.len() > limit;
+    let truncated = entry_limit_reached || jsonl_files.len() > limit;
     jsonl_files.truncate(limit);
     let mut cwds = BTreeSet::new();
     for jsonl in &jsonl_files {
@@ -317,6 +358,8 @@ fn inspect_dir(path: &Path) -> Result<DirReport> {
         deleted: Vec::new(),
         memory_preserved,
         cleanup,
+        identity: fs::metadata(path).ok().map(FileIdentity::from_metadata),
+        delete_artifacts: scan.delete,
     })
 }
 
@@ -336,6 +379,8 @@ fn skipped_with_storage(path: &Path, reason: &'static str, storage_bytes: u64) -
         deleted: Vec::new(),
         memory_preserved: false,
         cleanup: Cleanup::None,
+        identity: fs::metadata(path).ok().map(FileIdentity::from_metadata),
+        delete_artifacts: Vec::new(),
     }
 }
 
@@ -375,9 +420,54 @@ impl DirScan {
     }
 }
 
+#[derive(Debug, Clone)]
 struct DeleteArtifact {
     path: PathBuf,
     file_size: Option<u64>,
+    identity: FileIdentity,
+    kind: ArtifactKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactKind {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl FileIdentity {
+    #[cfg(unix)]
+    fn from_metadata(metadata: std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn from_metadata(_metadata: std::fs::Metadata) -> Self {
+        Self {
+            device: 0,
+            inode: 0,
+        }
+    }
+
+    #[cfg(unix)]
+    // st_dev is already u64 on Linux but i32 on macOS, so the widening cast is
+    // load-bearing on one target and redundant on the other.
+    #[allow(clippy::unnecessary_cast, reason = "st_dev width is platform-specific")]
+    fn from_stat(stat: &rustix::fs::Stat) -> Self {
+        Self {
+            device: stat.st_dev as u64,
+            inode: stat.st_ino,
+        }
+    }
 }
 
 impl DeleteArtifact {
@@ -413,14 +503,20 @@ fn scan_dir(path: &Path) -> Result<DirScan> {
                 .and_then(|n| n.to_str())
                 .is_some_and(looks_like_uuid);
 
-        if is_jsonl && !file_type.is_dir() {
+        if is_jsonl && file_type.is_file() {
             jsonl_files.push(artifact.clone());
         }
 
-        if (is_jsonl && !file_type.is_dir()) || is_uuid_dir {
+        if (is_jsonl && file_type.is_file()) || is_uuid_dir {
             delete.push(DeleteArtifact {
                 path: artifact,
-                file_size: (!file_type.is_dir()).then_some(meta.len()),
+                file_size: file_type.is_file().then_some(meta.len()),
+                identity: FileIdentity::from_metadata(meta),
+                kind: if is_uuid_dir {
+                    ArtifactKind::Directory
+                } else {
+                    ArtifactKind::File
+                },
             });
         } else {
             if file_type.is_dir()
@@ -443,6 +539,7 @@ fn scan_dir(path: &Path) -> Result<DirScan> {
     })
 }
 
+#[cfg(not(unix))]
 fn cleanup_after_delete(path: &Path, artifacts: &[PathBuf]) -> Result<Cleanup> {
     let remaining = remaining_after_artifacts(path, artifacts)?;
     if remaining.is_empty() {
@@ -455,6 +552,7 @@ fn cleanup_after_delete(path: &Path, artifacts: &[PathBuf]) -> Result<Cleanup> {
     cleanup_for_remaining(&remaining, true)
 }
 
+#[cfg(not(unix))]
 fn remaining_after_artifacts(path: &Path, artifacts: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let artifact_names = artifacts
         .iter()
@@ -490,12 +588,14 @@ fn cleanup_for_remaining(remaining: &[PathBuf], applied: bool) -> Result<Cleanup
     Ok(Cleanup::PartiallyCleaned)
 }
 
+#[cfg(not(unix))]
 fn has_memory_dir(path: &Path) -> bool {
     fs::symlink_metadata(path.join("memory"))
         .map(|meta| meta.file_type().is_dir())
         .unwrap_or(false)
 }
 
+#[cfg(not(unix))]
 fn remove_artifact(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_dir() => fs::remove_dir_all(path)?,
@@ -504,6 +604,392 @@ fn remove_artifact(path: &Path) -> Result<()> {
         Err(e) => return Err(e.into()),
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn open_verified_directory(
+    path: &Path,
+    expected: Option<FileIdentity>,
+) -> Result<std::os::fd::OwnedFd> {
+    let expected = expected.context("directory identity was unavailable during discovery")?;
+    let directory = openat(
+        CWD,
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let actual = FileIdentity::from_stat(&fstat(&directory).map_err(std::io::Error::from)?);
+    if actual != expected {
+        bail_identity(path, "directory changed after discovery")?;
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn delete_dir_artifacts(
+    projects: &std::os::fd::OwnedFd,
+    projects_path: &Path,
+    report: &mut DirReport,
+) -> Result<()> {
+    let name = report
+        .path
+        .strip_prefix(projects_path)
+        .ok()
+        .filter(|path| path.components().count() == 1)
+        .context("transcript directory escaped the discovered projects directory")?;
+    let directory = openat(
+        projects,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)
+    .with_context(|| format!("re-open {}", report.path.display()))?;
+    let actual = FileIdentity::from_stat(&fstat(&directory).map_err(std::io::Error::from)?);
+    if Some(actual) != report.identity {
+        bail_identity(&report.path, "transcript directory changed after discovery")?;
+    }
+
+    revalidate_transcript_evidence(&directory, report)?;
+    revalidate_artifact_set(&directory, report)?;
+    let (quarantine_name, quarantine) = create_quarantine(&directory)?;
+    for artifact in report.delete_artifacts.clone() {
+        let artifact_name = artifact
+            .path
+            .file_name()
+            .context("transcript artifact has no file name")?;
+        renameat_with(
+            &directory,
+            artifact_name,
+            &quarantine,
+            artifact_name,
+            RenameFlags::NOREPLACE,
+        )
+        .map_err(std::io::Error::from)
+        .with_context(|| format!("quarantine {}", artifact.path.display()))?;
+        let stat = match statat(&quarantine, artifact_name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(error) => {
+                restore_quarantined(
+                    &directory,
+                    &quarantine,
+                    artifact_name,
+                    &report.path.join(&quarantine_name),
+                )?;
+                unlinkat(&directory, &quarantine_name, AtFlags::REMOVEDIR)
+                    .map_err(std::io::Error::from)?;
+                return Err(std::io::Error::from(error))
+                    .with_context(|| format!("re-stat quarantined {}", artifact.path.display()));
+            }
+        };
+        let actual = FileIdentity::from_stat(&stat);
+        let actual_kind = match FileType::from_raw_mode(stat.st_mode) {
+            FileType::RegularFile => Some(ArtifactKind::File),
+            FileType::Directory => Some(ArtifactKind::Directory),
+            _ => None,
+        };
+        if actual != artifact.identity || actual_kind != Some(artifact.kind) {
+            restore_quarantined(
+                &directory,
+                &quarantine,
+                artifact_name,
+                &report.path.join(&quarantine_name),
+            )?;
+            unlinkat(&directory, &quarantine_name, AtFlags::REMOVEDIR)
+                .map_err(std::io::Error::from)?;
+            bail_identity(
+                &artifact.path,
+                "transcript artifact changed after discovery",
+            )?;
+        }
+        match artifact.kind {
+            ArtifactKind::File => {
+                unlinkat(&quarantine, artifact_name, AtFlags::empty())
+                    .map_err(std::io::Error::from)?;
+            }
+            ArtifactKind::Directory => {
+                remove_directory_at(&quarantine, artifact_name, Some(artifact.identity))?;
+            }
+        }
+        report.deleted.push(artifact.path);
+    }
+    if !anchored_remaining_names(&quarantine)?.is_empty() {
+        anyhow::bail!(
+            "transcript quarantine was not empty after deletion: {}",
+            report.path.join(&quarantine_name).display()
+        );
+    }
+    unlinkat(&directory, &quarantine_name, AtFlags::REMOVEDIR).map_err(std::io::Error::from)?;
+    let remaining = anchored_remaining_names(&directory)?;
+    report.memory_preserved = remaining.iter().any(|name| name == "memory");
+    report.cleanup = if remaining.is_empty() {
+        remove_empty_directory_at(projects, name, actual, &report.path)?;
+        Cleanup::RemovedDir
+    } else if remaining.len() == 1 && report.memory_preserved {
+        Cleanup::MemoryPreserved
+    } else {
+        Cleanup::PartiallyCleaned
+    };
+    Ok(())
+}
+
+#[cfg(unix)]
+fn random_quarantine_name(prefix: &str) -> Result<std::ffi::OsString> {
+    use std::fmt::Write as _;
+
+    let mut random = [0_u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .context("open /dev/urandom")?
+        .read_exact(&mut random)
+        .context("read /dev/urandom")?;
+    let mut name = prefix.to_string();
+    for byte in random {
+        write!(&mut name, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    Ok(name.into())
+}
+
+#[cfg(unix)]
+fn create_quarantine(
+    directory: &std::os::fd::OwnedFd,
+) -> Result<(std::ffi::OsString, std::os::fd::OwnedFd)> {
+    for _ in 0..QUARANTINE_ATTEMPTS {
+        let name = random_quarantine_name(".midden-delete-")?;
+        match mkdirat(directory, &name, Mode::RWXU) {
+            Ok(()) => {
+                let quarantine = openat(
+                    directory,
+                    &name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(std::io::Error::from)?;
+                fchmod(&quarantine, Mode::RWXU).map_err(std::io::Error::from)?;
+                return Ok((name, quarantine));
+            }
+            Err(rustix::io::Errno::EXIST) => continue,
+            Err(error) => return Err(std::io::Error::from(error).into()),
+        }
+    }
+    anyhow::bail!("could not create a unique transcript quarantine")
+}
+
+#[cfg(unix)]
+fn restore_quarantined(
+    directory: &std::os::fd::OwnedFd,
+    quarantine: &std::os::fd::OwnedFd,
+    name: &std::ffi::OsStr,
+    quarantine_path: &Path,
+) -> Result<()> {
+    renameat_with(quarantine, name, directory, name, RenameFlags::NOREPLACE)
+        .map_err(std::io::Error::from)
+        .with_context(|| {
+            format!(
+                "restore changed transcript artifact; preserved replacement in {}",
+                quarantine_path.display()
+            )
+        })
+}
+
+#[cfg(unix)]
+fn remove_empty_directory_at(
+    parent: &std::os::fd::OwnedFd,
+    name: &Path,
+    expected: FileIdentity,
+    display_path: &Path,
+) -> Result<()> {
+    for _ in 0..QUARANTINE_ATTEMPTS {
+        let quarantine_name = random_quarantine_name(".midden-empty-")?;
+        match renameat_with(
+            parent,
+            name,
+            parent,
+            &quarantine_name,
+            RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => {
+                let stat = statat(parent, &quarantine_name, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(std::io::Error::from)?;
+                if FileIdentity::from_stat(&stat) != expected
+                    || FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+                {
+                    renameat_with(
+                        parent,
+                        &quarantine_name,
+                        parent,
+                        name,
+                        RenameFlags::NOREPLACE,
+                    )
+                    .map_err(std::io::Error::from)
+                    .with_context(|| {
+                        format!(
+                            "restore changed transcript directory; preserved replacement as {}",
+                            quarantine_name.to_string_lossy()
+                        )
+                    })?;
+                    bail_identity(display_path, "transcript directory changed before removal")?;
+                }
+                unlinkat(parent, &quarantine_name, AtFlags::REMOVEDIR)
+                    .map_err(std::io::Error::from)?;
+                return Ok(());
+            }
+            Err(rustix::io::Errno::EXIST) => continue,
+            Err(error) => return Err(std::io::Error::from(error).into()),
+        }
+    }
+    anyhow::bail!("could not reserve a unique transcript-directory quarantine")
+}
+
+#[cfg(unix)]
+fn anchored_remaining_names(directory: &std::os::fd::OwnedFd) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in Dir::read_from(directory).map_err(std::io::Error::from)? {
+        let entry = entry.map_err(std::io::Error::from)?;
+        let name = entry.file_name().to_bytes();
+        if name != b"." && name != b".." {
+            names.push(String::from_utf8_lossy(name).into_owned());
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+#[cfg(unix)]
+fn revalidate_transcript_evidence(
+    directory: &std::os::fd::OwnedFd,
+    report: &DirReport,
+) -> Result<()> {
+    let expected_cwd = report
+        .derived_cwd
+        .as_deref()
+        .context("dead transcript directory has no cwd evidence")?;
+    if !orphans::provably_absent(Path::new(expected_cwd)) {
+        anyhow::bail!("project became live after transcript discovery: {expected_cwd}");
+    }
+    for artifact in report
+        .delete_artifacts
+        .iter()
+        .filter(|artifact| artifact.kind == ArtifactKind::File)
+    {
+        let name = artifact
+            .path
+            .file_name()
+            .context("JSONL artifact has no name")?;
+        let file = openat(
+            directory,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        let stat = fstat(&file).map_err(std::io::Error::from)?;
+        if FileIdentity::from_stat(&stat) != artifact.identity
+            || FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+        {
+            bail_identity(&artifact.path, "JSONL artifact changed after discovery")?;
+        }
+        let file = std::fs::File::from(file);
+        let current_cwd = cwd_from_reader(file)?;
+        if current_cwd.as_deref() != Some(expected_cwd) {
+            bail_identity(
+                &artifact.path,
+                "transcript cwd evidence changed after discovery",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn revalidate_artifact_set(directory: &std::os::fd::OwnedFd, report: &DirReport) -> Result<()> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let expected = report
+        .delete_artifacts
+        .iter()
+        .filter_map(|artifact| artifact.path.file_name().map(ToOwned::to_owned))
+        .collect::<BTreeSet<_>>();
+    let mut current = BTreeSet::new();
+    for entry in Dir::read_from(directory).map_err(std::io::Error::from)? {
+        let entry = entry.map_err(std::io::Error::from)?;
+        let name = entry.file_name().to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        let name = OsStr::from_bytes(name);
+        let path = Path::new(name);
+        let stat =
+            statat(directory, path, AtFlags::SYMLINK_NOFOLLOW).map_err(std::io::Error::from)?;
+        let kind = FileType::from_raw_mode(stat.st_mode);
+        let eligible = (path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
+            && kind == FileType::RegularFile)
+            || (kind == FileType::Directory
+                && path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(looks_like_uuid));
+        if eligible {
+            current.insert(name.to_owned());
+        }
+    }
+    if current != expected {
+        anyhow::bail!("transcript artifact set changed after discovery");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_directory_at(
+    parent: &std::os::fd::OwnedFd,
+    name: &std::ffi::OsStr,
+    expected: Option<FileIdentity>,
+) -> Result<()> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let directory = openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let identity = FileIdentity::from_stat(&fstat(&directory).map_err(std::io::Error::from)?);
+    if expected.is_some_and(|expected| expected != identity) {
+        anyhow::bail!("quarantined transcript directory changed before traversal");
+    }
+    fchmod(&directory, Mode::RWXU).map_err(std::io::Error::from)?;
+    let entries = Dir::read_from(&directory).map_err(std::io::Error::from)?;
+    for entry in entries {
+        let entry = entry.map_err(std::io::Error::from)?;
+        let bytes = entry.file_name().to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        let child = OsStr::from_bytes(bytes);
+        let stat =
+            statat(&directory, child, AtFlags::SYMLINK_NOFOLLOW).map_err(std::io::Error::from)?;
+        if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
+            remove_directory_at(&directory, child, Some(FileIdentity::from_stat(&stat)))?;
+        } else {
+            unlinkat(&directory, child, AtFlags::empty()).map_err(std::io::Error::from)?;
+        }
+    }
+    let stat = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW).map_err(std::io::Error::from)?;
+    if FileIdentity::from_stat(&stat) != identity
+        || FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+    {
+        anyhow::bail!("quarantined transcript directory changed before removal");
+    }
+    unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(std::io::Error::from)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn bail_identity(path: &Path, message: &str) -> Result<()> {
+    anyhow::bail!("{message}: {}", path.display())
 }
 
 fn dir_size(path: &Path) -> Result<u64> {
@@ -521,7 +1007,8 @@ fn dir_size(path: &Path) -> Result<u64> {
 }
 
 fn cwd_from_jsonl(path: &Path) -> Result<Option<String>> {
-    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let file =
+        safe_io::open_regular(path, false).with_context(|| format!("open {}", path.display()))?;
     cwd_from_reader(file)
 }
 
@@ -584,7 +1071,8 @@ fn read_line_capped(reader: &mut impl BufRead, out: &mut Vec<u8>) -> std::io::Re
 
 fn cwd_from_line(line: &[u8]) -> Option<String> {
     let value: Value = serde_json::from_slice(line).ok()?;
-    value.get("cwd")?.as_str().map(ToOwned::to_owned)
+    let cwd = value.get("cwd")?.as_str()?;
+    (!cwd.is_empty() && Path::new(cwd).is_absolute()).then(|| cwd.to_owned())
 }
 
 fn looks_like_uuid(name: &str) -> bool {
@@ -633,6 +1121,14 @@ mod tests {
     }
 
     #[test]
+    fn cwd_extraction_rejects_empty_and_relative_paths() {
+        let data = br#"{"cwd":""}
+{"cwd":"relative/project"}
+"#;
+        assert_eq!(cwd_from_reader(Cursor::new(data)).unwrap(), None);
+    }
+
+    #[test]
     fn cwd_extraction_caps_huge_lines() {
         let mut data = vec![b'x'; MAX_JSONL_LINE_BYTES + 10];
         data.extend_from_slice(
@@ -665,5 +1161,119 @@ mod tests {
         let link_meta_len = std::fs::symlink_metadata(&link).unwrap().len();
 
         assert_eq!(dir_size(&link).unwrap(), link_meta_len);
+    }
+
+    #[cfg(unix)]
+    fn dead_transcript_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let claude_home = root.path().join("claude");
+        let project = claude_home.join("projects/project-slug");
+        let session = project.join("session.jsonl");
+        let missing = root.path().join("missing-project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            &session,
+            format!("{{\"cwd\":{:?}}}\n", missing.display().to_string()),
+        )
+        .unwrap();
+        (root, claude_home, project, session)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deletion_refuses_a_replaced_transcript_file() {
+        let (_root, claude_home, project, session) = dead_transcript_fixture();
+        let report = discover(&claude_home, false).unwrap();
+        assert_eq!(report.dead_count(), 1);
+
+        let replacement = project.join("replacement");
+        std::fs::write(&replacement, std::fs::read(&session).unwrap()).unwrap();
+        std::fs::rename(&replacement, &session).unwrap();
+
+        let error = delete_dead(report).unwrap_err().to_string();
+        assert!(error.contains("changed after discovery"), "{error}");
+        assert!(session.exists(), "the replacement must not be deleted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deletion_refuses_a_replaced_transcript_directory() {
+        let (root, claude_home, project, session) = dead_transcript_fixture();
+        let report = discover(&claude_home, false).unwrap();
+        assert_eq!(report.dead_count(), 1);
+
+        let original = root.path().join("original-project-slug");
+        std::fs::rename(&project, &original).unwrap();
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(
+            &session,
+            std::fs::read(original.join("session.jsonl")).unwrap(),
+        )
+        .unwrap();
+
+        let error = delete_dead(report).unwrap_err().to_string();
+        assert!(error.contains("changed after discovery"), "{error}");
+        assert!(
+            session.exists(),
+            "the replacement directory must be untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deletion_rechecks_that_the_project_is_still_absent() {
+        let (root, claude_home, _project, session) = dead_transcript_fixture();
+        let report = discover(&claude_home, false).unwrap();
+        assert_eq!(report.dead_count(), 1);
+        std::fs::create_dir(root.path().join("missing-project")).unwrap();
+
+        let error = delete_dead(report).unwrap_err().to_string();
+        assert!(error.contains("became live"), "{error}");
+        assert!(
+            session.exists(),
+            "live-project evidence must prevent deletion"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deletion_supports_a_symlinked_projects_root() {
+        let root = tempfile::tempdir().unwrap();
+        let claude_home = root.path().join("claude");
+        let real_projects = root.path().join("state/projects");
+        let project = real_projects.join("project-slug");
+        let session = project.join("session.jsonl");
+        let missing = root.path().join("missing-project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&claude_home).unwrap();
+        std::fs::write(
+            &session,
+            format!("{{\"cwd\":{:?}}}\n", missing.display().to_string()),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&real_projects, claude_home.join("projects")).unwrap();
+
+        let report = discover(&claude_home, false).unwrap();
+        assert_eq!(report.projects_dir, real_projects.canonicalize().unwrap());
+        let applied = delete_dead(report).unwrap();
+
+        assert!(applied.applied);
+        assert!(!session.exists());
+        assert!(claude_home.join("projects").is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcript_discovery_does_not_follow_jsonl_symlinks() {
+        let (root, claude_home, project, session) = dead_transcript_fixture();
+        let external = root.path().join("external.jsonl");
+        std::fs::rename(&session, &external).unwrap();
+        std::os::unix::fs::symlink(&external, &session).unwrap();
+
+        let report = discover(&claude_home, false).unwrap();
+        assert_eq!(report.dead_count(), 0);
+        assert_eq!(report.skipped_count(), 1);
+        assert_eq!(report.dirs[0].reason, Some("no-jsonl"));
+        assert!(project.exists());
     }
 }

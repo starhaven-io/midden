@@ -12,6 +12,11 @@ fn write_json(path: &Path, value: &Value) {
     std::fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
 }
 
+fn track(fx: &Fixture, path: &str) {
+    fx.git(&["init", "--quiet"]);
+    fx.git(&["add", path]);
+}
+
 #[test]
 fn detects_orphaned_projects() {
     let fx = Fixture::new();
@@ -72,6 +77,7 @@ fn flags_secrets_in_committed_settings_but_masks_by_default() {
             "env": { "ANTHROPIC_API_KEY": "sk-very-real-token-abc123" }
         }),
     );
+    track(&fx, ".claude/settings.json");
 
     let out = fx.cmd().arg("doctor").arg(fx.root.path()).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -91,6 +97,7 @@ fn flags_secret_in_array_under_sensitive_key() {
         &project_settings,
         &json!({ "apiKeys": ["sk-real-committed-secret-aaaa"] }),
     );
+    track(&fx, ".claude/settings.json");
 
     let out = fx.cmd().arg("doctor").arg(fx.root.path()).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -162,6 +169,61 @@ fn gitignored_settings_json_is_not_flagged_as_committed_secret() {
 }
 
 #[test]
+fn untracked_secret_is_reported_as_a_warning() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    fx.git(&["init", "--quiet"]);
+    write_json(
+        &fx.root.path().join(".claude/settings.json"),
+        &json!({ "env": { "API_KEY": "sk-untracked-secret-aaaa" } }),
+    );
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("doctor")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let finding = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "secret-in-unignored-settings")
+        .expect("untracked secret finding");
+    assert_eq!(finding["severity"], "warn");
+}
+
+#[test]
+fn secret_outside_a_git_repository_is_not_called_committed() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    write_json(
+        &fx.root.path().join(".claude/settings.json"),
+        &json!({ "env": { "API_KEY": "sk-git-unknown-secret-aaaa" } }),
+    );
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("doctor")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let finding = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "secret-exposure-unverifiable-settings")
+        .expect("git-unverifiable secret finding");
+    assert_eq!(finding["severity"], "warn");
+}
+
+#[test]
 fn flags_secret_in_committed_mcp_json() {
     let fx = Fixture::new();
     fx.write_config(json!({}), json!({}));
@@ -176,6 +238,7 @@ fn flags_secret_in_committed_mcp_json() {
             }
         }),
     );
+    track(&fx, ".mcp.json");
 
     let out = fx.cmd().arg("doctor").arg(fx.root.path()).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -209,6 +272,7 @@ fn flags_token_shaped_value_under_innocent_key() {
             }
         }),
     );
+    track(&fx, ".mcp.json");
 
     let out = fx.cmd().arg("doctor").arg(fx.root.path()).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -231,6 +295,7 @@ fn flags_url_password_in_committed_settings() {
         &fx.root.path().join(".claude/settings.json"),
         &json!({ "env": { "DATABASE_URL": "postgres://app:hunter2pass@db.example.com/prod" } }),
     );
+    track(&fx, ".claude/settings.json");
 
     let out = fx.cmd().arg("doctor").arg(fx.root.path()).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -278,6 +343,58 @@ fn env_expansion_in_mcp_json_is_not_flagged() {
     assert!(
         !ids.contains(&"secret-in-committed-mcp"),
         "a ${{VAR}} reference is not a committed secret; ids: {ids:?}"
+    );
+}
+
+#[test]
+fn numeric_settings_and_non_secret_argv_are_not_flagged_as_credentials() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    write_json(
+        &fx.root.path().join(".mcp.json"),
+        &json!({
+            "oauth": { "callbackPort": 8080 },
+            "env": {
+                "MAX_THINKING_TOKENS": 10000,
+                "tokenEndpoint": "https://identity.example.test/token",
+                "privateKeyAlgorithm": "Ed25519"
+            },
+            "mcpServers": {
+                "svc": {
+                    "command": "helper",
+                    "args": [
+                        "--credentials-file", "/tmp/credentials.json",
+                        "--credentials-file=/tmp/credentials.json",
+                        "--auth", "oauth",
+                        "--session-name", "work",
+                        "--token-limit", "10000",
+                        "--token-url", "https://identity.example.test/token"
+                    ]
+                }
+            }
+        }),
+    );
+    track(&fx, ".mcp.json");
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("doctor")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let secret_findings = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|finding| finding["id"].as_str())
+        .filter(|id| id.starts_with("secret-"))
+        .collect::<Vec<_>>();
+
+    assert!(
+        secret_findings.is_empty(),
+        "false positives: {secret_findings:?}"
     );
 }
 
@@ -345,6 +462,27 @@ fn covered_credential_deny_rules_pass() {
         &json!({
             "permissions": {
                 "deny": ["Read(./.env)", "Read(./.env.*)", "Read(./secrets/**)"]
+            }
+        }),
+    );
+
+    let out = fx.cmd().arg("doctor").arg(fx.root.path()).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("missing-credential-deny"),
+        "stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn project_root_relative_credential_deny_rules_pass() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    write_json(
+        &fx.root.path().join(".claude/settings.json"),
+        &json!({
+            "permissions": {
+                "deny": ["Read(/.env)", "Read(/.env.*)", "Read(/secrets/**)"]
             }
         }),
     );
@@ -619,6 +757,7 @@ fn flags_token_shaped_secret_in_malformed_json() {
         ),
     )
     .unwrap();
+    track(&fx, ".claude/settings.json");
 
     let out = fx.cmd().arg("doctor").arg(fx.root.path()).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -647,6 +786,7 @@ fn fix_with_nothing_auto_fixable_writes_nothing() {
         &project_settings,
         &json!({ "env": { "API_KEY": "sk-realsecret-aaaa" } }),
     );
+    track(&fx, ".claude/settings.json");
 
     fx.cmd()
         .arg("doctor")

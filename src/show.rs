@@ -9,7 +9,9 @@ use walkdir::WalkDir;
 
 use crate::claude_json;
 use crate::paths::{Env, ProjectPaths, managed_settings_files};
+use crate::safe_io;
 use crate::secrets;
+use crate::terminal;
 
 pub struct Options {
     pub path: PathBuf,
@@ -66,7 +68,10 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     }
     let project = ProjectPaths::new(&root);
 
-    let sources = settings_sources(env, &project);
+    let (sources, source_errors) = settings_sources(env, &project);
+    if let Some(error) = source_errors.first() {
+        bail!("could not load {}: {}", error.path.display(), error.message);
+    }
 
     let mut hooks = collect_hooks(&sources);
     let resolved: Vec<Resolved> = resolve_settings(&sources)
@@ -75,12 +80,12 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
         // dump so they aren't shown twice as opaque JSON blobs.
         .filter(|r| !r.key.starts_with("hooks."))
         .collect();
-    let claude_mds = collect_claude_md(&project, env);
-    let contradictions = detect_contradictions(&claude_mds);
+    let mut claude_mds = collect_claude_md(&project, env);
+    let contradictions = detect_contradictions(&mut claude_mds);
     let skills = collect_dirs(&[env.user_skills_dir(), project.skills_dir()], "SKILL.md");
     let commands = collect_files(&[env.user_commands_dir(), project.commands_dir()]);
     let agents = collect_files(&[env.user_agents_dir(), project.agents_dir()]);
-    let mut mcp_servers = collect_mcp_servers(env, &project);
+    let mut mcp_servers = collect_mcp_servers(env, &project)?;
     let worktrees = collect_worktrees(&project);
 
     let mut resolved = resolved;
@@ -94,9 +99,9 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
             }
             // Token-shaped values hide under innocent keys too — args arrays,
             // env.DATABASE_URL — so mask by content as well as by key name.
-            secrets::mask_sensitive_values(&mut r.effective);
+            secrets::mask_tree(&mut r.effective);
             for c in &mut r.contributions {
-                secrets::mask_sensitive_values(&mut c.value);
+                secrets::mask_tree(&mut c.value);
             }
         }
         // Hook commands and MCP URLs are free-form text that can embed
@@ -105,9 +110,13 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
             h.command = secrets::mask_embedded(&h.command);
         }
         for s in &mut mcp_servers {
+            if let Some(command) = &mut s.command {
+                *command = secrets::mask_embedded(command);
+            }
             if let Some(url) = &mut s.url {
                 *url = secrets::mask_embedded(url);
             }
+            secrets::mask_tree(&mut s.definition);
         }
     }
 
@@ -125,36 +134,57 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     };
 
     if opts.json {
-        emit_json(&report);
+        emit_json(&report, opts.show_secrets);
     } else {
-        emit_human(&report);
+        emit_human(&report, opts.show_secrets);
     }
 
     Ok(ExitCode::SUCCESS)
 }
 
-fn read_json(path: &Path) -> Option<Value> {
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+fn read_json(path: &Path) -> Result<Option<Value>> {
+    let text = match safe_io::read_to_string(path, safe_io::MAX_CONFIG_BYTES) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let value = serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+    Ok(Some(value))
 }
 
-pub(crate) fn settings_sources(env: &Env, project: &ProjectPaths) -> Vec<(Scope, PathBuf, Value)> {
+#[derive(Debug)]
+pub(crate) struct SettingsReadError {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+pub(crate) fn settings_sources(
+    env: &Env,
+    project: &ProjectPaths,
+) -> (Vec<(Scope, PathBuf, Value)>, Vec<SettingsReadError>) {
     let mut sources = Vec::new();
-    if let Some(value) = read_json(&env.user_settings()) {
-        sources.push((Scope::User, env.user_settings(), value));
-    }
-    if let Some(value) = read_json(&project.settings()) {
-        sources.push((Scope::Project, project.settings(), value));
-    }
-    if let Some(value) = read_json(&project.local_settings()) {
-        sources.push((Scope::Local, project.local_settings(), value));
-    }
-    for managed in managed_settings_files() {
-        if let Some(value) = read_json(&managed) {
-            sources.push((Scope::Managed, managed, value));
+    let mut errors = Vec::new();
+    let mut candidates = vec![
+        (Scope::User, env.user_settings()),
+        (Scope::Project, project.settings()),
+        (Scope::Local, project.local_settings()),
+    ];
+    candidates.extend(
+        managed_settings_files()
+            .into_iter()
+            .map(|path| (Scope::Managed, path)),
+    );
+    for (scope, path) in candidates {
+        match read_json(&path) {
+            Ok(Some(value)) => sources.push((scope, path, value)),
+            Ok(None) => {}
+            Err(error) => errors.push(SettingsReadError {
+                path,
+                message: format!("{error:#}"),
+            }),
         }
     }
-    sources
+    (sources, errors)
 }
 
 pub(crate) fn effective_setting(sources: &[(Scope, PathBuf, Value)], key: &str) -> Option<Value> {
@@ -267,6 +297,17 @@ struct ClaudeMd {
     file: PathBuf,
     scope: ClaudeMdScope,
     bytes: u64,
+    load_state: ClaudeMdLoadState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum ClaudeMdLoadState {
+    Loaded,
+    Disabled,
+    Unknown,
 }
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -281,11 +322,16 @@ enum ClaudeMdScope {
 fn collect_claude_md(project: &ProjectPaths, env: &Env) -> Vec<ClaudeMd> {
     let mut out = Vec::new();
     let user = env.user_claude_md();
-    if let Ok(m) = std::fs::metadata(&user) {
+    if let Ok(m) = std::fs::metadata(&user)
+        && m.is_file()
+    {
+        let (load_state, detail) = claude_md_initial_state(m.len());
         out.push(ClaudeMd {
             file: user,
             scope: ClaudeMdScope::User,
             bytes: m.len(),
+            load_state,
+            detail,
         });
     }
     // Walk from project root up to filesystem root for ancestor CLAUDE.md.
@@ -304,11 +350,16 @@ fn collect_claude_md(project: &ProjectPaths, env: &Env) -> Vec<ClaudeMd> {
             ("CLAUDE.local.md", ClaudeMdScope::Local),
         ] {
             let p = current.join(name);
-            if let Ok(m) = std::fs::metadata(&p) {
+            if let Ok(m) = std::fs::metadata(&p)
+                && m.is_file()
+            {
+                let (load_state, detail) = claude_md_initial_state(m.len());
                 out.push(ClaudeMd {
                     file: p,
                     scope,
                     bytes: m.len(),
+                    load_state,
+                    detail,
                 });
             }
         }
@@ -318,6 +369,20 @@ fn collect_claude_md(project: &ProjectPaths, env: &Env) -> Vec<ClaudeMd> {
         }
     }
     out
+}
+
+fn claude_md_initial_state(bytes: u64) -> (ClaudeMdLoadState, Option<String>) {
+    if bytes > safe_io::MAX_INSTRUCTION_BYTES as u64 {
+        (
+            ClaudeMdLoadState::Disabled,
+            Some(format!(
+                "skipped by Claude because the file exceeds the {} byte CLAUDE.md limit",
+                safe_io::MAX_INSTRUCTION_BYTES
+            )),
+        )
+    } else {
+        (ClaudeMdLoadState::Loaded, None)
+    }
 }
 
 /// Directory names that hold vendored or generated content. The walker prunes
@@ -357,11 +422,24 @@ type Directive = (Polarity, String, String);
 /// ("do X", "don't X", "never X", "always X") that share a content keyword
 /// across files and disagree on directive polarity. This is best-effort by
 /// design — false negatives are common, false positives kept low.
-fn detect_contradictions(files: &[ClaudeMd]) -> Vec<Contradiction> {
+fn detect_contradictions(files: &mut [ClaudeMd]) -> Vec<Contradiction> {
     let mut lines_by_file: Vec<(PathBuf, Vec<Directive>)> = Vec::new();
     for f in files {
-        let Ok(text) = std::fs::read_to_string(&f.file) else {
-            continue;
+        let text = match safe_io::read_to_string(&f.file, safe_io::MAX_INSTRUCTION_BYTES) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::FileTooLarge => {
+                f.load_state = ClaudeMdLoadState::Disabled;
+                f.detail = Some(format!(
+                    "skipped by Claude because the file exceeds the {} byte CLAUDE.md limit; midden did not scan it: {error}",
+                    safe_io::MAX_INSTRUCTION_BYTES
+                ));
+                continue;
+            }
+            Err(error) => {
+                f.load_state = ClaudeMdLoadState::Unknown;
+                f.detail = Some(format!("could not inspect for contradictions: {error}"));
+                continue;
+            }
         };
         let mut entries = Vec::new();
         for line in text.lines() {
@@ -546,6 +624,7 @@ struct Hook {
 /// `hooks` array contains one or more concrete commands — we flatten the lot.
 fn collect_hooks(sources: &[(Scope, PathBuf, Value)]) -> Vec<Hook> {
     let mut out = Vec::new();
+    let mut seen_handlers: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (scope, file, value) in sources {
         let Some(events) = value.get("hooks").and_then(Value::as_object) else {
             continue;
@@ -564,6 +643,16 @@ fn collect_hooks(sources: &[(Scope, PathBuf, Value)]) -> Vec<Hook> {
                     continue;
                 };
                 for entry in entries {
+                    // Claude runs a handler only once when the same handler is
+                    // contributed by multiple settings files or matching
+                    // groups. Matcher provenance does not form part of the
+                    // handler identity.
+                    let identity = hook_handler_identity(entry);
+                    let seen = seen_handlers.entry(event_name.clone()).or_default();
+                    if seen.contains(&identity) {
+                        continue;
+                    }
+                    seen.push(identity);
                     let kind = entry
                         .get("type")
                         .and_then(Value::as_str)
@@ -596,6 +685,30 @@ fn collect_hooks(sources: &[(Scope, PathBuf, Value)]) -> Vec<Hook> {
     out
 }
 
+fn hook_handler_identity(entry: &Value) -> String {
+    let kind = entry
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("command");
+    let fields: &[&str] = match kind {
+        // Presentation-only metadata such as timeout and statusMessage does
+        // not turn the same operation into a second handler.
+        "command" => &["command", "args", "shell", "async", "asyncRewake", "if"],
+        "http" => &["url", "headers", "allowedEnvVars", "if"],
+        "mcp_tool" => &["server", "tool", "input", "if"],
+        "prompt" | "agent" => &["prompt", "model", "if"],
+        _ => return serde_json::to_string(entry).unwrap_or_default(),
+    };
+    let mut identity = serde_json::Map::new();
+    identity.insert("type".into(), Value::String(kind.to_string()));
+    for field in fields {
+        if let Some(value) = entry.get(*field) {
+            identity.insert((*field).to_string(), value.clone());
+        }
+    }
+    serde_json::to_string(&identity).unwrap_or_default()
+}
+
 #[derive(Debug, Serialize)]
 struct McpServer {
     name: String,
@@ -604,14 +717,15 @@ struct McpServer {
     command: Option<String>,
     url: Option<String>,
     disabled: bool,
+    definition: Value,
 }
 
-fn collect_mcp_servers(env: &Env, project: &ProjectPaths) -> Vec<McpServer> {
+fn collect_mcp_servers(env: &Env, project: &ProjectPaths) -> Result<Vec<McpServer>> {
     let mut out = Vec::new();
     // User and local scope both live in ~/.claude.json: the top-level
     // `mcpServers` map is user scope; the per-project entry's `mcpServers` is
     // local scope — the default destination of `claude mcp add`.
-    if let Some(claude) = read_json(&env.claude_json) {
+    if let Some(claude) = read_json(&env.claude_json)? {
         push_mcp_servers(claude.get("mcpServers"), "user", &env.claude_json, &mut out);
         let local = claude_json::project_entry(&claude, &project.root)
             .and_then(|entry| entry.get("mcpServers"));
@@ -621,11 +735,11 @@ fn collect_mcp_servers(env: &Env, project: &ProjectPaths) -> Vec<McpServer> {
         ("project", project.mcp_json()),
         ("managed", project.managed_mcp_json()),
     ] {
-        if let Some(v) = read_json(&path) {
+        if let Some(v) = read_json(&path)? {
             push_mcp_servers(v.get("mcpServers"), scope, &path, &mut out);
         }
     }
-    out
+    Ok(out)
 }
 
 fn push_mcp_servers(
@@ -648,6 +762,7 @@ fn push_mcp_servers(
                 .get("disabled")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            definition: def.clone(),
         });
     }
 }
@@ -702,7 +817,7 @@ struct Report {
 
 // -- presentation ------------------------------------------------------------
 
-fn emit_human(report: &Report) {
+fn emit_human(report: &Report, show_secrets: bool) {
     let Report {
         root,
         resolved,
@@ -715,7 +830,11 @@ fn emit_human(report: &Report) {
         mcp_servers,
         worktrees,
     } = report;
-    println!("{} {}", "resolved for".bold(), root.display());
+    println!(
+        "{} {}",
+        "resolved for".bold(),
+        display_path(root, show_secrets)
+    );
     println!();
 
     println!("{}", "settings".bold().underline());
@@ -724,7 +843,11 @@ fn emit_human(report: &Report) {
     } else {
         for r in resolved {
             let val_str = format_value(&r.effective);
-            println!("  {} = {}", r.key.cyan(), val_str);
+            println!(
+                "  {} = {}",
+                display_text(&r.key, show_secrets).cyan(),
+                terminal::escape(&val_str)
+            );
             for c in &r.contributions {
                 let tag = if c.shadowed {
                     format!("[{} shadowed]", c.scope.label())
@@ -738,8 +861,8 @@ fn emit_human(report: &Report) {
                 };
                 println!(
                     "    {tag} {} = {}",
-                    c.file.display(),
-                    format_value(&c.value).dimmed()
+                    display_path(&c.file, show_secrets),
+                    terminal::escape(&format_value(&c.value)).dimmed()
                 );
             }
         }
@@ -757,16 +880,36 @@ fn emit_human(report: &Report) {
                 ClaudeMdScope::Local => "local",
                 ClaudeMdScope::Ancestor => "ancestor",
             };
-            println!("  [{scope}] {} ({} bytes)", c.file.display(), c.bytes);
+            println!(
+                "  [{scope}; {}] {} ({} bytes)",
+                match c.load_state {
+                    ClaudeMdLoadState::Loaded => "loaded",
+                    ClaudeMdLoadState::Disabled => "disabled",
+                    ClaudeMdLoadState::Unknown => "load unknown",
+                },
+                display_path(&c.file, show_secrets),
+                c.bytes
+            );
+            if let Some(detail) = &c.detail {
+                println!("    {}", display_text(detail, show_secrets).dimmed());
+            }
         }
     }
     if !contradictions.is_empty() {
         println!();
         println!("  {}", "contradictions:".yellow().bold());
         for c in contradictions {
-            println!("    keyword `{}`", c.keyword);
-            println!("      {} — {}", c.a_file.display(), c.a_line.dimmed());
-            println!("      {} — {}", c.b_file.display(), c.b_line.dimmed());
+            println!("    keyword `{}`", display_text(&c.keyword, show_secrets));
+            println!(
+                "      {} — {}",
+                display_path(&c.a_file, show_secrets),
+                display_text(&c.a_line, show_secrets).dimmed()
+            );
+            println!(
+                "      {} — {}",
+                display_path(&c.b_file, show_secrets),
+                display_text(&c.b_line, show_secrets).dimmed()
+            );
         }
     }
     println!();
@@ -776,18 +919,21 @@ fn emit_human(report: &Report) {
         skills
             .iter()
             .map(|s| (s.name.as_str(), s.file.as_path(), s.scope)),
+        show_secrets,
     );
     print_section(
         "commands",
         commands
             .iter()
             .map(|c| (c.name.as_str(), c.file.as_path(), c.scope)),
+        show_secrets,
     );
     print_section(
         "agents",
         agents
             .iter()
             .map(|a| (a.name.as_str(), a.file.as_path(), a.scope)),
+        show_secrets,
     );
 
     println!("{}", "hooks".bold().underline());
@@ -797,18 +943,18 @@ fn emit_human(report: &Report) {
         let mut current_event = "";
         for h in hooks {
             if h.event != current_event {
-                println!("  {}", h.event.bold());
+                println!("  {}", display_text(&h.event, show_secrets).bold());
                 current_event = &h.event;
             }
             let matcher = h.matcher.as_deref().unwrap_or("*");
             println!(
                 "    [{}] {} ({}): {}",
                 h.scope.label(),
-                matcher.cyan(),
-                h.kind,
-                truncate_oneline(&h.command, 80)
+                display_text(matcher, show_secrets).cyan(),
+                display_text(&h.kind, show_secrets),
+                display_text(&truncate_oneline(&h.command, 80), show_secrets)
             );
-            println!("      {}", h.file.display().to_string().dimmed());
+            println!("      {}", display_path(&h.file, show_secrets).dimmed());
         }
     }
     println!();
@@ -828,8 +974,13 @@ fn emit_human(report: &Report) {
             } else {
                 String::new()
             };
-            println!("  [{}] {} -> {target}{dis}", s.scope, s.name);
-            println!("    {}", s.file.display().to_string().dimmed());
+            println!(
+                "  [{}] {} -> {}{dis}",
+                s.scope,
+                display_text(&s.name, show_secrets),
+                display_text(target, show_secrets)
+            );
+            println!("    {}", display_path(&s.file, show_secrets).dimmed());
         }
     }
     println!();
@@ -839,18 +990,26 @@ fn emit_human(report: &Report) {
         println!("  (none)");
     } else {
         for w in worktrees {
-            println!("  {} — {}", w.name, w.file.display());
+            println!(
+                "  {} — {}",
+                display_text(&w.name, show_secrets),
+                display_path(&w.file, show_secrets)
+            );
         }
     }
 }
 
-fn print_section<'a>(title: &str, iter: impl Iterator<Item = (&'a str, &'a Path, &'a str)>) {
+fn print_section<'a>(
+    title: &str,
+    iter: impl Iterator<Item = (&'a str, &'a Path, &'a str)>,
+    show_secrets: bool,
+) {
     println!("{}", title.bold().underline());
     let mut empty = true;
     for (name, file, scope) in iter {
         empty = false;
-        println!("  [{scope}] {name}");
-        println!("    {}", file.display().to_string().dimmed());
+        println!("  [{scope}] {}", display_text(name, show_secrets));
+        println!("    {}", display_path(file, show_secrets).dimmed());
     }
     if empty {
         println!("  (none)");
@@ -883,10 +1042,27 @@ fn truncate_oneline(s: &str, max: usize) -> String {
     }
 }
 
-fn emit_json(report: &Report) {
+fn display_text(value: &str, show_secrets: bool) -> String {
+    let value = if show_secrets {
+        value.to_string()
+    } else {
+        secrets::mask_embedded(value)
+    };
+    terminal::escape(&value)
+}
+
+fn display_path(path: &Path, show_secrets: bool) -> String {
+    display_text(&path.display().to_string(), show_secrets)
+}
+
+fn emit_json(report: &Report, show_secrets: bool) {
+    let mut value = serde_json::to_value(report).expect("serialize");
+    if !show_secrets {
+        secrets::mask_sensitive_values(&mut value);
+    }
     println!(
         "{}",
-        serde_json::to_string_pretty(report).expect("serialize")
+        serde_json::to_string_pretty(&value).expect("serialize")
     );
 }
 
@@ -1030,19 +1206,23 @@ mod tests {
         let b = dir.path().join("B.md");
         std::fs::write(&a, "- Always use tabs.\n").unwrap();
         std::fs::write(&b, "- Must not use tabs.\n").unwrap();
-        let files = vec![
+        let mut files = vec![
             ClaudeMd {
                 file: a,
                 scope: ClaudeMdScope::User,
                 bytes: 0,
+                load_state: ClaudeMdLoadState::Loaded,
+                detail: None,
             },
             ClaudeMd {
                 file: b,
                 scope: ClaudeMdScope::Project,
                 bytes: 0,
+                load_state: ClaudeMdLoadState::Loaded,
+                detail: None,
             },
         ];
-        let c = detect_contradictions(&files);
+        let c = detect_contradictions(&mut files);
         assert_eq!(c.len(), 1, "polarity must differ: {c:?}");
         assert!(c[0].keyword.starts_with("use"));
     }
@@ -1054,19 +1234,23 @@ mod tests {
         let b = dir.path().join("B.md");
         std::fs::write(&a, "- Always commit signed.\n").unwrap();
         std::fs::write(&b, "- Never commit signed.\n").unwrap();
-        let files = vec![
+        let mut files = vec![
             ClaudeMd {
                 file: a.clone(),
                 scope: ClaudeMdScope::User,
                 bytes: 0,
+                load_state: ClaudeMdLoadState::Loaded,
+                detail: None,
             },
             ClaudeMd {
                 file: b.clone(),
                 scope: ClaudeMdScope::Project,
                 bytes: 0,
+                load_state: ClaudeMdLoadState::Loaded,
+                detail: None,
             },
         ];
-        let c = detect_contradictions(&files);
+        let c = detect_contradictions(&mut files);
         assert_eq!(c.len(), 1);
         assert!(c[0].keyword.starts_with("commit"));
     }

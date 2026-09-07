@@ -1,8 +1,8 @@
 use anyhow::{Result, bail};
 use colored::Colorize;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::backup;
@@ -11,6 +11,8 @@ use crate::orphans;
 use crate::output;
 use crate::paths::Env;
 use crate::process;
+use crate::secrets;
+use crate::terminal;
 use crate::transcripts;
 
 pub struct Options {
@@ -23,6 +25,19 @@ pub struct Options {
 
 type ProjectApplyResult = Option<(PathBuf, usize, usize)>;
 type TranscriptApplyResult = Option<transcripts::Report>;
+
+fn display_text(value: &str) -> String {
+    terminal::escape(&secrets::mask_free_text(value))
+}
+
+fn display_path(path: &Path) -> String {
+    display_text(&path.display().to_string())
+}
+
+fn emit_json(mut value: Value) {
+    secrets::mask_sensitive_values(&mut value);
+    println!("{value}");
+}
 
 pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     if opts.transcripts {
@@ -37,7 +52,7 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     let config = ClaudeJson::load(path)?;
     let Some(projects) = config.projects() else {
         if opts.json {
-            println!("{}", json!({"total": 0, "orphans": [], "removed": false}));
+            emit_json(json!({"total": 0, "orphans": [], "removed": false}));
         } else {
             println!("no 'projects' map found; nothing to do");
         }
@@ -48,10 +63,7 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
 
     if orphans.is_empty() {
         if opts.json {
-            println!(
-                "{}",
-                json!({"total": total, "orphans": [], "removed": false})
-            );
+            emit_json(json!({"total": total, "orphans": [], "removed": false}));
         } else {
             println!("clean. {total} project entries, none orphaned.");
         }
@@ -68,20 +80,17 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
         } else {
             None
         };
-        println!(
-            "{}",
-            json!({
-                "total": total,
-                "orphans": orphans.iter().map(|o| json!({
-                    "path": o.path,
-                    "is_worktree": o.is_worktree,
-                })).collect::<Vec<_>>(),
-                "bytes_before": config.raw.len(),
-                "bytes_after": applied.as_ref().map(|(_, _, b)| *b).unwrap_or(new_raw.len()),
-                "removed": applied.is_some(),
-                "backup": applied.as_ref().map(|(p, _, _)| p.display().to_string()),
-            })
-        );
+        emit_json(json!({
+            "total": total,
+            "orphans": orphans.iter().map(|o| json!({
+                "path": o.path,
+                "is_worktree": o.is_worktree,
+            })).collect::<Vec<_>>(),
+            "bytes_before": config.raw.len(),
+            "bytes_after": applied.as_ref().map(|(_, _, b)| *b).unwrap_or(new_raw.len()),
+            "removed": applied.is_some(),
+            "backup": applied.as_ref().map(|(p, _, _)| p.display().to_string()),
+        }));
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -98,12 +107,12 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
         } else {
             String::new()
         };
-        println!("  - {}{tag}", o.path);
+        println!("  - {}{tag}", display_text(&o.path));
     }
     println!();
     println!(
         "would shrink {} by ~{} ({} -> {}).",
-        path.file_name().unwrap_or_default().to_string_lossy(),
+        display_text(&path.file_name().unwrap_or_default().to_string_lossy()),
         output::kb(saved),
         output::kb(config.raw.len()),
         output::kb(new_raw.len()),
@@ -119,10 +128,10 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     match apply_prune(env, &opts)? {
         Some((backup_path, removed, _)) => {
             println!();
-            println!("backed up to {}", backup_path.display());
+            println!("backed up to {}", display_path(&backup_path));
             println!(
                 "removed {removed} entries from {}",
-                env.claude_json.display()
+                display_path(&env.claude_json)
             );
         }
         None => {
@@ -163,25 +172,22 @@ fn run_with_transcripts(env: &Env, opts: Options) -> Result<ExitCode> {
             .as_ref()
             .unwrap_or(&transcript_report)
             .to_json();
-        println!(
-            "{}",
-            json!({
-                "total": total,
-                "orphans": orphans.iter().map(|o| json!({
-                    "path": o.path,
-                    "is_worktree": o.is_worktree,
-                })).collect::<Vec<_>>(),
-                "bytes_before": config.raw.len(),
-                "bytes_after": applied_prune
-                    .as_ref()
-                    .map(|(_, _, b)| *b)
-                    .or_else(|| new_raw.as_ref().map(String::len))
-                    .unwrap_or(config.raw.len()),
-                "removed": applied_prune.is_some(),
-                "backup": applied_prune.as_ref().map(|(p, _, _)| p.display().to_string()),
-                "transcripts": transcript_json,
-            })
-        );
+        emit_json(json!({
+            "total": total,
+            "orphans": orphans.iter().map(|o| json!({
+                "path": o.path,
+                "is_worktree": o.is_worktree,
+            })).collect::<Vec<_>>(),
+            "bytes_before": config.raw.len(),
+            "bytes_after": applied_prune
+                .as_ref()
+                .map(|(_, _, b)| *b)
+                .or_else(|| new_raw.as_ref().map(String::len))
+                .unwrap_or(config.raw.len()),
+            "removed": applied_prune.is_some(),
+            "backup": applied_prune.as_ref().map(|(p, _, _)| p.display().to_string()),
+            "transcripts": transcript_json,
+        }));
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -243,12 +249,12 @@ fn print_project_preview(
         } else {
             String::new()
         };
-        println!("  - {}{tag}", o.path);
+        println!("  - {}{tag}", display_text(&o.path));
     }
     println!();
     println!(
         "would shrink {} by ~{} ({} -> {}).",
-        path.file_name().unwrap_or_default().to_string_lossy(),
+        display_text(&path.file_name().unwrap_or_default().to_string_lossy()),
         output::kb(saved),
         output::kb(config.raw.len()),
         output::kb(new_raw.len()),
@@ -260,10 +266,10 @@ fn print_project_apply(env: &Env, applied: ProjectApplyResult) {
     match applied {
         Some((backup_path, removed, _)) => {
             println!();
-            println!("backed up to {}", backup_path.display());
+            println!("backed up to {}", display_path(&backup_path));
             println!(
                 "removed {removed} entries from {}",
-                env.claude_json.display()
+                display_path(&env.claude_json)
             );
         }
         None => {
@@ -279,7 +285,7 @@ fn print_transcript_preview(report: &transcripts::Report) {
     if report.total() == 0 {
         println!(
             "  no transcript project dirs found under {}",
-            report.projects_dir.display()
+            display_path(&report.projects_dir)
         );
         return;
     }
@@ -299,20 +305,20 @@ fn print_transcript_preview(report: &transcripts::Report) {
             transcripts::DirStatus::Dead => {
                 println!(
                     "  - {} -> {} ({})",
-                    dir.path.display(),
-                    dir.derived_cwd.as_deref().unwrap_or("<unknown>"),
+                    display_path(&dir.path),
+                    display_text(dir.derived_cwd.as_deref().unwrap_or("<unknown>")),
                     output::human_bytes(dir.bytes)
                 );
                 for target in &dir.delete {
-                    println!("      delete {}", target.display());
+                    println!("      delete {}", display_path(target));
                 }
                 print_cleanup_note(dir);
             }
             transcripts::DirStatus::Skipped => {
                 println!(
                     "  - {} [skipped: {}]",
-                    dir.path.display(),
-                    dir.reason.unwrap_or("cannot-tell")
+                    display_path(&dir.path),
+                    display_text(dir.reason.unwrap_or("cannot-tell"))
                 );
             }
             transcripts::DirStatus::Kept => {}
@@ -332,8 +338,8 @@ fn print_kept_transcript_storage(report: &transcripts::Report) {
     for dir in dirs {
         println!(
             "    - {} -> {} ({})",
-            dir.path.display(),
-            dir.derived_cwd.as_deref().unwrap_or("<unknown>"),
+            display_path(&dir.path),
+            display_text(dir.derived_cwd.as_deref().unwrap_or("<unknown>")),
             output::human_bytes(dir.storage_bytes),
         );
     }
@@ -354,9 +360,9 @@ fn print_transcript_apply(report: &transcripts::Report) {
         output::human_bytes(report.bytes()),
     );
     for dir in report.dirs.iter().filter(|d| d.is_dead()) {
-        println!("  - {}", dir.path.display());
+        println!("  - {}", display_path(&dir.path));
         for target in &dir.deleted {
-            println!("      deleted {}", target.display());
+            println!("      deleted {}", display_path(target));
         }
         print_cleanup_note(dir);
     }

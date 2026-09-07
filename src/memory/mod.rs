@@ -1,10 +1,5 @@
 mod claude;
 mod codex;
-#[allow(
-    dead_code,
-    reason = "the item contract is consumed by the next memory diff slice"
-)]
-mod items;
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
@@ -16,6 +11,8 @@ use std::process::ExitCode;
 
 use crate::output;
 use crate::paths::Env;
+use crate::secrets;
+use crate::terminal;
 
 pub struct ShowOptions {
     pub path: PathBuf,
@@ -288,7 +285,7 @@ impl Source {
     ) -> std::io::Result<Self> {
         let metadata = fs::metadata(&path)?;
         Ok(Self {
-            id: format!("{}:{}", provider.as_str(), path.display()),
+            id: source_id(provider, &path),
             provider,
             role: spec.role,
             kind: spec.kind,
@@ -379,6 +376,43 @@ impl ProviderInventory {
             )),
         }
     }
+
+    /// Record a source whose provider trust/approval state prevents midden
+    /// from opening it. Avoiding `metadata` here is part of that boundary.
+    pub(super) fn push_uninspected(&mut self, path: PathBuf, spec: SourceSpec) {
+        self.push(Source {
+            id: source_id(self.provider, &path),
+            provider: self.provider,
+            role: spec.role,
+            kind: spec.kind,
+            scope: spec.scope,
+            load_state: spec.load_state,
+            association: spec.association,
+            path,
+            bytes: None,
+            inventory_order: 0,
+            detail: spec.detail,
+            human_detail: spec.human_detail,
+        });
+    }
+}
+
+fn source_id(provider: Provider, path: &Path) -> String {
+    if let Some(path) = path.to_str() {
+        return format!("{}:{path}", provider.as_str());
+    }
+    #[cfg(unix)]
+    {
+        use std::fmt::Write;
+        use std::os::unix::ffi::OsStrExt;
+        let mut encoded = String::new();
+        for byte in path.as_os_str().as_bytes() {
+            let _ = write!(encoded, "{byte:02x}");
+        }
+        format!("{}:path-bytes:{encoded}", provider.as_str())
+    }
+    #[cfg(not(unix))]
+    format!("{}:{}", provider.as_str(), path.display())
 }
 
 pub(super) struct DiscoveryRequest<'a> {
@@ -425,8 +459,11 @@ pub fn run_show(env: &Env, opts: ShowOptions) -> Result<ExitCode> {
         providers,
     };
     if opts.json {
-        let json = serde_json::to_string_pretty(&inventory)
-            .context("could not serialize memory inventory")?;
+        let mut value =
+            serde_json::to_value(&inventory).context("could not serialize memory inventory")?;
+        secrets::mask_sensitive_values(&mut value);
+        let json =
+            serde_json::to_string_pretty(&value).context("could not serialize memory inventory")?;
         println!("{json}");
     } else {
         emit_human(&inventory);
@@ -460,7 +497,7 @@ fn emit_human(inventory: &Inventory) {
     println!(
         "{} {}",
         "memory for".bold(),
-        inventory.target.display().to_string().bold()
+        display_path(&inventory.target).bold()
     );
 
     for provider in &inventory.providers {
@@ -503,11 +540,11 @@ fn emit_human(inventory: &Inventory) {
                     "    [{}; {}] {}{}",
                     source.scope.styled(),
                     source.load_state.styled(),
-                    source.path.display().to_string().bold(),
+                    display_path(&source.path).bold(),
                     bytes
                 );
                 if let Some(detail) = source.human_detail() {
-                    println!("      {}", detail.dimmed());
+                    println!("      {}", display_text(detail).dimmed());
                 }
             }
         }
@@ -516,15 +553,15 @@ fn emit_human(inventory: &Inventory) {
                 Some(path) => println!(
                     "  {} [{}] {}: {}",
                     "warning".yellow().bold(),
-                    warning.code.yellow(),
-                    path.display().to_string().bold(),
-                    warning.message
+                    terminal::escape(warning.code).yellow(),
+                    display_path(path).bold(),
+                    display_text(&warning.message)
                 ),
                 None => println!(
                     "  {} [{}] {}",
                     "warning".yellow().bold(),
-                    warning.code.yellow(),
-                    warning.message
+                    terminal::escape(warning.code).yellow(),
+                    display_text(&warning.message)
                 ),
             }
         }
@@ -559,6 +596,14 @@ fn emit_human(inventory: &Inventory) {
             );
         }
     }
+}
+
+fn display_text(value: &str) -> String {
+    terminal::escape(&secrets::mask_embedded(value))
+}
+
+fn display_path(path: &Path) -> String {
+    display_text(&path.display().to_string())
 }
 
 #[cfg(all(test, unix))]

@@ -1,8 +1,10 @@
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
+use globset::Glob;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
@@ -15,13 +17,19 @@ use crate::orphans;
 use crate::output;
 use crate::paths::{Env, ProjectPaths, managed_settings_files};
 use crate::process;
+use crate::safe_io;
 use crate::secrets;
+use crate::terminal;
 use crate::transcripts;
 
 const WORKTREE_STALE_AFTER: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const CLAUDE_JSON_BLOAT_THRESHOLD_KIB: usize = 512;
 const TRANSCRIPT_STORAGE_BLOAT_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
-const CREDENTIAL_DENY_HINTS: &[&str] = &[".env", "secrets"];
+const CREDENTIAL_TARGETS: &[(&str, &str)] = &[
+    (".env", ".env"),
+    (".env variants", ".env.local"),
+    ("secrets/**", "secrets/credential"),
+];
 
 pub struct Options {
     pub path: PathBuf,
@@ -101,7 +109,7 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     });
 
     if !opts.json {
-        emit_human(&findings);
+        emit_human(&findings, opts.show_secrets);
     }
 
     // Apply before emitting JSON so `fix_applied` reflects whether a mutation
@@ -114,7 +122,7 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     };
 
     if opts.json {
-        emit_json(&findings, fix_applied);
+        emit_json(&findings, fix_applied, opts.show_secrets);
     }
 
     let exit = if findings.iter().any(|f| f.severity == Severity::Error) {
@@ -133,7 +141,7 @@ fn severity_rank(s: Severity) -> u8 {
     }
 }
 
-fn emit_human(findings: &[Finding]) {
+fn emit_human(findings: &[Finding], show_secrets: bool) {
     if findings.is_empty() {
         println!("{} no findings", "clean.".green().bold());
         return;
@@ -150,14 +158,22 @@ fn emit_human(findings: &[Finding]) {
         } else {
             String::new()
         };
-        println!("{tag} [{}] {}{auto}", f.id, f.message);
+        println!(
+            "{tag} [{}] {}{auto}",
+            f.id,
+            display_text(&f.message, show_secrets)
+        );
         let loc = match &f.location.key_path {
-            Some(k) => format!("  at {}:{}", f.location.file.display(), k),
-            None => format!("  at {}", f.location.file.display()),
+            Some(k) => format!(
+                "  at {}:{}",
+                display_path(&f.location.file, show_secrets),
+                display_text(k, show_secrets)
+            ),
+            None => format!("  at {}", display_path(&f.location.file, show_secrets)),
         };
         println!("{}", loc.dimmed());
         if let Some(fix) = &f.suggested_fix {
-            println!("  {} {fix}", "fix:".green());
+            println!("  {} {}", "fix:".green(), display_text(fix, show_secrets));
         }
         println!();
     }
@@ -181,12 +197,28 @@ fn emit_human(findings: &[Finding]) {
     );
 }
 
-fn emit_json(findings: &[Finding], fix: bool) {
-    let v = json!({
+fn emit_json(findings: &[Finding], fix: bool, show_secrets: bool) {
+    let mut v = json!({
         "findings": findings,
         "fix_applied": fix,
     });
+    if !show_secrets {
+        secrets::mask_sensitive_values(&mut v);
+    }
     println!("{}", serde_json::to_string_pretty(&v).expect("serialize"));
+}
+
+fn display_text(value: &str, show_secrets: bool) -> String {
+    let value = if show_secrets {
+        value.to_string()
+    } else {
+        secrets::mask_free_text(value)
+    };
+    terminal::escape(&value)
+}
+
+fn display_path(path: &Path, show_secrets: bool) -> String {
+    display_text(&path.display().to_string(), show_secrets)
 }
 
 /// Apply the auto-fixable findings. Returns whether the config was actually
@@ -596,20 +628,25 @@ fn scan_committed_secret_file(
             return Ok(());
         }
     }
-    // A file git explicitly ignores is not "committed" — flagging it as an
-    // Error (and exiting 1) is a false positive for the common pattern of
-    // gitignoring .claude/ wholesale. When git can't tell (not a repo, no
-    // git), fall through and flag it, as before. settings.local.json is
-    // covered separately by check_local_settings_in_git.
     let rel = file.strip_prefix(&project.root).unwrap_or(file);
-    if git::is_ignored(&project.root, rel) == Some(true) {
+    let Some(exposure) = secret_exposure(&project.root, rel) else {
         return Ok(());
-    }
+    };
     let name = file
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let raw = std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
+    let raw = match safe_io::read_to_string(file, safe_io::MAX_CONFIG_BYTES) {
+        Ok(raw) => raw,
+        Err(error) => {
+            push_inaccessible(
+                out,
+                file.to_path_buf(),
+                format!("could not read {}: {error}", file.display()),
+            );
+            return Ok(());
+        }
+    };
     let value: Value = match serde_json::from_str(&raw) {
         Ok(value) => value,
         Err(e) => {
@@ -631,14 +668,15 @@ fn scan_committed_secret_file(
             });
             if secrets::value_looks_sensitive(&raw) {
                 out.push(Finding {
-                    id: "secret-in-malformed-config",
-                    severity: Severity::Error,
+                    id: exposure.malformed_id(),
+                    severity: exposure.severity(),
                     location: Location {
                         file: file.to_path_buf(),
                         key_path: None,
                     },
                     message: format!(
-                        "possible token-shaped secret in malformed committed {name}; inspect manually"
+                        "possible token-shaped secret in malformed {} {name}; inspect manually",
+                        exposure.label()
                     ),
                     suggested_fix: Some(
                         "remove the credential, repair the JSON, and re-run `midden doctor`".into(),
@@ -655,7 +693,7 @@ fn scan_committed_secret_file(
     for (key_path, raw_value) in hits {
         // A pure `${VAR}` reference resolves at load time and commits nothing
         // — it's the very fix we recommend, so don't flag it.
-        if is_env_expansion(&raw_value) {
+        if secrets::is_env_expansion(&raw_value) {
             continue;
         }
         let displayed = if show_secrets {
@@ -664,13 +702,16 @@ fn scan_committed_secret_file(
             secrets::masked_for_display(&raw_value)
         };
         out.push(Finding {
-            id,
-            severity: Severity::Error,
+            id: exposure.finding_id(id),
+            severity: exposure.severity(),
             location: Location {
                 file: file.to_path_buf(),
                 key_path: Some(key_path.clone()),
             },
-            message: format!("possible secret in committed {name}: {key_path} = {displayed}"),
+            message: format!(
+                "possible secret in {} {name}: {key_path} = {displayed}",
+                exposure.label()
+            ),
             suggested_fix: Some(suggested_fix(&key_path)),
             auto_fixable: false,
         });
@@ -678,13 +719,59 @@ fn scan_committed_secret_file(
     Ok(())
 }
 
-/// Whether a string is purely a `${VAR}` environment reference. A
-/// `${VAR:-default}` ships whatever the default holds, so it is still scanned.
-fn is_env_expansion(s: &str) -> bool {
-    let Some(inner) = s.strip_prefix("${").and_then(|r| r.strip_suffix('}')) else {
-        return false;
-    };
-    !inner.is_empty() && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+#[derive(Clone, Copy)]
+enum SecretExposure {
+    Committed,
+    Unignored,
+    Unknown,
+}
+
+impl SecretExposure {
+    fn severity(self) -> Severity {
+        match self {
+            Self::Committed => Severity::Error,
+            Self::Unignored | Self::Unknown => Severity::Warn,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Committed => "committed",
+            Self::Unignored => "untracked, non-ignored",
+            Self::Unknown => "git-unverifiable",
+        }
+    }
+
+    fn finding_id(self, committed_id: &'static str) -> &'static str {
+        match (self, committed_id) {
+            (Self::Committed, id) => id,
+            (Self::Unignored, "secret-in-committed-settings") => "secret-in-unignored-settings",
+            (Self::Unignored, _) => "secret-in-unignored-mcp",
+            (Self::Unknown, "secret-in-committed-settings") => {
+                "secret-exposure-unverifiable-settings"
+            }
+            (Self::Unknown, _) => "secret-exposure-unverifiable-mcp",
+        }
+    }
+
+    fn malformed_id(self) -> &'static str {
+        match self {
+            Self::Committed => "secret-in-malformed-config",
+            Self::Unignored => "secret-in-malformed-unignored-config",
+            Self::Unknown => "secret-in-malformed-unverifiable-config",
+        }
+    }
+}
+
+fn secret_exposure(root: &Path, relative: &Path) -> Option<SecretExposure> {
+    if git::is_ignored(root, relative) == Some(true) {
+        return None;
+    }
+    match git::is_tracked(root, relative) {
+        Some(true) => Some(SecretExposure::Committed),
+        Some(false) => Some(SecretExposure::Unignored),
+        None => Some(SecretExposure::Unknown),
+    }
 }
 
 fn walk_for_secrets(value: &Value, path: &str, out: &mut Vec<(String, String)>) {
@@ -696,9 +783,11 @@ fn walk_for_secrets(value: &Value, path: &str, out: &mut Vec<(String, String)>) 
                 } else {
                     format!("{path}.{k}")
                 };
-                if secrets::key_looks_sensitive(k) {
-                    // The whole subtree under a sensitive key is suspect —
-                    // including bare strings in arrays, which carry no key.
+                if secrets::key_expects_secret_value(k) {
+                    // Generic authentication/session objects still recurse
+                    // normally; the narrower predicate here means this key
+                    // specifically names credential material, so every string
+                    // in its value is suspect.
                     collect_secret_strings(v, &new_path, out);
                 } else {
                     walk_for_secrets(v, &new_path, out);
@@ -706,8 +795,28 @@ fn walk_for_secrets(value: &Value, path: &str, out: &mut Vec<(String, String)>) 
             }
         }
         Value::Array(arr) => {
+            let mut paired = HashSet::new();
+            for (index, pair) in arr.windows(2).enumerate() {
+                let Some(argument) = pair[0].as_str() else {
+                    continue;
+                };
+                let Some(raw_value) = pair[1].as_str() else {
+                    continue;
+                };
+                if secrets::argument_expects_secret(argument)
+                    && !secrets::is_env_expansion(raw_value)
+                {
+                    out.push((
+                        format!("{path}[{}] (value for {argument})", index + 1),
+                        raw_value.to_string(),
+                    ));
+                    paired.insert(index + 1);
+                }
+            }
             for (i, v) in arr.iter().enumerate() {
-                walk_for_secrets(v, &format!("{path}[{i}]"), out);
+                if !paired.contains(&i) {
+                    walk_for_secrets(v, &format!("{path}[{i}]"), out);
+                }
             }
         }
         // Content-shaped detection: a token under an innocent key — an `args`
@@ -790,12 +899,14 @@ fn check_credential_deny_rules(
     env: &Env,
     out: &mut Vec<Finding>,
 ) -> Result<()> {
-    let merged_deny = merged_deny_rules(project, env)?;
-    let lower: Vec<String> = merged_deny.iter().map(|s| s.to_ascii_lowercase()).collect();
+    let merged_deny = merged_deny_rules(project, env, out);
     let mut missing = Vec::new();
-    for hint in CREDENTIAL_DENY_HINTS {
-        if !lower.iter().any(|s| s.contains(hint)) {
-            missing.push(*hint);
+    for (label, representative) in CREDENTIAL_TARGETS {
+        if !merged_deny
+            .iter()
+            .any(|rule| read_deny_covers(rule, representative))
+        {
+            missing.push(*label);
         }
     }
     if missing.is_empty() {
@@ -820,6 +931,29 @@ fn check_credential_deny_rules(
         auto_fixable: false,
     });
     Ok(())
+}
+
+fn read_deny_covers(rule: &str, representative: &str) -> bool {
+    let Some(pattern) = rule
+        .strip_prefix("Read(")
+        .and_then(|value| value.strip_suffix(')'))
+    else {
+        return false;
+    };
+    // Claude interprets one leading slash relative to the project root and
+    // two leading slashes relative to the filesystem root. Representatives
+    // here are project-relative, so only the former can cover them.
+    if pattern.starts_with("//") || pattern.starts_with("~/") {
+        return false;
+    }
+    let pattern = pattern
+        .strip_prefix("./")
+        .or_else(|| pattern.strip_prefix('/'))
+        .unwrap_or(pattern);
+    Glob::new(pattern)
+        .ok()
+        .map(|glob| glob.compile_matcher().is_match(representative))
+        .unwrap_or(false)
 }
 
 fn recommend_deny_location(project: &ProjectPaths, env: &Env) -> (PathBuf, String) {
@@ -848,7 +982,11 @@ fn recommend_deny_location(project: &ProjectPaths, env: &Env) -> (PathBuf, Strin
     }
 }
 
-fn merged_deny_rules(project: &ProjectPaths, env: &Env) -> Result<Vec<String>> {
+fn merged_deny_rules(
+    project: &ProjectPaths,
+    env: &Env,
+    findings: &mut Vec<Finding>,
+) -> Vec<String> {
     let mut out = Vec::new();
     // Managed scope can carry the org-wide deny rules; ignoring it produced
     // false missing-credential-deny findings on MDM-managed machines.
@@ -859,8 +997,7 @@ fn merged_deny_rules(project: &ProjectPaths, env: &Env) -> Result<Vec<String>> {
     ];
     paths.extend(managed_settings_files());
     for path in paths {
-        if let Ok(text) = std::fs::read_to_string(&path)
-            && let Ok(v) = serde_json::from_str::<Value>(&text)
+        if let Some(v) = read_optional_json_for_audit(&path, findings)
             && let Some(deny) = v.pointer("/permissions/deny").and_then(Value::as_array)
         {
             for d in deny {
@@ -870,7 +1007,7 @@ fn merged_deny_rules(project: &ProjectPaths, env: &Env) -> Result<Vec<String>> {
             }
         }
     }
-    Ok(out)
+    out
 }
 
 fn check_dead_skill_command_agent_refs(
@@ -951,7 +1088,7 @@ fn check_dead_skill_command_agent_refs(
             if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("md") {
                 continue;
             }
-            let text = match std::fs::read_to_string(path) {
+            let text = match safe_io::read_to_string(path, safe_io::MAX_INSTRUCTION_BYTES) {
                 Ok(text) => text,
                 Err(e) => {
                     push_inaccessible(
@@ -1025,13 +1162,7 @@ fn check_disabled_mcp_servers(
     }
     // Project and managed scopes live in their own files.
     for path in [project.mcp_json(), project.managed_mcp_json()] {
-        if !path.exists() {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        let Some(v) = read_optional_json_for_audit(&path, out) else {
             continue;
         };
         scan_mcp_servers(&v, &path, "", out);
@@ -1122,12 +1253,10 @@ fn is_plaintext_remote_url(url: &str) -> bool {
     let host = host.to_ascii_lowercase();
     // localhost and *.localhost are loopback by RFC 6761; 0.0.0.0 and [::]
     // are bindable only on this machine.
-    !(host == "localhost"
-        || host.ends_with(".localhost")
-        || host.starts_with("127.")
-        || host == "::1"
-        || host == "::"
-        || host == "0.0.0.0")
+    let local_ip = host
+        .parse::<IpAddr>()
+        .is_ok_and(|address| address.is_loopback() || address.is_unspecified());
+    !(host == "localhost" || host.ends_with(".localhost") || local_ip)
 }
 
 /// `.mcp.json` servers are approved or rejected per project via the
@@ -1148,8 +1277,7 @@ fn check_mcpjson_approvals(
     };
     let mut defined: HashSet<String> = HashSet::new();
     for path in [project.mcp_json(), project.managed_mcp_json()] {
-        if let Ok(text) = std::fs::read_to_string(&path)
-            && let Ok(v) = serde_json::from_str::<Value>(&text)
+        if let Some(v) = read_optional_json_for_audit(&path, out)
             && let Some(servers) = v.get("mcpServers").and_then(Value::as_object)
         {
             defined.extend(servers.keys().cloned());
@@ -1192,6 +1320,46 @@ fn check_mcpjson_approvals(
                     auto_fixable: false,
                 });
             }
+        }
+    }
+}
+
+fn read_optional_json_for_audit(path: &Path, out: &mut Vec<Finding>) -> Option<Value> {
+    let raw = match safe_io::read_to_string(path, safe_io::MAX_CONFIG_BYTES) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            if !out.iter().any(|finding| {
+                finding.id == "config-path-inaccessible" && finding.location.file == path
+            }) {
+                push_inaccessible(
+                    out,
+                    path.to_path_buf(),
+                    format!("could not read {}: {error}", path.display()),
+                );
+            }
+            return None;
+        }
+    };
+    match serde_json::from_str(&raw) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            if !out.iter().any(|finding| {
+                finding.id == "malformed-json-config" && finding.location.file == path
+            }) {
+                out.push(Finding {
+                    id: "malformed-json-config",
+                    severity: Severity::Warn,
+                    location: Location {
+                        file: path.to_path_buf(),
+                        key_path: None,
+                    },
+                    message: format!("{} is not valid JSON: {error}", path.display()),
+                    suggested_fix: Some("fix the JSON syntax and re-run `midden doctor`".into()),
+                    auto_fixable: false,
+                });
+            }
+            None
         }
     }
 }
@@ -1252,6 +1420,7 @@ mod tests {
         // A hostname that merely starts like "localhost" is still remote.
         assert!(is_plaintext_remote_url("http://localhost.evil.example"));
         assert!(is_plaintext_remote_url("http://notlocalhost"));
+        assert!(is_plaintext_remote_url("http://127.attacker.example"));
 
         // Empty url (stdio server), other schemes — not plaintext HTTP.
         assert!(!is_plaintext_remote_url(""));
@@ -1372,15 +1541,15 @@ mod tests {
 
     #[test]
     fn env_expansion_detection() {
-        assert!(is_env_expansion("${API_KEY}"));
-        assert!(is_env_expansion("${a1_b2}"));
+        assert!(secrets::is_env_expansion("${API_KEY}"));
+        assert!(secrets::is_env_expansion("${a1_b2}"));
         assert!(
-            !is_env_expansion("${API_KEY:-sk-default}"),
+            !secrets::is_env_expansion("${API_KEY:-sk-default}"),
             "defaults ship content"
         );
-        assert!(!is_env_expansion("sk-real-value"));
-        assert!(!is_env_expansion("${}"));
-        assert!(!is_env_expansion("prefix ${API_KEY}"));
+        assert!(!secrets::is_env_expansion("sk-real-value"));
+        assert!(!secrets::is_env_expansion("${}"));
+        assert!(!secrets::is_env_expansion("prefix ${API_KEY}"));
     }
 
     #[test]
