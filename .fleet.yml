@@ -13,7 +13,7 @@ params:
       group: "github-actions"
       directory: "/"
   link-check:
-    targets: "--config lychee.toml README.md"
+    targets: "--config lychee.toml README.md SECURITY.md"
     build-site: false
     authenticated-github: true
     schedule: "0 14 * * 1"
