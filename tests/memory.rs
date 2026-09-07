@@ -1628,3 +1628,90 @@ fn all_includes_unrecognized_codex_memory_sources() {
         );
     }
 }
+
+#[test]
+fn nested_memory_index_names_are_on_demand_topics() {
+    let (fx, _, claude_memory) = paired_fixture();
+    let nested = claude_memory.join("archive/MEMORY.md");
+    write(&nested, "# Archived topic\n");
+    let output = fx
+        .cmd()
+        .args(["--json", "memory", "show"])
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let nested_source = source(provider(&report, "claude"), &nested);
+    assert_eq!(nested_source["kind"], "memory-topic");
+    assert_eq!(nested_source["load_state"], "unknown");
+    assert!(
+        !nested_source["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("startup index")
+    );
+}
+
+#[test]
+fn unreadable_import_content_has_unknown_load_state() {
+    let (fx, _, _) = paired_fixture();
+    let imported = fx.root.path().join("imported.md");
+    std::fs::write(&imported, [0xff]).unwrap();
+    write(fx.root.path().join("CLAUDE.md"), "@imported.md\n");
+    let output = fx
+        .cmd()
+        .args(["--json", "memory", "show"])
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let claude = provider(&report, "claude");
+    assert_eq!(source(claude, &imported)["load_state"], "unknown");
+    assert!(
+        claude["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning["code"] == "source-inaccessible")
+    );
+}
+
+#[test]
+fn incomplete_transcript_metadata_cannot_associate_memory() {
+    let (fx, _, claude_memory) = paired_fixture();
+    fx.write_transcript_line(
+        "paired-project",
+        "unknown.jsonl",
+        "{\"type\":\"summary\"}\n",
+    );
+    let output = fx
+        .cmd()
+        .args(["--json", "memory", "show"])
+        .arg(fx.root.path())
+        .arg("--all")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        source(
+            provider(&report, "claude"),
+            &claude_memory.join("MEMORY.md")
+        )["association"],
+        "unknown"
+    );
+}

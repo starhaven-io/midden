@@ -285,15 +285,17 @@ pub(crate) fn project_cwds(path: &Path, limit: usize) -> Result<(Vec<PathBuf>, b
         }
     }
     jsonl_files.sort();
-    let truncated = entry_limit_reached || jsonl_files.len() > limit;
+    let mut incomplete = entry_limit_reached || jsonl_files.len() > limit;
     jsonl_files.truncate(limit);
     let mut cwds = BTreeSet::new();
     for jsonl in &jsonl_files {
         if let Some(cwd) = cwd_from_jsonl(jsonl)? {
             cwds.insert(PathBuf::from(cwd));
+        } else {
+            incomplete = true;
         }
     }
-    Ok((cwds.into_iter().collect(), truncated))
+    Ok((cwds.into_iter().collect(), incomplete))
 }
 
 fn inspect_dir(path: &Path) -> Result<DirReport> {
@@ -309,7 +311,7 @@ fn inspect_dir(path: &Path) -> Result<DirReport> {
             Ok(Some(cwd)) => {
                 cwds.insert(cwd);
             }
-            Ok(None) => {}
+            Ok(None) => return Ok(skipped_with_storage(path, "no-cwd", storage_bytes)),
             Err(_) => {
                 return Ok(skipped_with_storage(
                     path,
@@ -704,14 +706,20 @@ fn delete_dir_artifacts(
             )?;
         }
         match artifact.kind {
-            ArtifactKind::File => {
-                unlinkat(&quarantine, artifact_name, AtFlags::empty())
-                    .map_err(std::io::Error::from)?;
-            }
+            ArtifactKind::File => unlinkat(&quarantine, artifact_name, AtFlags::empty())
+                .map_err(std::io::Error::from)
+                .map_err(anyhow::Error::from),
             ArtifactKind::Directory => {
-                remove_directory_at(&quarantine, artifact_name, Some(artifact.identity))?;
+                remove_directory_at(&quarantine, artifact_name, Some(artifact.identity))
             }
         }
+        .with_context(|| {
+            format!(
+                "deletion stopped for {}; inspect remaining data in {} before moving or removing it",
+                artifact.path.display(),
+                report.path.join(&quarantine_name).display()
+            )
+        })?;
         report.deleted.push(artifact.path);
     }
     if !anchored_remaining_names(&quarantine)?.is_empty() {

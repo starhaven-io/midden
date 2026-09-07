@@ -41,8 +41,7 @@ time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
 [lints.rust]
-# The single sanctioned unsafe block (SIGPIPE reset in main.rs) carries an
-# #[expect]; anything new fails the build until explicitly justified.
+# Unsafe operations require an explicit, documented lint exception.
 unsafe_code = "deny"
 
 [target.'cfg(unix)'.dependencies]

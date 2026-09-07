@@ -1001,3 +1001,29 @@ fn transcripts_apply_deletes_exactly_reported_set() {
     assert_eq!(applied_json["backup"], json!(null));
     assert!(fx.backup_paths().is_empty());
 }
+
+#[test]
+fn mixed_known_and_unknown_transcript_metadata_is_preserved() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), standard_extras());
+    let known = fx.write_transcript("mixed", "/missing/project");
+    let unknown = fx.write_transcript_line("mixed", "unknown.jsonl", "{\"type\":\"summary\"}\n");
+    let artifacts = fx.session_artifact_dir("mixed");
+    for apply in [false, true] {
+        let mut command = fx.cmd();
+        command.args(["--json", "prune", "--transcripts", "--force"]);
+        if apply {
+            command.arg("--apply");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["transcripts"]["dirs"][0]["status"], "skipped");
+        assert_eq!(report["transcripts"]["dirs"][0]["reason"], "no-cwd");
+        assert!(known.exists() && unknown.exists() && artifacts.exists());
+    }
+}

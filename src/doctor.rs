@@ -15,7 +15,7 @@ use crate::claude_json::{self, ClaudeJson};
 use crate::git;
 use crate::orphans;
 use crate::output;
-use crate::paths::{Env, ProjectPaths, managed_settings_files};
+use crate::paths::{Env, ProjectPaths, managed_settings_files, serialize_path};
 use crate::process;
 use crate::safe_io;
 use crate::secrets;
@@ -49,6 +49,7 @@ pub enum Severity {
 
 #[derive(Debug, Serialize)]
 pub struct Location {
+    #[serde(serialize_with = "serialize_path")]
     pub file: PathBuf,
     /// Dotted JSON path inside `file`, when applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -79,12 +80,13 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     let project = ProjectPaths::new(root);
     let mut findings = Vec::new();
 
-    // Read the user-scope ~/.claude.json once; three checks consult it. A parse
-    // error aborts the run (exit 2), as it did when the first check loaded it.
-    let claude_json = if env.claude_json.exists() {
-        Some(ClaudeJson::load(&env.claude_json)?)
-    } else {
-        None
+    // Share one state snapshot across checks; parse errors abort with exit 2.
+    let claude_json = match std::fs::metadata(&env.claude_json) {
+        Ok(_) => Some(ClaudeJson::load(&env.claude_json)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {}", env.claude_json.display()));
+        }
     };
 
     check_orphaned_projects(env, claude_json.as_ref(), &mut findings);
@@ -288,7 +290,10 @@ fn apply_fixes(env: &Env, findings: &[Finding], opts: &Options) -> Result<bool> 
     claude_json::write_atomic(&env.claude_json, &new_raw)?;
     if !opts.json {
         println!("pruned {removed} orphaned project entries.");
-        println!("backed up to {}", backup_path.display());
+        println!(
+            "backed up to {}",
+            display_path(&backup_path, opts.show_secrets)
+        );
     }
     Ok(true)
 }
@@ -478,12 +483,10 @@ fn largest_top_level_keys(data: &Value, n: usize) -> Vec<(String, usize)> {
 
 fn check_stale_worktrees(project: &ProjectPaths, out: &mut Vec<Finding>) -> Result<()> {
     let dir = project.worktrees_dir();
-    if !dir.is_dir() {
-        return Ok(());
-    }
     let now = SystemTime::now();
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => {
             push_inaccessible(out, dir, format!("could not read worktrees directory: {e}"));
             return Ok(());
@@ -502,7 +505,7 @@ fn check_stale_worktrees(project: &ProjectPaths, out: &mut Vec<Finding>) -> Resu
             }
         };
         let path = entry.path();
-        if !path.is_dir() {
+        if !audit_metadata(&path, out).is_some_and(|metadata| metadata.is_dir()) {
             continue;
         }
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -537,7 +540,7 @@ fn check_stale_worktrees(project: &ProjectPaths, out: &mut Vec<Finding>) -> Resu
             },
             message: format!("worktree {name} has been idle for {days} days"),
             suggested_fix: Some(format!(
-                "inspect for uncommitted work, then `rm -rf {}`",
+                "inspect {} for uncommitted work before removing this directory",
                 path.display()
             )),
             auto_fixable: false,
@@ -995,7 +998,15 @@ fn merged_deny_rules(
         project.settings(),
         project.local_settings(),
     ];
-    paths.extend(managed_settings_files());
+    let managed = managed_settings_files();
+    for (path, error) in managed.errors {
+        push_inaccessible(
+            findings,
+            path,
+            format!("could not inspect managed settings: {error}"),
+        );
+    }
+    paths.extend(managed.paths);
     for path in paths {
         if let Some(v) = read_optional_json_for_audit(&path, findings)
             && let Some(deny) = v.pointer("/permissions/deny").and_then(Value::as_array)
@@ -1010,6 +1021,17 @@ fn merged_deny_rules(
     out
 }
 
+fn audit_metadata(path: &Path, findings: &mut Vec<Finding>) -> Option<std::fs::Metadata> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            push_inaccessible(findings, path.to_path_buf(), error.to_string());
+            None
+        }
+    }
+}
+
 fn check_dead_skill_command_agent_refs(
     project: &ProjectPaths,
     env: &Env,
@@ -1020,11 +1042,9 @@ fn check_dead_skill_command_agent_refs(
         ("user skill", env.user_skills_dir()),
         ("project skill", project.skills_dir()),
     ] {
-        if !dir.is_dir() {
-            continue;
-        }
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 push_inaccessible(out, dir.clone(), format!("could not read {label} dir: {e}"));
                 continue;
@@ -1043,10 +1063,19 @@ fn check_dead_skill_command_agent_refs(
                 }
             };
             let path = entry.path();
-            if !path.is_dir() {
+            if !audit_metadata(&path, out).is_some_and(|metadata| metadata.is_dir()) {
                 continue;
             }
-            if !path.join("SKILL.md").is_file() {
+            let required = path.join("SKILL.md");
+            let missing = match std::fs::metadata(&required) {
+                Ok(metadata) => !metadata.is_file(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(error) => {
+                    push_inaccessible(out, required, error.to_string());
+                    continue;
+                }
+            };
+            if missing {
                 out.push(Finding {
                     id: "skill-missing-skill-md",
                     severity: Severity::Warn,
@@ -1076,16 +1105,29 @@ fn check_dead_skill_command_agent_refs(
         ("user agent", env.user_agents_dir(), true),
         ("project agent", project.agents_dir(), true),
     ] {
-        if !dir.is_dir() {
+        let Some(metadata) = audit_metadata(&dir, out) else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            push_inaccessible(out, dir, "expected a directory".into());
             continue;
         }
-        for entry in WalkDir::new(&dir)
-            .max_depth(3)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
+        for entry in WalkDir::new(&dir).max_depth(3) {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    push_inaccessible(
+                        out,
+                        error.path().unwrap_or(&dir).to_path_buf(),
+                        error.to_string(),
+                    );
+                    continue;
+                }
+            };
             let path = entry.path();
-            if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("md") {
+            if path.extension().and_then(|e| e.to_str()) != Some("md")
+                || !audit_metadata(path, out).is_some_and(|metadata| metadata.is_file())
+            {
                 continue;
             }
             let text = match safe_io::read_to_string(path, safe_io::MAX_INSTRUCTION_BYTES) {
@@ -1621,5 +1663,24 @@ mod tests {
     fn largest_top_level_keys_empty_on_non_object() {
         let v: Value = serde_json::from_str(r#""just a string""#).unwrap();
         assert!(largest_top_level_keys(&v, 3).is_empty());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn finding_serialization_accepts_non_unicode_paths() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"project-\xff".to_vec()));
+        let finding = Finding {
+            id: "empty-config-file",
+            severity: Severity::Warn,
+            location: Location {
+                file: path.clone(),
+                key_path: None,
+            },
+            message: "empty instruction".into(),
+            suggested_fix: None,
+            auto_fixable: false,
+        };
+        let value = serde_json::to_value(&finding).unwrap();
+        assert_eq!(value["location"]["file"], path.display().to_string());
     }
 }

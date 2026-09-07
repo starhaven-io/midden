@@ -619,12 +619,9 @@ fn argument_value_ranges(s: &str) -> Vec<(usize, usize)> {
         {
             let next = &s[next_start..next_end];
             let leading = next.len() - next.trim_start_matches(['\'', '"']).len();
-            let trailing = next.len() - next.trim_end_matches(['\'', '"']).len();
-            let unquoted = &next[leading..next.len().saturating_sub(trailing)];
-            if !is_env_expansion(unquoted)
-                && next_start + leading < next_end.saturating_sub(trailing)
-            {
-                ranges.push((next_start + leading, next_end - trailing));
+            let unquoted = next.trim_matches(['\'', '"']);
+            if !unquoted.is_empty() && !is_env_expansion(unquoted) {
+                ranges.push((next_start + leading, next_start + leading + unquoted.len()));
             }
         }
     }
@@ -1017,5 +1014,15 @@ mod tests {
             ),
             "cmd --token ${SERVICE_TOKEN} --auth oauth --credentials-file=/tmp/key.json"
         );
+    }
+    #[test]
+    fn empty_quoted_secret_arguments_preserve_command_text() {
+        for input in [
+            "cmd --token '' --mode safe",
+            "cmd --password \"\"",
+            "cmd --token '",
+        ] {
+            assert_eq!(mask_embedded(input), input);
+        }
     }
 }

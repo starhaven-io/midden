@@ -1,4 +1,5 @@
 import importlib.util
+import re
 import unittest
 from pathlib import Path
 
@@ -21,6 +22,15 @@ class CiPathRoutingTests(unittest.TestCase):
         self.assertNotIn(
             "| python3 scripts/ci-path-routing.py", workflow
         )
+
+    def test_dependency_policy_jobs_use_the_same_cargo_deny_version(self) -> None:
+        versions = []
+        for name in ("ci.yml", "cargo-deny.yml"):
+            workflow = WORKFLOW.with_name(name).read_text()
+            pins = re.findall(r"cargo install cargo-deny --locked --version ([0-9.]+)", workflow)
+            self.assertEqual(len(pins), 1, f"expected one cargo-deny pin in {name}")
+            versions.append(pins[0])
+        self.assertEqual(versions[0], versions[1])
 
     def test_repository_cargo_config_runs_the_full_matrix(self) -> None:
         for path in (".cargo/config", ".cargo/config.toml"):

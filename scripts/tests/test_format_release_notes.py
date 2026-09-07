@@ -23,8 +23,10 @@ class ReleaseNotesTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(sections["What's New"], ["replace the output schema"])
-        self.assertEqual(sections["Fixes"], ["reject ambiguous input"])
+        self.assertEqual(
+            sections["Breaking Changes"],
+            ["replace the output schema", "reject ambiguous input"],
+        )
         self.assertEqual(sections["Documentation"], ["explain migration"])
         self.assertEqual(changelog, "https://example.test/compare/v1...v2")
 
@@ -35,6 +37,15 @@ class ReleaseNotesTests(unittest.TestCase):
         )
 
         self.assertEqual(sections, {})
+
+    def test_breaking_internal_changes_are_preserved_and_rendered_first(self) -> None:
+        sections, _ = FORMATTER.parse_notes(
+            "* build!: raise the minimum supported compiler\n"
+            "* fix: repair a thing\n"
+        )
+        rendered = FORMATTER.format_markdown("v2.0.0", sections, None)
+        self.assertIn("raise the minimum supported compiler", rendered)
+        self.assertLess(rendered.index("Breaking Changes"), rendered.index("Fixes"))
 
     def test_uncategorized_entries_are_preserved(self) -> None:
         sections, _ = FORMATTER.parse_notes(

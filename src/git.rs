@@ -49,8 +49,17 @@ fn git_path(root: &Path, args: &[&str]) -> Option<PathBuf> {
     if !output.status.success() {
         return None;
     }
-    let value = String::from_utf8(output.stdout).ok()?;
-    let path = PathBuf::from(value.trim());
+    let mut bytes = output.stdout;
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(std::ffi::OsString::from_vec(bytes))
+    };
+    #[cfg(not(unix))]
+    let path = PathBuf::from(String::from_utf8(bytes).ok()?);
     let absolute = if path.is_absolute() {
         path
     } else {
@@ -74,12 +83,17 @@ mod tests {
     use super::*;
 
     fn git(dir: &Path, args: &[&str]) {
-        Command::new("git")
+        let output = Command::new("git")
             .arg("-C")
             .arg(dir)
             .args(args)
             .output()
             .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -125,6 +139,35 @@ mod tests {
         assert_eq!(
             repository_identity(dir.path()),
             dir.path().join(".git").canonicalize().ok()
+        );
+    }
+    #[test]
+    fn repository_paths_preserve_trailing_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project ");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "--quiet"]);
+        assert_eq!(repository_root(&root), root.canonicalize().ok());
+        assert_eq!(
+            repository_identity(&root),
+            root.join(".git").canonicalize().ok()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repository_paths_preserve_non_unicode_names() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"project-\xff".to_vec()));
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "--quiet"]);
+        assert_eq!(repository_root(&root), root.canonicalize().ok());
+        assert_eq!(
+            repository_identity(&root),
+            root.join(".git").canonicalize().ok()
         );
     }
 }
