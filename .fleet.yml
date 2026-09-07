@@ -2,6 +2,7 @@ schema: 1
 visibility: "public"
 license: "agpl"
 params:
+  codecov: true
   renovate: true
   dependabot:
     - package-ecosystem: "cargo"
