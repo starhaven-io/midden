@@ -576,24 +576,6 @@ fn promote_imported_instruction(
     true
 }
 
-fn collect_imports(
-    inventory: &mut ProviderInventory,
-    source: &Path,
-    context: InstructionContext<'_>,
-    depth: usize,
-    imported: &mut BTreeSet<PathBuf>,
-) {
-    let Ok(raw) = safe_io::read_to_string(source, safe_io::MAX_INSTRUCTION_BYTES) else {
-        inventory.warnings.push(Warning::at(
-            "source-inaccessible",
-            "could not read instruction imports",
-            source.to_path_buf(),
-        ));
-        return;
-    };
-    collect_imports_from_raw(inventory, source, context, depth, imported, &raw);
-}
-
 fn collect_imports_from_raw(
     inventory: &mut ProviderInventory,
     source: &Path,
@@ -680,17 +662,32 @@ fn collect_imports_from_raw(
             ));
             continue;
         }
+        let raw = safe_io::read_to_string(&path, safe_io::MAX_INSTRUCTION_BYTES);
+        let load_state = if raw.is_ok() {
+            LoadState::Loaded
+        } else {
+            LoadState::Unknown
+        };
         let detail = format!("imported by {}", source.display());
         let spec = SourceSpec::new(
             SourceRole::Authority,
             SourceKind::ImportedInstruction,
             context.scope,
-            LoadState::Loaded,
+            load_state,
             context.association,
         )
         .with_detail(detail);
         inventory.push_path(identity, spec);
-        collect_imports(inventory, &path, context, depth + 1, imported);
+        match raw {
+            Ok(raw) => {
+                collect_imports_from_raw(inventory, &path, context, depth + 1, imported, &raw);
+            }
+            Err(error) => inventory.warnings.push(Warning::at(
+                "source-inaccessible",
+                format!("could not read imported instruction: {error}"),
+                path,
+            )),
+        }
     }
 }
 
@@ -991,35 +988,34 @@ fn collect_default_memory_dirs(
     }
 
     for directory in directories {
-        let (cwds, sampled) = match transcripts::project_cwds(&directory, MAX_PROJECT_TRANSCRIPTS) {
-            Ok(result) => result,
-            Err(error) => {
-                inventory.warnings.push(Warning::at(
-                    "claude-project-association-unavailable",
-                    error.to_string(),
-                    directory,
-                ));
-                continue;
-            }
-        };
+        let (cwds, incomplete) =
+            match transcripts::project_cwds(&directory, MAX_PROJECT_TRANSCRIPTS) {
+                Ok(result) => result,
+                Err(error) => {
+                    inventory.warnings.push(Warning::at(
+                        "claude-project-association-unavailable",
+                        error.to_string(),
+                        directory,
+                    ));
+                    continue;
+                }
+            };
         let complete_association = classify_cwds(
             repository_root,
             target_identity.as_deref(),
             &cwds,
             &mut identity_cache,
         );
-        let association = if sampled {
+        let association = if incomplete {
             Association::Unknown
         } else {
             complete_association
         };
         if association != Association::Target && !request.include_unassociated {
-            let (code, message) = if sampled {
+            let (code, message) = if incomplete {
                 (
                     "claude-memory-association-incomplete",
-                    format!(
-                        "only the first {MAX_PROJECT_TRANSCRIPTS} transcripts were sampled, so target association is unknown; rerun with --all"
-                    ),
+                    "transcript cwd evidence is incomplete (missing metadata or scan limit), so target association is unknown; rerun with --all".to_string(),
                 )
             } else {
                 (
@@ -1032,8 +1028,8 @@ fn collect_default_memory_dirs(
                 .push(Warning::at(code, message, directory.join("memory")));
             continue;
         }
-        let detail = cwd_detail(&cwds, sampled);
-        let human_detail = human_cwd_detail(repository_root, association, &cwds, sampled);
+        let detail = cwd_detail(&cwds, incomplete);
+        let human_detail = human_cwd_detail(repository_root, association, &cwds, incomplete);
         collect_memory_dir(
             inventory,
             &directory.join("memory"),
@@ -1089,21 +1085,19 @@ fn same_repository(
     Some(candidate_identity.as_deref()? == target_identity)
 }
 
-fn cwd_detail(cwds: &[PathBuf], sampled: bool) -> Option<String> {
-    labeled_cwd_detail(cwds, sampled, "associated")
+fn cwd_detail(cwds: &[PathBuf], incomplete: bool) -> Option<String> {
+    labeled_cwd_detail(cwds, incomplete, "associated")
 }
 
-fn labeled_cwd_detail(cwds: &[PathBuf], sampled: bool, label: &str) -> Option<String> {
+fn labeled_cwd_detail(cwds: &[PathBuf], incomplete: bool, label: &str) -> Option<String> {
     let first = cwds.first()?;
     let mut detail = if cwds.len() == 1 {
         format!("{label} cwd: {}", first.display())
     } else {
         format!("{} {label} cwds; first: {}", cwds.len(), first.display())
     };
-    if sampled {
-        detail.push_str(&format!(
-            "; sampled first {MAX_PROJECT_TRANSCRIPTS} transcripts"
-        ));
+    if incomplete {
+        detail.push_str("; incomplete transcript evidence");
     }
     Some(detail)
 }
@@ -1112,7 +1106,7 @@ fn human_cwd_detail(
     target_root: &Path,
     association: Association,
     cwds: &[PathBuf],
-    sampled: bool,
+    incomplete: bool,
 ) -> Option<String> {
     // "associated" would overclaim for a dir whose cwd evidence could not be
     // matched to the target; label the unresolved case as evidence instead.
@@ -1121,13 +1115,13 @@ fn human_cwd_detail(
     } else {
         "associated"
     };
-    let detail = labeled_cwd_detail(cwds, sampled, label).or_else(|| {
+    let detail = labeled_cwd_detail(cwds, incomplete, label).or_else(|| {
         (association == Association::Unknown)
             .then(|| "association unknown: no transcript cwd evidence".to_string())
     })?;
     let repeats_target = association == Association::Target
         && cwds.len() == 1
-        && !sampled
+        && !incomplete
         && same_path(&cwds[0], target_root);
     (!repeats_target).then_some(detail)
 }
@@ -1194,7 +1188,7 @@ fn collect_memory_dir(
     let human_detail_anchor = context.human_directory_detail.as_ref().and_then(|_| {
         files
             .iter()
-            .find(|path| path.file_name().and_then(|name| name.to_str()) == Some("MEMORY.md"))
+            .find(|path| **path == directory.join("MEMORY.md"))
             .or_else(|| {
                 files.iter().find(|path| {
                     path.extension().and_then(|extension| extension.to_str()) == Some("md")
@@ -1209,7 +1203,7 @@ fn collect_memory_dir(
         if !is_markdown && !context.include_unknown {
             continue;
         }
-        let is_index = path.file_name().and_then(|name| name.to_str()) == Some("MEMORY.md");
+        let is_index = path == directory.join("MEMORY.md");
         let is_human_detail_anchor = human_detail_anchor.as_ref() == Some(&path);
         let (role, kind, load_state, detail, human_detail) = if is_index {
             let (enabled_state, load_detail) = memory_index_state(&path, inventory);
@@ -1574,7 +1568,7 @@ mod tests {
                 true,
             )
             .unwrap()
-            .contains("sampled first 16 transcripts")
+            .contains("incomplete transcript evidence")
         );
     }
 }

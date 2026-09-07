@@ -638,8 +638,7 @@ jobs:
           else
             NEEDED=true
           fi
-          BRANCH_VERSION="${VERSION//[^A-Za-z0-9._-]/-}"
-          BRANCH="bump-midden-${BRANCH_VERSION}-${GITHUB_RUN_ID}"
+          BRANCH="bump-midden-${VERSION}"
           {
             echo "needed=${NEEDED}"
             echo "base_sha=${BASE_SHA}"
@@ -713,6 +712,10 @@ jobs:
         run: |
           TAP_REPO="starhaven-io/homebrew-tap"
           BOT_USER="${APP_SLUG}[bot]"
+          BOT_ID=$(gh api "users/${BOT_USER}" --jq .id)
+          [[ "${BOT_ID}" =~ ^[0-9]+$ ]]
+          BOT_EMAIL="${BOT_ID}+${BOT_USER}@users.noreply.github.com"
+          COMMIT_MESSAGE=$(printf 'midden %s\n\nSigned-off-by: %s <%s>' "${VERSION}" "${BOT_USER}" "${BOT_EMAIL}")
           api_status() {
             curl --silent --show-error --retry 3 \
               --header "Accept: application/vnd.github+json" \
@@ -742,10 +745,12 @@ jobs:
             '{base_tree: $base, tree: [{path: "Casks/midden.rb", mode: "100644", type: "blob", sha: $blob}]}' \
             | gh api --method POST "repos/${TAP_REPO}/git/trees" --input - --jq .sha)
           COMMIT_SHA=$(jq -n \
-            --arg message "midden ${VERSION}" \
+            --arg message "${COMMIT_MESSAGE}" \
+            --arg name "${BOT_USER}" --arg email "${BOT_EMAIL}" \
             --arg tree "${TREE_SHA}" \
             --arg parent "${BASE_SHA}" \
-            '{message: $message, tree: $tree, parents: [$parent]}' \
+            '{message: $message, tree: $tree, parents: [$parent],
+              author: {name: $name, email: $email}, committer: {name: $name, email: $email}}' \
             | gh api --method POST "repos/${TAP_REPO}/git/commits" --input - --jq .sha)
 
           REF_STATUS=$(api_status "${API_URL}/repos/${TAP_REPO}/git/ref/heads/${BRANCH}" branch-ref.json)
@@ -756,9 +761,12 @@ jobs:
               jq -e \
                 --arg tree "${TREE_SHA}" \
                 --arg parent "${BASE_SHA}" \
-                --arg message "midden ${VERSION}" \
+                --arg message "${COMMIT_MESSAGE}" \
+                --arg name "${BOT_USER}" --arg email "${BOT_EMAIL}" \
                 '.tree.sha == $tree
                   and .message == $message
+                  and .author.name == $name and .author.email == $email
+                  and .committer.name == $name and .committer.email == $email
                   and (.parents | length) == 1
                   and .parents[0].sha == $parent' branch-commit.json >/dev/null
               COMMIT_SHA="${EXISTING_SHA}"

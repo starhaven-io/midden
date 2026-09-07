@@ -1,4 +1,9 @@
+import json
+import os
 import re
+import subprocess
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -83,6 +88,62 @@ class ReleaseWorkflowTests(unittest.TestCase):
                     invocation.search(block),
                     f"run block {index} calls shell function {name!r} defined only elsewhere",
                 )
+
+    def test_generated_cask_branch_and_commit_match_publisher_policy(self) -> None:
+        preparation = job(self.source, "prepare-cask-bump")
+        branch_line = re.search(r'(?m)^\s*BRANCH="[^"\n]+"$', preparation)
+        self.assertIsNotNone(branch_line)
+        write = job(self.source, "write-cask-bump")
+        block = next(block for block in run_blocks(write) if "COMMIT_SHA=$(jq" in block)
+        # Execute the actual payload builder with a local API fixture. No network or ref writes.
+        builder = textwrap.dedent(block).split("REF_STATUS=", 1)[0]
+        stub = r"""
+        # The job uses GNU base64; normalize the fixture on macOS without changing job code.
+        base64() {
+          test "$1" = -w && test "$2" = 0
+          command base64 < "$3" | tr -d '\n'
+        }
+        gh() {
+          case "$*" in
+            'api users/starhaven-bot[bot] --jq .id') printf '12345' ;;
+            'api repos/starhaven-io/homebrew-tap --jq .default_branch') printf 'main' ;;
+            'api repos/starhaven-io/homebrew-tap/git/ref/heads/main --jq .object.sha') printf 'base' ;;
+            'api repos/starhaven-io/homebrew-tap/git/commits/base --jq .tree.sha') printf 'base-tree' ;;
+            *'/git/blobs --input - --jq .sha') cat > blob.json; printf 'blob' ;;
+            *'/git/trees --input - --jq .sha') cat > tree.json; printf 'tree' ;;
+            *'/git/commits --input - --jq .sha') cat > commit.json; printf 'commit' ;;
+            *) printf 'Unexpected fixture API call: %s\n' "$*" >&2; return 1 ;;
+          esac
+        }
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "cask-plan").mkdir()
+            (path / "cask-plan/candidate-cask.rb").write_text('cask "midden" do\nend\n')
+            environment = {
+                **os.environ, "APP_SLUG": "starhaven-bot", "VERSION": "1.2.3", "BASE_SHA": "base",
+                "BASE_BRANCH": "main",
+            }
+            subprocess.run(["bash", "-euo", "pipefail", "-c", stub + builder], cwd=path, env=environment, check=True)
+            commit = json.loads((path / "commit.json").read_text())
+            branch = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", branch_line.group() + '\nprintf "%s" "$BRANCH"'],
+                env=environment, check=True, capture_output=True, text=True,
+            ).stdout
+        self.assertEqual(branch, "bump-midden-1.2.3")
+        self.assertEqual(commit["tree"], "tree")
+        self.assertEqual(commit["parents"], ["base"])
+        self.assertEqual(commit["author"], {
+            "name": "starhaven-bot[bot]", "email": "12345+starhaven-bot[bot]@users.noreply.github.com",
+        })
+        self.assertEqual(commit["committer"], commit["author"])
+        trailers = subprocess.run(
+            ["git", "interpret-trailers", "--parse"], input=commit["message"], text=True,
+            check=True, capture_output=True,
+        ).stdout
+        self.assertEqual(trailers.strip(), f'Signed-off-by: {commit["author"]["name"]} <{commit["author"]["email"]}>')
+        self.assertIn("and .author.name == $name and .author.email == $email", write)
+        self.assertIn("and .committer.name == $name and .committer.email == $email", write)
 
     def test_cask_validation_is_unprivileged_and_head_bound(self) -> None:
         preparation = job(self.source, "prepare-cask-bump")

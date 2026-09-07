@@ -4,13 +4,13 @@ mod codex;
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use colored::{ColoredString, Colorize};
-use serde::{Serialize, Serializer};
+use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::output;
-use crate::paths::Env;
+use crate::paths::{Env, serialize_optional_path, serialize_path};
 use crate::secrets;
 use crate::terminal;
 
@@ -469,28 +469,6 @@ pub fn run_show(env: &Env, opts: ShowOptions) -> Result<ExitCode> {
         emit_human(&inventory);
     }
     Ok(ExitCode::SUCCESS)
-}
-
-// JSON strings require Unicode while Unix paths do not. Match the CLI's human
-// rendering instead of letting one byte-oriented path abort the whole report.
-fn serialize_path<S>(path: &Path, serializer: S) -> std::result::Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    serializer.serialize_str(&path.display().to_string())
-}
-
-fn serialize_optional_path<S>(
-    path: &Option<PathBuf>,
-    serializer: S,
-) -> std::result::Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    match path {
-        Some(path) => serializer.serialize_some(&path.display().to_string()),
-        None => serializer.serialize_none(),
-    }
 }
 
 fn emit_human(inventory: &Inventory) {

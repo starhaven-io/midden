@@ -4,11 +4,11 @@ midden is a Rust CLI for resolving, auditing, visualizing, and cleaning the cont
 
 ## Project overview
 
-- **Language:** Rust, 2024 edition, MSRV 1.95.
-- **Platforms:** macOS and Linux. Windows is out of scope for v0 (a `cfg(windows)` branch may exist but is untested/unsupported).
+- **Language:** Rust; edition and minimum supported version are declared in `Cargo.toml`.
+- **Platforms:** macOS and Linux. Windows is unsupported; conditional portability code does not establish Windows support.
 - **License:** AGPL-3.0-only.
 - **Binary:** one CLI; subcommands `memory show`, `prune`, `doctor`, `show`, plus `completions` for shell completion.
-- **Deps:** clap/clap_complete, serde/serde_json (with `preserve_order`), walkdir, colored, anyhow, time, sysinfo. Error handling is anyhow throughout — there are no `thiserror` types.
+- **Dependencies:** `Cargo.toml` is authoritative. Preserve JSON key order and use anyhow for contextual errors.
 
 ## Project-specific notes
 
@@ -16,14 +16,14 @@ midden is a Rust CLI for resolving, auditing, visualizing, and cleaning the cont
 
 - `memory show [PATH] [--provider all|codex|claude] [--all]` — inventory Codex and Claude Code instructions, retained memory, and evidence stores through one normalized read-only schema while preserving provider-native loading behavior. The default provider is `all`; `--all` includes unrelated and unassociated sources.
 - `prune [--apply] [--transcripts] [--worktrees-only] [--force]` — GC dead `projects` entries from `~/.claude.json`. Dry-run by default; removes only entries whose directory is provably absent. `--transcripts` additionally cleans orphaned session artifacts under `~/.claude/projects/` by deriving cwd from JSONL heads, never from lossy slugs. `--apply` backs up then writes `.claude.json`; transcript deletion deliberately does not create backups. `--worktrees-only` restricts to `.claude/worktrees/` paths; `--force` overrides the write gates.
-- `doctor [PATH] [--fix] [--force] [--show-secrets]` — emit structured `Finding { id, severity, location, message, suggested_fix, auto_fixable }`. `--fix` applies the `auto_fixable` findings under the same backup + atomic-write discipline as prune (today only `orphaned-project` is auto-fixable). See the README for the full check list.
+- `doctor [PATH] [--fix] [--force] [--show-secrets]` — emit structured `Finding { id, severity, location, message, suggested_fix, auto_fixable }`. `--fix` applies the `auto_fixable` findings under the same backup + atomic-write discipline as prune (only `orphaned-project` is auto-fixable). See the README for the full check list.
 - `show [PATH] [--show-secrets]` — resolve every config surface for a directory with provenance: settings (with shadow/merge tags), every contributing `CLAUDE.md`, skills, commands, subagents, hooks, MCP servers (user/local/project/managed — local being the per-project `mcpServers` map inside `~/.claude.json`), worktrees.
 
-Global flags: `--json` (machine output; disables color), `--color auto|always|never`, `--config <PATH>` (override `~/.claude.json`), `--claude-home <PATH>` (override `~/.claude`), `--codex-home <PATH>` (override `$CODEX_HOME` / `~/.codex`). The three override flags exist for testing — integration tests point them at fixture dirs.
+Global flags: `--json` (machine output; disables color), `--color auto|always|never`, `--config <PATH>` (override `~/.claude.json`), `--claude-home <PATH>` (override `~/.claude`), `--codex-home <PATH>` (override `$CODEX_HOME` / `~/.codex`). Path overrides support relocated state and isolated integration fixtures.
 
 ### Gotchas
 
-- `~/.claude.json` is the central, live file Claude Code rewrites constantly — the highest-stakes thing midden touches. All mutations go through backup → atomic write → the running-claude gate.
+- `~/.claude.json` is the central, live file Claude Code rewrites constantly — the highest-stakes thing midden touches. All mutations go through write gates → backup → atomic write.
 - Orphan detection is existence-only (`fs::metadata`): only `NotFound` / `NotADirectory` (or an existing non-directory) count as provably absent — any other stat failure (permission denied, I/O error, dead mount) means "can't tell" and the entry is kept. "Not visible on this host" ≠ "dead", which is why the mass-deletion gate also exists.
 - `git.rs` shells out; treat `None` as "can't tell" (not a repo / no git), never as "false".
 - Integration tests isolate `HOME`, `XDG_CONFIG_HOME`, and `GIT_CONFIG_NOSYSTEM` so a developer's global gitignore can't sway doctor's git checks — preserve that in `tests/common/mod.rs`.
@@ -36,7 +36,7 @@ Global flags: `--json` (machine output; disables color), `--color auto|always|ne
 
 Dependency automation is split. `.github/dependabot.yml` is fleet-rendered and owns Cargo manifests and GitHub Actions. `renovate.json` extends the shared preset at a pinned `local>starhaven-io/.github:renovate-config#<fleet-release>` reference and owns what no Dependabot ecosystem covers: the `rust-toolchain.toml` channel and the `cargo install <tool> --locked --version <version>` pins in `ci.yml` and `cargo-deny.yml`.
 
-Two things need a human. The `cargo-deny` pins in `ci.yml` and `cargo-deny.yml` stay in lockstep only because Renovate puts both occurrences of one crate on a single branch; nothing enforces it, so a pull request touching one file alone means they have drifted. And with the dependency dashboard off, a quiet week and a broken integration look the same — confirm liveness in Mend's run log, not the pull request list.
+Keep the `cargo-deny` pins in `ci.yml` and `cargo-deny.yml` aligned; script tests enforce equality and Renovate groups their updates. Confirm hosted dependency automation liveness in Mend's run log when investigating missing updates; the pull request list alone cannot distinguish inactivity from failure.
 
 Never drop the `#<fleet-release>` tag or point the reference at a branch: an unpinned preset lets hub `main` change dependency behavior here with no review. Moving the pin is a pull request in this repository, and validation does not resolve the reference, so a green `renovate-config-validator` run says nothing about whether the tag exists or contains the preset.
 
@@ -49,14 +49,16 @@ Never drop the `#<fleet-release>` tag or point the reference at a branch: an unp
 - `orphans.rs` — orphan detection (shared by prune + doctor) and `looks_like_wrong_host` (the mass-deletion heuristic).
 - `transcripts.rs` — transcript cwd derivation and artifact cleanup under `~/.claude/projects/`; deletes only `*.jsonl` and UUID session dirs, never `memory/`.
 - `claude_json.rs` — read/render `~/.claude.json` (order-preserving) and `write_atomic`.
-- `paths.rs` — user/project/managed path helpers. `managed_settings_paths()` are hardcoded system paths (not overridable — so managed-scope file discovery isn't reachable from integration tests yet).
+- `paths.rs` — user/project/managed path helpers and JSON path presentation. Managed system paths are deliberately not overridable; discovery is tested with local unit fixtures.
 - `backup.rs` — timestamped sibling copy taken before any write.
 - `process.rs` — detect a running `claude` process for the write gate.
 - `secrets.rs` — sensitive-key detection (`key_looks_sensitive`) and masking (`mask`, `mask_value`).
-- `git.rs` — `is_tracked` / `is_ignored` via the `git` CLI; both return `None` when git is unavailable or the path isn't in a repo.
-- `output.rs` — KiB formatting.
+- `git.rs` — tracked/ignored checks and repository/common-directory identities via Git; unresolved queries return `None`.
+- `memory/` — provider-neutral inventory and provider-specific discovery.
+- `safe_io.rs` — bounded regular-file reads.
+- `output.rs` / `terminal.rs` — size formatting and safe terminal presentation.
 
-Tests: `tests/{prune,doctor,show}.rs` (integration, via `assert_cmd`) + `tests/common/mod.rs` (the `Fixture` helper) + `#[cfg(test)]` unit modules in `src/`.
+Tests: command integration tests in `tests/`, shared fixtures in `tests/common/mod.rs`, unit modules in `src/`, and release/CI contract tests in `scripts/tests/`. Preserve paired Codex/Claude fixtures and exercise commands through their public CLI when checking output behavior.
 
 ### Settings precedence (the `show` model)
 
@@ -66,7 +68,7 @@ There is **no** "command-line args" settings scope — the `Scope` enum is exact
 
 ### CLAUDE.md handling
 
-CLAUDE.md does **not** follow settings precedence. All applicable files load simultaneously; midden does a no-precedence merge and runs a heuristic contradiction-detection pass instead of picking a winner. The one ordering exception: `CLAUDE.local.md` loads after `CLAUDE.md` in the same directory.
+CLAUDE.md does **not** follow settings precedence. Applicable files within the provider size limit load together; midden does a no-precedence merge and runs a heuristic contradiction-detection pass instead of picking a winner. The one ordering exception: `CLAUDE.local.md` loads after `CLAUDE.md` in the same directory.
 
 ## Safety / do-not-touch rules
 
@@ -87,12 +89,14 @@ CLAUDE.md does **not** follow settings precedence. All applicable files load sim
 stable toolchain. Homebrew's standalone Rust does not honor that file, so verify
 `rustc --version` matches its `channel` before running the required checks.
 
+Script contract tests execute local shell/JSON payload builders and require Python 3, Bash, Git, and `jq`. They mock API calls and do not publish.
+
 `just` recipes (raw command in parens):
 - `just build` / `just test` (`cargo build --locked` / `cargo test --locked`)
 - `just clippy` — `cargo clippy --locked --all-targets -- -D warnings` (zero warnings required)
 - `just fmt` / `just fmt-check` — rustfmt, 2024 style edition (`rustfmt.toml`)
 - `just typos`, `just deny` (`cargo deny check`), `just lychee`, `just audit` (zizmor)
-- `just check` — run everything; skips tools that aren't installed
+- `just check` — run all local checks, including script tests; missing tools make the gate fail.
 - Errors: anyhow throughout (`Result`, `.with_context`, `bail!`). Flat modules.
   Comments explain *why*, not *what*.
 

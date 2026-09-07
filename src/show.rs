@@ -2,13 +2,13 @@ use anyhow::{Context, Result, bail};
 use colored::Colorize;
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use walkdir::WalkDir;
 
 use crate::claude_json;
-use crate::paths::{Env, ProjectPaths, managed_settings_files};
+use crate::paths::{Env, ProjectPaths, managed_settings_files, serialize_path};
 use crate::safe_io;
 use crate::secrets;
 use crate::terminal;
@@ -42,6 +42,7 @@ impl Scope {
 #[derive(Debug, Serialize)]
 struct Contribution {
     scope: Scope,
+    #[serde(serialize_with = "serialize_path")]
     file: PathBuf,
     value: Value,
     /// For scalars: true if a higher scope shadows this. For arrays this is
@@ -80,13 +81,23 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
         // dump so they aren't shown twice as opaque JSON blobs.
         .filter(|r| !r.key.starts_with("hooks."))
         .collect();
-    let mut claude_mds = collect_claude_md(&project, env);
-    let contradictions = detect_contradictions(&mut claude_mds);
-    let skills = collect_dirs(&[env.user_skills_dir(), project.skills_dir()], "SKILL.md");
-    let commands = collect_files(&[env.user_commands_dir(), project.commands_dir()]);
-    let agents = collect_files(&[env.user_agents_dir(), project.agents_dir()]);
+    let mut claude_mds = collect_claude_md(&project, env, opts.show_secrets);
+    let (contradictions, contradictions_truncated) = detect_contradictions(&mut claude_mds);
+    let skills = collect_dirs(
+        &[env.user_skills_dir(), project.skills_dir()],
+        "SKILL.md",
+        opts.show_secrets,
+    );
+    let commands = collect_files(
+        &[env.user_commands_dir(), project.commands_dir()],
+        opts.show_secrets,
+    );
+    let agents = collect_files(
+        &[env.user_agents_dir(), project.agents_dir()],
+        opts.show_secrets,
+    );
     let mut mcp_servers = collect_mcp_servers(env, &project)?;
-    let worktrees = collect_worktrees(&project);
+    let worktrees = collect_worktrees(&project, opts.show_secrets);
 
     let mut resolved = resolved;
     if !opts.show_secrets {
@@ -108,6 +119,7 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
         // credentials (Bearer headers, user:pass URLs, token query params).
         for h in &mut hooks {
             h.command = secrets::mask_embedded(&h.command);
+            mask_definition(&mut h.definition);
         }
         for s in &mut mcp_servers {
             if let Some(command) = &mut s.command {
@@ -116,7 +128,7 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
             if let Some(url) = &mut s.url {
                 *url = secrets::mask_embedded(url);
             }
-            secrets::mask_tree(&mut s.definition);
+            mask_definition(&mut s.definition);
         }
     }
 
@@ -125,6 +137,7 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
         resolved,
         claude_mds,
         contradictions,
+        contradictions_truncated,
         skills,
         commands,
         agents,
@@ -142,8 +155,19 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn mask_definition(definition: &mut Value) {
+    if let Some(Value::String(command)) = definition.get_mut("command") {
+        *command = secrets::mask_embedded(command);
+    }
+    secrets::mask_tree(definition);
+}
+
 fn read_json(path: &Path) -> Result<Option<Value>> {
-    let text = match safe_io::read_to_string(path, safe_io::MAX_CONFIG_BYTES) {
+    read_json_with_limit(path, safe_io::MAX_CONFIG_BYTES)
+}
+
+fn read_json_with_limit(path: &Path, limit: usize) -> Result<Option<Value>> {
+    let text = match safe_io::read_to_string(path, limit) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
@@ -169,11 +193,17 @@ pub(crate) fn settings_sources(
         (Scope::Project, project.settings()),
         (Scope::Local, project.local_settings()),
     ];
-    candidates.extend(
-        managed_settings_files()
+    let managed = managed_settings_files();
+    errors.extend(
+        managed
+            .errors
             .into_iter()
-            .map(|path| (Scope::Managed, path)),
+            .map(|(path, error)| SettingsReadError {
+                path,
+                message: error.to_string(),
+            }),
     );
+    candidates.extend(managed.paths.into_iter().map(|path| (Scope::Managed, path)));
     for (scope, path) in candidates {
         match read_json(&path) {
             Ok(Some(value)) => sources.push((scope, path, value)),
@@ -294,6 +324,7 @@ fn path_looks_sensitive(dotted: &str) -> bool {
 
 #[derive(Debug, Serialize)]
 struct ClaudeMd {
+    #[serde(serialize_with = "serialize_path")]
     file: PathBuf,
     scope: ClaudeMdScope,
     bytes: u64,
@@ -319,10 +350,10 @@ enum ClaudeMdScope {
     Ancestor,
 }
 
-fn collect_claude_md(project: &ProjectPaths, env: &Env) -> Vec<ClaudeMd> {
+fn collect_claude_md(project: &ProjectPaths, env: &Env, show_secrets: bool) -> Vec<ClaudeMd> {
     let mut out = Vec::new();
     let user = env.user_claude_md();
-    if let Ok(m) = std::fs::metadata(&user)
+    if let Some(m) = source_metadata(&user, show_secrets)
         && m.is_file()
     {
         let (load_state, detail) = claude_md_initial_state(m.len());
@@ -350,7 +381,7 @@ fn collect_claude_md(project: &ProjectPaths, env: &Env) -> Vec<ClaudeMd> {
             ("CLAUDE.local.md", ClaudeMdScope::Local),
         ] {
             let p = current.join(name);
-            if let Ok(m) = std::fs::metadata(&p)
+            if let Some(m) = source_metadata(&p, show_secrets)
                 && m.is_file()
             {
                 let (load_state, detail) = claude_md_initial_state(m.len());
@@ -409,21 +440,24 @@ fn is_vendored_dir(path: &Path) -> bool {
 
 #[derive(Debug, Serialize)]
 struct Contradiction {
+    #[serde(serialize_with = "serialize_path")]
     a_file: PathBuf,
+    #[serde(serialize_with = "serialize_path")]
     b_file: PathBuf,
     a_line: String,
     b_line: String,
     keyword: String,
 }
 
-type Directive = (Polarity, String, String);
+type DirectivesByKeyword = BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)>;
+const MAX_CONTRADICTIONS: usize = 128;
 
 /// Heuristic CLAUDE.md contradiction detection. We look for imperative lines
 /// ("do X", "don't X", "never X", "always X") that share a content keyword
 /// across files and disagree on directive polarity. This is best-effort by
 /// design — false negatives are common, false positives kept low.
-fn detect_contradictions(files: &mut [ClaudeMd]) -> Vec<Contradiction> {
-    let mut lines_by_file: Vec<(PathBuf, Vec<Directive>)> = Vec::new();
+fn detect_contradictions(files: &mut [ClaudeMd]) -> (Vec<Contradiction>, bool) {
+    let mut lines_by_file: Vec<(PathBuf, DirectivesByKeyword)> = Vec::new();
     for f in files {
         let text = match safe_io::read_to_string(&f.file, safe_io::MAX_INSTRUCTION_BYTES) {
             Ok(text) => text,
@@ -441,10 +475,14 @@ fn detect_contradictions(files: &mut [ClaudeMd]) -> Vec<Contradiction> {
                 continue;
             }
         };
-        let mut entries = Vec::new();
+        let mut entries = DirectivesByKeyword::new();
         for line in text.lines() {
             if let Some((pol, kw, raw)) = parse_directive(line) {
-                entries.push((pol, kw, raw));
+                let (positive, negative) = entries.entry(kw).or_default();
+                match pol {
+                    Polarity::Do => positive.insert(raw),
+                    Polarity::Dont => negative.insert(raw),
+                };
             }
         }
         if !entries.is_empty() {
@@ -455,22 +493,30 @@ fn detect_contradictions(files: &mut [ClaudeMd]) -> Vec<Contradiction> {
     let mut out = Vec::new();
     for i in 0..lines_by_file.len() {
         for j in (i + 1)..lines_by_file.len() {
-            for (a_pol, a_kw, a_raw) in &lines_by_file[i].1 {
-                for (b_pol, b_kw, b_raw) in &lines_by_file[j].1 {
-                    if a_kw == b_kw && a_pol != b_pol {
-                        out.push(Contradiction {
-                            a_file: lines_by_file[i].0.clone(),
-                            b_file: lines_by_file[j].0.clone(),
-                            a_line: a_raw.clone(),
-                            b_line: b_raw.clone(),
-                            keyword: a_kw.clone(),
-                        });
+            for (keyword, (a_positive, a_negative)) in &lines_by_file[i].1 {
+                let Some((b_positive, b_negative)) = lines_by_file[j].1.get(keyword) else {
+                    continue;
+                };
+                for (a_lines, b_lines) in [(a_positive, b_negative), (a_negative, b_positive)] {
+                    for a_line in a_lines {
+                        for b_line in b_lines {
+                            if out.len() == MAX_CONTRADICTIONS {
+                                return (out, true);
+                            }
+                            out.push(Contradiction {
+                                a_file: lines_by_file[i].0.clone(),
+                                b_file: lines_by_file[j].0.clone(),
+                                a_line: a_line.clone(),
+                                b_line: b_line.clone(),
+                                keyword: keyword.clone(),
+                            });
+                        }
                     }
                 }
             }
         }
     }
-    out
+    (out, false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -480,8 +526,8 @@ enum Polarity {
 }
 
 /// Parse a single line for a coarse imperative directive. Returns `(polarity,
-/// content-keyword, original-line)`. The content-keyword is the first
-/// significant word after the polarity verb, lowercased.
+/// content-keyword, original-line)`. The content-keyword combines the first
+/// two significant words after the polarity verb, lowercased.
 fn parse_directive(line: &str) -> Option<(Polarity, String, String)> {
     let trimmed = line.trim_start_matches(['-', '*', '#', ' ', '\t']).trim();
     if trimmed.is_empty() {
@@ -531,24 +577,32 @@ const STOPWORDS: &[&str] = &[
 #[derive(Debug, Serialize)]
 struct LocatedDir {
     name: String,
+    #[serde(serialize_with = "serialize_path")]
     file: PathBuf,
     scope: &'static str,
 }
 
-fn collect_dirs(roots: &[PathBuf], required_file: &str) -> Vec<LocatedDir> {
+fn collect_dirs(roots: &[PathBuf], required_file: &str, show_secrets: bool) -> Vec<LocatedDir> {
     let mut out = Vec::new();
     for (i, root) in roots.iter().enumerate() {
         let scope = if i == 0 { "user" } else { "project" };
-        if !root.is_dir() {
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(root) else {
+        let Some(entries) = source_entries(root, show_secrets) else {
             continue;
         };
         let mut found: Vec<LocatedDir> = Vec::new();
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    warn_source(root, &error, show_secrets);
+                    continue;
+                }
+            };
             let path = entry.path();
-            if path.is_dir() && path.join(required_file).is_file() {
+            if source_metadata(&path, show_secrets).is_some_and(|metadata| metadata.is_dir())
+                && source_metadata(&path.join(required_file), show_secrets)
+                    .is_some_and(|metadata| metadata.is_file())
+            {
                 found.push(LocatedDir {
                     name: path
                         .file_name()
@@ -568,15 +622,20 @@ fn collect_dirs(roots: &[PathBuf], required_file: &str) -> Vec<LocatedDir> {
 #[derive(Debug, Serialize)]
 struct LocatedFile {
     name: String,
+    #[serde(serialize_with = "serialize_path")]
     file: PathBuf,
     scope: &'static str,
 }
 
-fn collect_files(roots: &[PathBuf]) -> Vec<LocatedFile> {
+fn collect_files(roots: &[PathBuf], show_secrets: bool) -> Vec<LocatedFile> {
     let mut out = Vec::new();
     for (i, root) in roots.iter().enumerate() {
         let scope = if i == 0 { "user" } else { "project" };
-        if !root.is_dir() {
+        let Some(metadata) = source_metadata(root, show_secrets) else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            warn_source(root, "expected a directory", show_secrets);
             continue;
         }
         let walker = WalkDir::new(root)
@@ -584,9 +643,18 @@ fn collect_files(roots: &[PathBuf]) -> Vec<LocatedFile> {
             .into_iter()
             .filter_entry(|e| !is_vendored_dir(e.path()));
         let mut found: Vec<LocatedFile> = Vec::new();
-        for entry in walker.filter_map(|e| e.ok()) {
+        for entry in walker {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    warn_source(error.path().unwrap_or(root), &error, show_secrets);
+                    continue;
+                }
+            };
             let p = entry.path();
-            if p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("md") {
+            if p.extension().and_then(|e| e.to_str()) == Some("md")
+                && source_metadata(p, show_secrets).is_some_and(|metadata| metadata.is_file())
+            {
                 found.push(LocatedFile {
                     name: p
                         .file_stem()
@@ -610,18 +678,21 @@ struct Hook {
     /// Tool matcher pattern. None when the matcher is omitted (all tools).
     #[serde(skip_serializing_if = "Option::is_none")]
     matcher: Option<String>,
-    /// Hook entry kind ("command", "script", etc.).
+    /// Handler type, including command, HTTP, MCP, prompt, and agent hooks.
     kind: String,
     /// The command/script body. Long values are kept full in JSON; the human
     /// presenter truncates.
     command: String,
+    /// Complete handler configuration, including non-command hook fields.
+    definition: Value,
     scope: Scope,
+    #[serde(serialize_with = "serialize_path")]
     file: PathBuf,
 }
 
 /// Pull every individual hook entry out of every settings source. Each
 /// `hooks.<EventName>` array contains matcher-groups, and each group's inner
-/// `hooks` array contains one or more concrete commands — we flatten the lot.
+/// `hooks` array contains one or more handlers.
 fn collect_hooks(sources: &[(Scope, PathBuf, Value)]) -> Vec<Hook> {
     let mut out = Vec::new();
     let mut seen_handlers: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -668,6 +739,7 @@ fn collect_hooks(sources: &[(Scope, PathBuf, Value)]) -> Vec<Hook> {
                         matcher: matcher.clone(),
                         kind,
                         command,
+                        definition: entry.clone(),
                         scope: *scope,
                         file: file.clone(),
                     });
@@ -683,6 +755,20 @@ fn collect_hooks(sources: &[(Scope, PathBuf, Value)]) -> Vec<Hook> {
             .then(a.file.cmp(&b.file))
     });
     out
+}
+
+fn hook_summary(hook: &Hook) -> String {
+    let field = match hook.kind.as_str() {
+        "command" => return hook.command.clone(),
+        "http" => "url",
+        "prompt" | "agent" => "prompt",
+        _ => return format_value(&hook.definition),
+    };
+    hook.definition
+        .get(field)
+        .and_then(Value::as_str)
+        .map(String::from)
+        .unwrap_or_else(|| format_value(&hook.definition))
 }
 
 fn hook_handler_identity(entry: &Value) -> String {
@@ -713,6 +799,7 @@ fn hook_handler_identity(entry: &Value) -> String {
 struct McpServer {
     name: String,
     scope: &'static str,
+    #[serde(serialize_with = "serialize_path")]
     file: PathBuf,
     command: Option<String>,
     url: Option<String>,
@@ -725,7 +812,7 @@ fn collect_mcp_servers(env: &Env, project: &ProjectPaths) -> Result<Vec<McpServe
     // User and local scope both live in ~/.claude.json: the top-level
     // `mcpServers` map is user scope; the per-project entry's `mcpServers` is
     // local scope — the default destination of `claude mcp add`.
-    if let Some(claude) = read_json(&env.claude_json)? {
+    if let Some(claude) = read_json_with_limit(&env.claude_json, safe_io::MAX_CLAUDE_JSON_BYTES)? {
         push_mcp_servers(claude.get("mcpServers"), "user", &env.claude_json, &mut out);
         let local = claude_json::project_entry(&claude, &project.root)
             .and_then(|entry| entry.get("mcpServers"));
@@ -770,43 +857,81 @@ fn push_mcp_servers(
 #[derive(Debug, Serialize)]
 struct Worktree {
     name: String,
+    #[serde(serialize_with = "serialize_path")]
     file: PathBuf,
 }
 
-fn collect_worktrees(project: &ProjectPaths) -> Vec<Worktree> {
+fn collect_worktrees(project: &ProjectPaths, show_secrets: bool) -> Vec<Worktree> {
     let dir = project.worktrees_dir();
-    if !dir.is_dir() {
+    let Some(entries) = source_entries(&dir, show_secrets) else {
         return Vec::new();
-    }
+    };
     let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_dir() {
-                out.push(Worktree {
-                    name: p
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                    file: p,
-                });
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                warn_source(&dir, &error, show_secrets);
+                continue;
             }
+        };
+        let path = entry.path();
+        if source_metadata(&path, show_secrets).is_some_and(|metadata| metadata.is_dir()) {
+            out.push(Worktree {
+                name: path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                file: path,
+            });
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
 
+fn warn_source(path: &Path, error: impl std::fmt::Display, show_secrets: bool) {
+    eprintln!(
+        "warning: could not inspect {}: {}",
+        display_path(path, show_secrets),
+        display_text(&error.to_string(), show_secrets)
+    );
+}
+
+fn source_metadata(path: &Path, show_secrets: bool) -> Option<std::fs::Metadata> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            warn_source(path, error, show_secrets);
+            None
+        }
+    }
+}
+
+fn source_entries(path: &Path, show_secrets: bool) -> Option<std::fs::ReadDir> {
+    match std::fs::read_dir(path) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            warn_source(path, error, show_secrets);
+            None
+        }
+    }
+}
+
 /// Everything `show` resolved for a target directory. Field order is the JSON
 /// emission order; `settings`/`claude_md` keep their original key names.
 #[derive(Serialize)]
 struct Report {
+    #[serde(serialize_with = "serialize_path")]
     root: PathBuf,
     #[serde(rename = "settings")]
     resolved: Vec<Resolved>,
     #[serde(rename = "claude_md")]
     claude_mds: Vec<ClaudeMd>,
     contradictions: Vec<Contradiction>,
+    contradictions_truncated: bool,
     skills: Vec<LocatedDir>,
     commands: Vec<LocatedFile>,
     agents: Vec<LocatedFile>,
@@ -823,6 +948,7 @@ fn emit_human(report: &Report, show_secrets: bool) {
         resolved,
         claude_mds,
         contradictions,
+        contradictions_truncated,
         skills,
         commands,
         agents,
@@ -912,6 +1038,9 @@ fn emit_human(report: &Report, show_secrets: bool) {
             );
         }
     }
+    if *contradictions_truncated {
+        println!("  additional contradictions omitted (limit: {MAX_CONTRADICTIONS})");
+    }
     println!();
 
     print_section(
@@ -952,7 +1081,7 @@ fn emit_human(report: &Report, show_secrets: bool) {
                 h.scope.label(),
                 display_text(matcher, show_secrets).cyan(),
                 display_text(&h.kind, show_secrets),
-                display_text(&truncate_oneline(&h.command, 80), show_secrets)
+                display_text(&truncate_oneline(&hook_summary(h), 80), show_secrets)
             );
             println!("      {}", display_path(&h.file, show_secrets).dimmed());
         }
@@ -1222,7 +1351,8 @@ mod tests {
                 detail: None,
             },
         ];
-        let c = detect_contradictions(&mut files);
+        let (c, truncated) = detect_contradictions(&mut files);
+        assert!(!truncated);
         assert_eq!(c.len(), 1, "polarity must differ: {c:?}");
         assert!(c[0].keyword.starts_with("use"));
     }
@@ -1250,7 +1380,8 @@ mod tests {
                 detail: None,
             },
         ];
-        let c = detect_contradictions(&mut files);
+        let (c, truncated) = detect_contradictions(&mut files);
+        assert!(!truncated);
         assert_eq!(c.len(), 1);
         assert!(c[0].keyword.starts_with("commit"));
     }
@@ -1272,7 +1403,7 @@ mod tests {
             Some(root.join(".claude.json")),
             Some(root.join(".claude-home")),
         );
-        let mds = collect_claude_md(&project, &env);
+        let mds = collect_claude_md(&project, &env, false);
         let paths: Vec<_> = mds.iter().map(|m| m.file.clone()).collect();
         assert!(
             paths
@@ -1300,7 +1431,7 @@ mod tests {
             Some(root.join(".claude.json")),
             Some(root.join(".claude-home")),
         );
-        let mds = collect_claude_md(&project, &env);
+        let mds = collect_claude_md(&project, &env, false);
         let paths: Vec<_> = mds.iter().map(|m| m.file.clone()).collect();
 
         assert!(paths.iter().any(|p| p == &root.join("CLAUDE.md")));
@@ -1372,29 +1503,38 @@ mod tests {
         assert!(truncated.ends_with('…'), "{truncated}");
         assert!(truncated.chars().count() <= 11);
     }
-
+    #[cfg(unix)]
     #[test]
-    fn hooks_filtered_out_of_settings_section() {
-        // The presenter drops `hooks.*` keys from the merged settings view so
-        // they don't appear twice. Exercised via the public `run` would be
-        // overkill — just confirm the filter predicate works as expected.
-        let entries = vec![
-            Resolved {
-                key: "permissions.defaultMode".into(),
-                effective: json!("ask"),
-                contributions: vec![],
-            },
-            Resolved {
-                key: "hooks.PreToolUse".into(),
-                effective: json!([]),
-                contributions: vec![],
-            },
-        ];
-        let filtered: Vec<_> = entries
-            .into_iter()
-            .filter(|r| !r.key.starts_with("hooks."))
-            .collect();
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].key, "permissions.defaultMode");
+    fn report_serialization_accepts_non_unicode_paths() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"project-\xff".to_vec()));
+        let report = Report {
+            root: path.clone(),
+            resolved: vec![Resolved {
+                key: "model".into(),
+                effective: json!("example"),
+                contributions: vec![Contribution {
+                    scope: Scope::Project,
+                    file: path.clone(),
+                    value: json!("example"),
+                    shadowed: false,
+                }],
+            }],
+            claude_mds: vec![],
+            contradictions: vec![],
+            contradictions_truncated: false,
+            skills: vec![],
+            commands: vec![],
+            agents: vec![],
+            hooks: vec![],
+            mcp_servers: vec![],
+            worktrees: vec![],
+        };
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["root"], path.display().to_string());
+        assert_eq!(
+            value["settings"][0]["contributions"][0]["file"],
+            path.display().to_string()
+        );
     }
 }

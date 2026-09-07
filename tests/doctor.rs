@@ -1194,3 +1194,113 @@ fn doctor_reports_only_stale_ephemeral_worktrees() {
             .contains(&stale.display().to_string())
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn json_doctor_accepts_non_unicode_finding_paths() {
+    use std::os::unix::ffi::OsStringExt;
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let root = fx
+        .root
+        .path()
+        .join(std::ffi::OsString::from_vec(b"project-\xff".to_vec()));
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir_all(root.join(".claude/agents")).unwrap();
+    std::fs::write(root.join(".claude/agents/empty.md"), "").unwrap();
+    let output = fx
+        .cmd()
+        .arg("--json")
+        .arg("doctor")
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "empty-config-file")
+    );
+}
+
+#[test]
+fn fix_uses_safe_backup_path_presentation() {
+    let mut fx = Fixture::new();
+    fx.config = fx
+        .config
+        .parent()
+        .unwrap()
+        .join("config\nwith-linebreak.json");
+    fx.write_config(json!({"/missing/project": {}}), json!({}));
+    let output = fx
+        .cmd()
+        .arg("doctor")
+        .arg(fx.root.path())
+        .args(["--fix", "--force"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(!text.contains("config\nwith-linebreak.json"));
+    assert!(text.contains("config\\nwith-linebreak.json.bak-"));
+    assert_eq!(fx.backup_paths().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn inaccessible_optional_inventory_is_reported_as_a_finding() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let blocked = fx.claude_home.join("agents/locked");
+    std::fs::create_dir_all(&blocked).unwrap();
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let output = fx
+        .cmd()
+        .args(["--json", "doctor"])
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| {
+                finding["id"] == "config-path-inaccessible"
+                    && finding["location"]["file"] == blocked.display().to_string()
+            })
+    );
+}
+
+#[test]
+fn inaccessible_central_state_is_not_treated_as_absent() {
+    let mut fx = Fixture::new();
+    let parent = fx.config.parent().unwrap().join("not-a-directory");
+    std::fs::write(&parent, "{}").unwrap();
+    fx.config = parent.join("config.json");
+    fx.cmd()
+        .arg("doctor")
+        .arg(fx.root.path())
+        .assert()
+        .code(2)
+        .stderr(contains("inspect"));
+}

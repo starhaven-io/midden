@@ -856,3 +856,242 @@ fn show_inventories_commands_agents_and_worktrees() {
     }
     assert!(!stdout.contains("hidden"), "stdout:\n{stdout}");
 }
+
+#[test]
+fn all_hook_kinds_retain_masked_definitions_and_useful_human_summaries() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let definitions = json!([
+        {"type": "command", "command": "echo check", "timeout": 30},
+        {"type": "http", "url": "https://example.com/check", "headers": {"Authorization": "Bearer example-private-value"}},
+        {"type": "prompt", "prompt": "Check the release summary"},
+        {"type": "agent", "prompt": "Review changed files"},
+        {"type": "mcp_tool", "server": "reviewer", "tool": "check", "input": {"token": "example-private-value"}}
+    ]);
+    write_json(
+        &fx.claude_home.join("settings.json"),
+        &json!({
+            "hooks": {"Stop": [{"hooks": definitions}]}
+        }),
+    );
+    let output = fx
+        .cmd()
+        .arg("--json")
+        .arg("show")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let hooks = report["hooks"].as_array().unwrap();
+    assert_eq!(hooks.len(), 5);
+    assert_eq!(hooks[0]["command"], "echo check");
+    assert_eq!(hooks[0]["definition"]["timeout"], 30);
+    assert_eq!(hooks[1]["definition"]["url"], "https://example.com/check");
+    assert_eq!(
+        hooks[2]["definition"]["prompt"],
+        "Check the release summary"
+    );
+    assert_eq!(hooks[3]["definition"]["prompt"], "Review changed files");
+    assert_eq!(hooks[4]["definition"]["tool"], "check");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("example-private-value"));
+    assert!(
+        !report["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["key"].as_str().unwrap().starts_with("hooks."))
+    );
+    fx.cmd()
+        .arg("show")
+        .arg(fx.root.path())
+        .assert()
+        .success()
+        .stdout(contains("https://example.com/check"))
+        .stdout(contains("Check the release summary"))
+        .stdout(contains("Review changed files"))
+        .stdout(contains("reviewer"));
+    fx.cmd()
+        .arg("--json")
+        .arg("show")
+        .arg(fx.root.path())
+        .arg("--show-secrets")
+        .assert()
+        .success()
+        .stdout(contains("example-private-value"));
+}
+
+#[test]
+fn central_mcp_state_uses_the_same_read_budget_as_other_commands() {
+    let fx = Fixture::new();
+    fx.write_config(
+        json!({}),
+        json!({
+            "history": "x".repeat(8 * 1024 * 1024),
+            "mcpServers": {"example": {"command": "example-server"}}
+        }),
+    );
+    fx.cmd()
+        .arg("--json")
+        .arg("show")
+        .arg(fx.root.path())
+        .assert()
+        .success()
+        .stdout(contains("example-server"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn json_show_accepts_non_unicode_project_paths() {
+    use std::os::unix::ffi::OsStringExt;
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let root = fx
+        .root
+        .path()
+        .join(std::ffi::OsString::from_vec(b"project-\xff".to_vec()));
+    std::fs::create_dir(&root).unwrap();
+    write(&root.join("CLAUDE.md"), "# Instructions\n");
+    write_json(
+        &root.join(".claude/settings.json"),
+        &json!({"model": "example"}),
+    );
+    let output = fx
+        .cmd()
+        .arg("--json")
+        .arg("show")
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["root"],
+        root.canonicalize().unwrap().display().to_string()
+    );
+    assert!(!report["settings"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn contradiction_inventory_deduplicates_and_reports_its_limit() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    write(
+        &fx.claude_home.join("CLAUDE.md"),
+        "Always use tabs in all examples.\nAlways use tabs in all examples.\n",
+    );
+    write(
+        &fx.root.path().join("CLAUDE.md"),
+        "Never use tabs in all examples.\nNever use tabs in all examples.\n",
+    );
+    let output = fx
+        .cmd()
+        .args(["--json", "show"])
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["contradictions"].as_array().unwrap().len(), 1);
+    assert_eq!(report["contradictions_truncated"], false);
+
+    let lines = (0..140)
+        .map(|index| format!("Never use tabs in example {index}.\n"))
+        .collect::<String>();
+    write(&fx.root.path().join("CLAUDE.md"), &lines);
+    let output = fx
+        .cmd()
+        .args(["--json", "show"])
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["contradictions"].as_array().unwrap().len(), 128);
+    assert_eq!(report["contradictions_truncated"], true);
+    fx.cmd()
+        .arg("show")
+        .arg(fx.root.path())
+        .assert()
+        .success()
+        .stdout(contains("additional contradictions omitted"));
+}
+
+#[cfg(unix)]
+#[test]
+fn inaccessible_optional_inventory_warns_without_corrupting_json() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    fx.cmd()
+        .args(["--json", "show"])
+        .arg(fx.root.path())
+        .assert()
+        .success()
+        .stderr("");
+    let blocked = fx.claude_home.join("commands/nested\nfolder");
+    std::fs::create_dir_all(&blocked).unwrap();
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let output = fx
+        .cmd()
+        .args(["--json", "show"])
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let warnings = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        warnings.contains("warning: could not inspect"),
+        "{warnings}"
+    );
+    assert!(warnings.contains("nested\\nfolder"), "{warnings}");
+    assert!(!warnings.contains("nested\nfolder"));
+}
+
+#[test]
+fn hook_and_mcp_definition_commands_share_argument_masking() {
+    let fx = Fixture::new();
+    fx.write_config(
+        json!({}),
+        json!({
+            "mcpServers": {"example": {"command": "server --token example-private-value"}}
+        }),
+    );
+    write_json(
+        &fx.claude_home.join("settings.json"),
+        &json!({
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "check --token example-private-value"}]}]}
+        }),
+    );
+    let output = fx
+        .cmd()
+        .args(["--json", "show"])
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["hooks"][0]["definition"]["command"],
+        report["hooks"][0]["command"]
+    );
+    assert_eq!(
+        report["mcp_servers"][0]["definition"]["command"],
+        report["mcp_servers"][0]["command"]
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("example-private-value"));
+}

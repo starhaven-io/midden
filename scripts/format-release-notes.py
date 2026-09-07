@@ -23,9 +23,6 @@ SECTIONS = {
 # Skip changes that aren't relevant to end users
 SKIP_TYPES = {"build", "ci", "chore"}
 
-# Internal scopes that ship no user-visible behavior. Empty for now.
-SKIP_SCOPES: set[str] = set()
-
 # PR line pattern from --generate-notes:
 #   * feat(scope): description by @user in https://...
 PR_RE = re.compile(
@@ -58,13 +55,14 @@ def parse_notes(raw: str) -> tuple[dict[str, list[str]], str | None]:
             continue
 
         pr_type = pr_match.group("type") or ""
-        pr_scope = pr_match.group("scope") or ""
         desc = pr_match.group("desc").strip()
 
-        if pr_type in SKIP_TYPES or pr_scope in SKIP_SCOPES:
+        if pr_match.group("breaking"):
+            section = "Breaking Changes"
+        elif pr_type in SKIP_TYPES:
             continue
-
-        section = SECTIONS.get(pr_type, "Other")
+        else:
+            section = SECTIONS.get(pr_type, "Other")
         sections.setdefault(section, []).append(desc)
 
     return sections, changelog_url
@@ -74,7 +72,7 @@ def format_markdown(tag: str, sections: dict[str, list[str]], changelog_url: str
     """Render categorized notes as markdown."""
     lines = [f"## midden {tag}", ""]
 
-    ordered_keys = list(dict.fromkeys(SECTIONS.values()))
+    ordered_keys = ["Breaking Changes", *dict.fromkeys(SECTIONS.values())]
     ordered_keys.append("Other")
 
     for heading in ordered_keys:
