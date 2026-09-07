@@ -38,6 +38,11 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Reject repository Cargo configuration
+        run: |
+          test ! -e .cargo/config && test ! -L .cargo/config
+          test ! -e .cargo/config.toml && test ! -L .cargo/config.toml
+
       - name: Install cargo-deny
         # Pinned to the version CI enforces (.github/workflows/ci.yml); Renovate
         # groups both occurrences onto one branch. No cache: GitHub evicts
@@ -78,8 +83,8 @@ jobs:
           } > issue-body.md
           EXISTING=$(gh issue list --state open --limit 50 \
             --search "in:title cargo deny check is failing" \
-            --json number,title \
-            --jq ".[] | select(.title == \"${TITLE}\") | .number" | head -1)
+            --json number,title,author \
+            --jq ".[] | select(.title == \"${TITLE}\" and .author.login == \"github-actions[bot]\") | .number" | head -1)
           if [[ -n "${EXISTING}" ]]; then
             gh issue comment "${EXISTING}" --body-file issue-body.md
           else
@@ -96,8 +101,8 @@ jobs:
           TITLE="cargo deny check is failing on main"
           for N in $(gh issue list --state open --limit 50 \
             --search "in:title cargo deny check is failing" \
-            --json number,title \
-            --jq ".[] | select(.title == \"${TITLE}\") | .number"); do
+            --json number,title,author \
+            --jq ".[] | select(.title == \"${TITLE}\" and .author.login == \"github-actions[bot]\") | .number"); do
             gh issue comment "${N}" --body "\`cargo deny check\` is passing again as of ${RUN_URL}. Closing."
             gh issue close "${N}"
           done
