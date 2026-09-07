@@ -4,6 +4,8 @@ use std::io::Write;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::safe_io;
+
 /// Loaded `~/.claude.json` plus the raw text it was parsed from. The raw text
 /// is kept so we can report size deltas without re-serializing twice.
 pub struct ClaudeJson {
@@ -13,8 +15,8 @@ pub struct ClaudeJson {
 
 impl ClaudeJson {
     pub fn load(path: &Path) -> Result<Self> {
-        let raw =
-            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let raw = safe_io::read_to_string(path, safe_io::MAX_CLAUDE_JSON_BYTES)
+            .with_context(|| format!("read {}", path.display()))?;
         let data: Value =
             serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
         Ok(Self { raw, data })

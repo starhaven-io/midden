@@ -53,7 +53,7 @@ cargo install --git https://github.com/starhaven-io/midden
 
 ## Usage
 
-All commands default to safe modes: dry-run for prune, read-only for show and memory inventory, and report-only for doctor. Writes always require an explicit flag, create a timestamped backup first, and replace the file atomically, preserving its file mode. Use `--json` for machine-readable output.
+All commands default to safe modes: dry-run for prune, read-only for show and memory inventory, and report-only for doctor. Rewriting `~/.claude.json` always requires an explicit flag, creates an owner-only timestamped backup first, and replaces the file atomically while preserving its file mode. A symlinked config is refused explicitly; pass `--config` with its resolved target when mutation is intended. Transcript cleanup is the documented backup exception because duplicating append-only logs would defeat garbage collection. Use `--json` for machine-readable output.
 
 ```bash
 # Compare Codex and Claude memory sources for this repo
@@ -110,30 +110,32 @@ midden completions zsh
 $ midden memory show .
 memory for /Users/me/myproject
 
-codex  memory enabled  management read-only
+codex  memory unknown  management read-only
   instructions
-    [repository; loaded] /Users/me/myproject/AGENTS.md (2.4 KiB)
+    [repository; load unknown] /Users/me/myproject/AGENTS.md (2.4 KiB)
+      configuration or project trust is unresolved; this source's load state depends on it
   retained memory
-    [global; loaded] /Users/me/.codex/memories/memory_summary.md (1.1 KiB)
+    [global; load unknown] /Users/me/.codex/memories/memory_summary.md (1.1 KiB)
 
-claude  memory enabled  management read-only
+claude  memory unknown  management read-only
   instructions
     [repository; loaded] /Users/me/myproject/CLAUDE.md (31 B)
     [repository; loaded] /Users/me/myproject/AGENTS.md (2.4 KiB)
       imported by /Users/me/myproject/CLAUDE.md
   retained memory
-    [repository; loaded] /Users/me/.claude/projects/example/memory/MEMORY.md (3.2 KiB)
+    [repository; load unknown] /Users/me/.claude/projects/example/memory/MEMORY.md (3.2 KiB)
+      startup index loaded in full (within 200 lines and 25 KiB)
 
 provider coverage
   codex: 1 instruction, 1 retained memory
   claude: 2 instructions, 1 retained memory
 ```
 
-Codex discovery follows `AGENTS.override.md`, `AGENTS.md`, configured fallback names, and the combined instruction byte limit. It inventories the generated summary, durable-memory index, and evidence stores under the configured Codex home without recursively reading rollout history.
+Codex discovery follows `AGENTS.override.md`, `AGENTS.md`, configured fallback names, and `project_root_markers` (defaulting to `.git`; an empty list makes the target directory the root). It resolves system, user, root-to-target project, `/etc/codex/managed_config.toml`, and `/etc/codex/requirements.toml` layers, then inventories the union of instruction candidates across named `<profile>.config.toml` and trusted/untrusted project alternatives. Obsolete inline `profile` / `[profiles.*]` keys are not applied. The active profile, one-off command-line overrides, cloud-managed requirements, and macOS MDM payloads are not observable from a filesystem inventory, so Codex memory and instruction load states remain unknown even when the visible disk layers agree. Generated summaries, the durable-memory index, and evidence stores are inventoried without recursively reading rollout history.
 
-Claude discovery includes managed, user, ancestor, project, local, imported, and path-scoped instruction sources. It associates per-repository auto-memory with the target from transcript `cwd` evidence rather than decoding Claude's lossy project-directory slugs, and reports `MEMORY.md` as startup context with topic files available on demand.
+Claude discovery includes managed, user, ancestor, project, local, imported, and path-scoped instruction sources. Rule-directory symlinks are followed with bounded traversal, and project external imports use Claude's recorded approval state when available; imports stop after four hops. It associates default per-repository auto-memory with the target from transcript `cwd` evidence rather than decoding Claude's lossy project-directory slugs. Claude accepts `autoMemoryDirectory` from every settings scope; project and local values are reported as repository-associated candidates whose use depends on workspace trust, alongside the user/policy or default fallback that may apply when the workspace is untrusted. The `--settings` layer, environment disable, in-session memory toggle, workspace trust decision, and higher managed tiers are not observable here, so effective Claude memory state and location remain unknown. `MEMORY.md` is loaded in full only when it stays within both 200 lines and 25 KiB, otherwise reported as truncated, with topic files available on demand. Claude loads a `CLAUDE.md` through 4 MiB and skips a larger file; midden reports that boundary rather than treating its own bounded-read failure as a loaded provider source. Sampled or conflicting transcript evidence produces an unknown association; `--all` exposes the affected sources.
 
-The default provider is `all`. `--provider codex` or `--provider claude` filters the same schema to one adapter. `--all` additionally includes unrelated and unassociated sources for forensic work. Memory content is not printed; JSON output contains source metadata, loading state, association, capabilities, and warnings.
+The default provider is `all`. `--provider codex` or `--provider claude` filters the same schema to one adapter. `--all` additionally includes unrelated and unassociated sources for forensic work. Memory content is not printed; JSON output contains source metadata, loading state, association, capabilities, and warnings. Reads are bounded by source class and accept regular files only; oversized, malformed, trust-dependent, or inaccessible sources stay visible as disabled, truncated, or unknown instead of being silently omitted.
 
 ### Show
 
@@ -152,8 +154,8 @@ settings
     [project merged] /Users/me/myproject/.claude/settings.json = ["Read(./.env)"]
 
 CLAUDE.md
-  [user] /Users/me/.claude/CLAUDE.md (8421 bytes)
-  [project] /Users/me/myproject/CLAUDE.md (10442 bytes)
+  [user; loaded] /Users/me/.claude/CLAUDE.md (8421 bytes)
+  [project; loaded] /Users/me/myproject/CLAUDE.md (10442 bytes)
 
 hooks
   PreToolUse
@@ -167,7 +169,9 @@ mcp servers
     /Users/me/myproject/.mcp.json
 ```
 
-Settings precedence is **Managed → Local → Project → User**. Scalars from a higher scope override; arrays concat and deduplicate across scopes. `show` tags every value with its source and marks contributions shadowed by a higher scope. `CLAUDE.md` files do not follow precedence — all applicable files load simultaneously, so midden lists every contributor and runs a heuristic contradiction-detection pass instead of picking a winner.
+Settings precedence is **Managed → Local → Project → User**. Scalars from a higher scope override; arrays concat and deduplicate across scopes. `show` tags every value with its source and marks contributions shadowed by a higher scope. `CLAUDE.md` files do not follow precedence — all applicable files load simultaneously, so midden lists every contributor and runs a heuristic contradiction-detection pass instead of picking a winner. Claude loads these files regardless of length; midden still caps its own optional content and contradiction scan at 4 MiB, reports that scan limit without mislabeling the source as disabled, and leaves an inaccessible file unknown without aborting the rest of `show`.
+
+Present but malformed or unreadable settings and MCP files make `show` fail with exit code 2 and name the affected path. They are never treated as an absent configuration layer.
 
 MCP servers are gathered from all four scopes: user (`~/.claude.json`), **local** (the per-project entry inside `~/.claude.json` — where `claude mcp add` writes by default), project (`.mcp.json`), and managed (`.claude/managed-mcp.json`).
 
@@ -215,7 +219,7 @@ An entry is a removal candidate only if its directory is provably absent from di
 
 Pass `--transcripts` to also inspect `~/.claude/projects/`, where Claude Code stores per-project session transcripts. These directories are named with lossy path slugs, so midden never decodes the directory name. Instead it reads only the head of each `*.jsonl` transcript and uses the first `cwd` field it can derive. A transcript directory is skipped if its transcripts disagree, no `cwd` can be derived, or it has no `*.jsonl` files.
 
-When a derived `cwd` is provably absent, `prune --transcripts` reports the session artifacts it would remove: `*.jsonl` files and bare UUID-named session artifact directories. `memory/` is durable user data and is never deleted. If only `memory/` remains, the transcript project directory is kept and reported as memory preserved; unknown entries are left in place and reported as partially cleaned. Unlike `.claude.json` rewrites, transcript deletion does not create `.bak` copies, because copying hundreds of MB of append-only logs would make cleanup impractical; the same dry-run, running-`claude`, mass-deletion, and `--force` gates still apply.
+When a derived `cwd` is provably absent, `prune --transcripts` reports the session artifacts it would remove: `*.jsonl` files and bare UUID-named session artifact directories. `memory/` is durable user data and is never deleted. Apply revalidates identity, cwd evidence, and the complete artifact set, then atomically moves each selected artifact into a private random quarantine before rechecking its identity and unlinking it. If only `memory/` remains, the transcript project directory is kept and reported as memory preserved; unknown entries are left in place and reported as partially cleaned. Unlike `.claude.json` rewrites, transcript deletion does not create `.bak` copies, because copying hundreds of MB of append-only logs would make cleanup impractical; the same dry-run, running-`claude`, mass-deletion, and `--force` gates still apply.
 
 `prune --transcripts` also reports the largest kept transcript directories. Those are not removal candidates today because their project directories still exist, but the inventory shows where live Claude Code history is consuming disk so retention-policy work can be deliberate rather than guesswork.
 
@@ -230,9 +234,15 @@ When a derived `cwd` is provably absent, `prune --transcripts` reports the sessi
 | `stale-worktree` | Info | no | Ephemeral worktree dir untouched for >30 days |
 | `config-path-inaccessible` | Warn | no | Config/worktree path could not be inspected because of permissions or filesystem errors |
 | `malformed-json-config` | Warn | no | Settings or MCP JSON could not be parsed, so key-aware checks were skipped |
-| `secret-in-malformed-config` | Error | no | Token-shaped secret appears in malformed committed JSON |
-| `secret-in-committed-settings` | Error | no | Suspect secret in a `settings.json` that git doesn't ignore — by key name or value shape (masked by default) |
-| `secret-in-committed-mcp` | Error | no | Suspect secret in a `.mcp.json` / `managed-mcp.json` that git doesn't ignore — by key name or value shape; pure `${VAR}` references are exempt |
+| `secret-in-malformed-config` | Error | no | Token-shaped secret appears in malformed Git-tracked JSON |
+| `secret-in-malformed-unignored-config` | Warn | no | Token-shaped secret appears in malformed untracked, non-ignored JSON |
+| `secret-in-malformed-unverifiable-config` | Warn | no | Token-shaped secret appears in malformed JSON whose Git state cannot be established |
+| `secret-in-committed-settings` | Error | no | Suspect secret in a Git-tracked `settings.json`, by key name, argument context, or value shape (masked by default) |
+| `secret-in-unignored-settings` | Warn | no | Suspect secret in an untracked, non-ignored `settings.json` |
+| `secret-exposure-unverifiable-settings` | Warn | no | Suspect settings secret whose Git state cannot be established |
+| `secret-in-committed-mcp` | Error | no | Suspect secret in a Git-tracked `.mcp.json` / `managed-mcp.json`; pure `${VAR}` references are exempt |
+| `secret-in-unignored-mcp` | Warn | no | Suspect secret in an untracked, non-ignored MCP JSON file |
+| `secret-exposure-unverifiable-mcp` | Warn | no | Suspect MCP secret whose Git state cannot be established |
 | `local-settings-tracked` | Warn | no | `settings.local.json` tracked by git (meant to stay machine-local) |
 | `local-settings-not-ignored` | Warn | no | `settings.local.json` not gitignored — one `git add` from being committed |
 | `missing-credential-deny` | Warn | no | No `permissions.deny` covers `.env` or `secrets/` paths |
@@ -282,15 +292,17 @@ just clippy         # Run clippy
 just fmt            # Format code
 just typos          # Check for typos
 just deny           # cargo-deny: license + advisory + source checks
-just lychee         # Check README links
+just lychee         # Check public documentation links
 just audit          # Audit GitHub Actions workflows (zizmor)
-just check          # Run all checks
+just check          # Run the full local gate, including release-note tests
 just install-hooks  # Install git hooks: pre-push check + DCO sign-off (once per clone)
 ```
 
 ## Contributing
 
-Commits must follow [Conventional Commits](https://www.conventionalcommits.org/) format and include a DCO sign-off (`git commit -s`). Run `just install-hooks` once per clone to enable the git hooks (a pre-push `just check` and DCO sign-off enforcement).
+Commits must follow [Conventional Commits](https://www.conventionalcommits.org/) format and include a DCO sign-off (`git commit -s`). Run `just install-hooks` once per clone to enable the git hooks (the full local `just check` gate and DCO sign-off enforcement). Hosted CI additionally runs platform, coverage-upload, link, and workflow checks selected for the changed paths.
+
+The manual release workflow accepts only `main`. Unprivileged jobs validate the crate, build binaries, and format generated notes; separate no-checkout jobs sign or attest those exact artifacts. The publication job validates all five archives before minting its narrowly scoped GitHub App token. A retry accepts an existing tag only when it resolves to the same commit, byte-compares every existing release asset, uploads only missing assets, and refuses any non-identical or unexpected asset instead of overwriting published bytes. Because a newly timestamped macOS signature changes the archive bytes, do not rerun a successful macOS build/sign job after assets are published; rerun only failed downstream jobs while the original artifacts are retained. Crates.io publication skips an already published version. Homebrew reconciliation fetches its public inputs in a token-isolated step, then renders and validates a credential-free cask plan even when the version already matches. A no-checkout job uses the Git data API to write only that pre-hashed candidate, an unprivileged job reads the exact remote head back, and the merge job waits for checks before minting its token, revalidating the PR, and directly merging the same head SHA.
 
 <!-- fleet:block license-section -->
 

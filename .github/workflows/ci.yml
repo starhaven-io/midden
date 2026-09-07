@@ -33,6 +33,7 @@ jobs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       links: ${{ steps.matrix.outputs.links }}
       zizmor: ${{ steps.matrix.outputs.zizmor }}
+      coverage: ${{ steps.matrix.outputs.coverage }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -49,59 +50,35 @@ jobs:
           # Codecov has a baseline for PR comparisons.
           if [[ "${EVENT_NAME}" == "push" ]]; then
             {
-              echo 'matrix=[{"name":"Lint","check":"lint","runner":"ubuntu-24.04"},{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04","environment":"codecov"}]'
+              echo 'matrix=[{"name":"Lint","check":"lint","runner":"ubuntu-24.04"},{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04"}]'
               echo "links=false"
               echo "zizmor=false"
+              echo "coverage=true"
             } >> "${GITHUB_OUTPUT}"
             exit 0
           fi
-
-          MATRIX='[]'
-          add_check() {
-            local entry="$1"
-            if [[ "${MATRIX}" == "[]" ]]; then
-              MATRIX="[${entry}]"
-            else
-              MATRIX="${MATRIX%]},${entry}]"
-            fi
-          }
-          LINKS=false
-          ZIZMOR=false
 
           # `edited` (title/body/base) also runs the full path-derived matrix. The
           # aggregate "conclusion" job is the only required status check, so it must
           # certify every relevant leg for the current commit. Collapsing to a
           # commits-only matrix on `edited` lets a green run overwrite a prior failing
           # one on the same SHA, bypassing tests, coverage, links, and the rest.
-          CHANGED=$(git diff --name-only "${BASE_SHA}...HEAD")
-
-          # Rust or build workflow changes: lint + test on all platforms
-          if echo "${CHANGED}" | grep -qE '\.rs$|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^clippy\.toml$|^rustfmt\.toml$|^\.github/workflows/(ci|cargo-deny|release)\.yml$'; then
-            add_check '{"name":"Lint","check":"lint","runner":"ubuntu-24.04"}'
-            add_check '{"name":"Test (Linux)","check":"test","runner":"ubuntu-24.04"}'
-            add_check '{"name":"Test (Linux ARM)","check":"test","runner":"ubuntu-24.04-arm"}'
-            add_check '{"name":"Test (macOS)","check":"test","runner":"macos-26"}'
-            add_check '{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04","environment":"codecov"}'
-            add_check '{"name":"MSRV","check":"msrv","runner":"ubuntu-24.04"}'
-          elif echo "${CHANGED}" | grep -qE '^deny\.toml$|^_typos\.toml$|^justfile$'; then
-            add_check '{"name":"Lint","check":"lint","runner":"ubuntu-24.04"}'
+          # Routing is itself a security boundary: never execute the pull
+          # request's copy and then trust the outputs it chooses to emit.
+          ROUTER="${RUNNER_TEMP}/ci-path-routing.py"
+          if git show "${BASE_SHA}:scripts/ci-path-routing.py" > "${ROUTER}"; then
+            git diff --name-only "${BASE_SHA}...HEAD" \
+              | python3 "${ROUTER}" >> "${GITHUB_OUTPUT}"
+          else
+            # The first change that introduces the trusted-base router cannot
+            # load it from base, so fail closed to the complete matrix.
+            {
+              echo 'matrix=[{"name":"Lint","check":"lint","runner":"ubuntu-24.04"},{"name":"Test (Linux)","check":"test","runner":"ubuntu-24.04"},{"name":"Test (Linux ARM)","check":"test","runner":"ubuntu-24.04-arm"},{"name":"Test (macOS)","check":"test","runner":"macos-26"},{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04"},{"name":"MSRV","check":"msrv","runner":"ubuntu-24.04"}]'
+              echo "links=true"
+              echo "zizmor=true"
+              echo "coverage=true"
+            } >> "${GITHUB_OUTPUT}"
           fi
-
-          # README or link-check config changes: verify links on the PR.
-          if echo "${CHANGED}" | grep -qE '^README\.md$|^lychee\.toml$|^\.github/workflows/(ci|link-check)\.yml$'; then
-            LINKS=true
-          fi
-
-          # Workflow changes: Actions security audit
-          if echo "${CHANGED}" | grep -qE '^\.github/workflows/'; then
-            ZIZMOR=true
-          fi
-
-          {
-            echo "matrix=${MATRIX}"
-            echo "links=${LINKS}"
-            echo "zizmor=${ZIZMOR}"
-          } >> "${GITHUB_OUTPUT}"
 
   commits:
     name: Conventional Commits
@@ -111,15 +88,21 @@ jobs:
       pull-requests: read # required to read PR titles
     uses: starhaven-io/.github/.github/workflows/reusable-conventional-commits.yml@5516bc8a2030979985d2f69e6017100992444cfb # v2026.09.06.6
 
+  fleet:
+    name: Fleet guard
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+    uses: starhaven-io/.github/.github/workflows/reusable-fleet-guard.yml@5516bc8a2030979985d2f69e6017100992444cfb # v2026.09.06.6
+    with:
+      repo-name: ${{ github.event.repository.name }}
+
   check:
     name: ${{ matrix.name }}
     needs: generate-matrix
     if: ${{ needs.generate-matrix.outputs.matrix != '[]' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
-    environment:
-      name: ${{ matrix.environment }}
-      deployment: false
     permissions:
       contents: read
     strategy:
@@ -132,6 +115,12 @@ jobs:
           fetch-depth: ${{ matrix.fetch_depth || 1 }}
           persist-credentials: false
 
+      - name: Reject repository Cargo configuration
+        run: |
+          if [[ -e .cargo/config || -L .cargo/config || -e .cargo/config.toml || -L .cargo/config.toml ]]; then
+            echo "::error::repository Cargo configuration is not allowed"
+            exit 1
+          fi
 
       - name: Restore cargo build cache
         id: cargo-build-cache
@@ -190,6 +179,10 @@ jobs:
       - name: Typos
         if: matrix.check == 'lint'
         run: typos
+
+      - name: Release note formatter tests
+        if: matrix.check == 'lint'
+        run: python3 -m unittest discover --start-directory scripts/tests
 
       - name: Cargo deny
         if: matrix.check == 'lint'
@@ -253,22 +246,16 @@ jobs:
         if: matrix.check == 'coverage'
         run: cargo llvm-cov nextest --locked --profile ci --lcov --output-path lcov.info
 
-      - name: Upload coverage to Codecov
-        if: ${{ !cancelled() && matrix.check == 'coverage' }}
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+      - name: Upload coverage reports
+        if: matrix.check == 'coverage'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-          fail_ci_if_error: false
-
-      - name: Upload test results to Codecov
-        if: ${{ !cancelled() && matrix.check == 'coverage' }}
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: target/nextest/ci/junit.xml
-          fail_ci_if_error: false
-          report_type: test_results
+          name: coverage-reports
+          path: |
+            lcov.info
+            target/nextest/ci/junit.xml
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Save coverage tools cache
         if: matrix.check == 'coverage' && github.event_name == 'push' && steps.cov-tools-cache.outputs.cache-hit != 'true'
@@ -281,6 +268,37 @@ jobs:
             ~/.cargo/.crates2.json
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-cov-tools-${{ hashFiles('.github/workflows/ci.yml') }}
 
+  codecov:
+    name: Codecov
+    needs: [generate-matrix, check]
+    if: needs.generate-matrix.outputs.coverage == 'true'
+    runs-on: ubuntu-slim
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write # required for Codecov OIDC authentication
+    steps:
+      - name: Download coverage reports
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: coverage-reports
+          path: coverage-reports
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          files: coverage-reports/lcov.info
+          fail_ci_if_error: true
+          use_oidc: true
+
+      - name: Upload test results to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          files: coverage-reports/target/nextest/ci/junit.xml
+          fail_ci_if_error: true
+          report_type: test_results
+          use_oidc: true
+
   links:
     name: Links
     needs: generate-matrix
@@ -289,7 +307,7 @@ jobs:
       contents: read
     uses: starhaven-io/.github/.github/workflows/reusable-link-check.yml@5516bc8a2030979985d2f69e6017100992444cfb # v2026.09.06.6
     with:
-      args: "--config lychee.toml README.md"
+      args: "--config lychee.toml README.md SECURITY.md"
       build-site: false
       site-directory: ""
       authenticated-github: true
@@ -303,9 +321,21 @@ jobs:
       security-events: write # required for zizmor SARIF upload
     uses: starhaven-io/.github/.github/workflows/reusable-zizmor.yml@5516bc8a2030979985d2f69e6017100992444cfb # v2026.09.06.6
 
+  pinprick:
+    name: pinprick audit
+    needs: generate-matrix
+    if: needs.generate-matrix.outputs.zizmor == 'true'
+    permissions:
+      contents: read
+      security-events: write # required for SARIF upload on same-repository changes
+    uses: starhaven-io/.github/.github/workflows/reusable-pinprick-audit.yml@5516bc8a2030979985d2f69e6017100992444cfb # v2026.09.06.6
+    with:
+      advanced-security: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+      fail-on-findings: true
+
   conclusion:
     name: conclusion
-    needs: [commits, check, links, zizmor]
+    needs: [generate-matrix, commits, fleet, check, codecov, links, zizmor, pinprick]
     runs-on: ubuntu-slim
     timeout-minutes: 15
     if: always()
@@ -313,11 +343,49 @@ jobs:
       - name: Result
         env:
           COMMITS_RESULT: ${{ needs.commits.result }}
+          GENERATE_RESULT: ${{ needs.generate-matrix.result }}
+          MATRIX: ${{ needs.generate-matrix.outputs.matrix }}
           CHECK_RESULT: ${{ needs.check.result }}
+          COVERAGE: ${{ needs.generate-matrix.outputs.coverage }}
+          CODECOV_RESULT: ${{ needs.codecov.result }}
+          EVENT_NAME: ${{ github.event_name }}
+          FLEET_RESULT: ${{ needs.fleet.result }}
+          LINKS: ${{ needs.generate-matrix.outputs.links }}
           LINKS_RESULT: ${{ needs.links.result }}
+          ZIZMOR: ${{ needs.generate-matrix.outputs.zizmor }}
           ZIZMOR_RESULT: ${{ needs.zizmor.result }}
+          PINPRICK_RESULT: ${{ needs.pinprick.result }}
         run: |
-          test "${COMMITS_RESULT}" = "success" || test "${COMMITS_RESULT}" = "skipped"
-          test "${CHECK_RESULT}" = "success" || test "${CHECK_RESULT}" = "skipped"
-          test "${LINKS_RESULT}" = "success" || test "${LINKS_RESULT}" = "skipped"
-          test "${ZIZMOR_RESULT}" = "success" || test "${ZIZMOR_RESULT}" = "skipped"
+          test "${GENERATE_RESULT}" = "success"
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            test "${COMMITS_RESULT}" = "success"
+          else
+            test "${COMMITS_RESULT}" = "skipped"
+          fi
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            test "${FLEET_RESULT}" = "success"
+          else
+            test "${FLEET_RESULT}" = "skipped"
+          fi
+          if [[ "${MATRIX}" == "[]" ]]; then
+            test "${CHECK_RESULT}" = "skipped"
+          else
+            test "${CHECK_RESULT}" = "success"
+          fi
+          if [[ "${COVERAGE}" == "true" ]]; then
+            test "${CODECOV_RESULT}" = "success"
+          else
+            test "${CODECOV_RESULT}" = "skipped"
+          fi
+          if [[ "${LINKS}" == "true" ]]; then
+            test "${LINKS_RESULT}" = "success"
+          else
+            test "${LINKS_RESULT}" = "skipped"
+          fi
+          if [[ "${ZIZMOR}" == "true" ]]; then
+            test "${ZIZMOR_RESULT}" = "success"
+            test "${PINPRICK_RESULT}" = "success"
+          else
+            test "${ZIZMOR_RESULT}" = "skipped"
+            test "${PINPRICK_RESULT}" = "skipped"
+          fi

@@ -45,9 +45,9 @@ typos:
 deny:
     cargo deny check
 
-# Check for broken links in README
+# Check for broken links in public documentation
 lychee:
-    lychee --config lychee.toml README.md
+    lychee --config lychee.toml README.md SECURITY.md
 
 # Check
 
@@ -69,6 +69,7 @@ check:
     }
     run cargo clippy --locked --all-targets -- -D warnings
     run cargo fmt -- --check
+    run python3 -m unittest discover --start-directory scripts/tests
     if command -v typos &>/dev/null; then
         run typos
     else
@@ -85,7 +86,7 @@ check:
         skip audit zizmor zizmor
     fi
     if command -v lychee &>/dev/null; then
-        run lychee --config lychee.toml README.md
+        run lychee --config lychee.toml README.md SECURITY.md
     else
         skip lychee lychee lychee
     fi

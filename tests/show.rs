@@ -52,6 +52,38 @@ fn resolved_settings_show_provenance_and_shadowing() {
 }
 
 #[test]
+fn malformed_settings_are_an_explicit_error() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let settings = fx.root.path().join(".claude/settings.json");
+    write(&settings, "{ not json");
+
+    fx.cmd()
+        .arg("show")
+        .arg(fx.root.path())
+        .assert()
+        .code(2)
+        .stderr(contains(settings.display().to_string()))
+        .stderr(contains("parse"));
+}
+
+#[test]
+fn malformed_mcp_configuration_is_an_explicit_error() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let mcp = fx.root.path().join(".mcp.json");
+    write(&mcp, "[");
+
+    fx.cmd()
+        .arg("show")
+        .arg(fx.root.path())
+        .assert()
+        .code(2)
+        .stderr(contains(mcp.display().to_string()))
+        .stderr(contains("parse"));
+}
+
+#[test]
 fn array_keys_concat_and_dedupe_across_scopes() {
     let fx = Fixture::new();
     fx.write_config(json!({}), json!({}));
@@ -137,6 +169,35 @@ fn show_masks_secret_arrays_by_default() {
 }
 
 #[test]
+fn show_masks_sensitive_object_keys_nested_in_arrays() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    write_json(
+        &fx.claude_home.join("settings.json"),
+        &json!({"plugins": [{"password": "hunter2", "name": "safe"}]}),
+    );
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("show")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        !stdout.contains("hunter2"),
+        "nested secret leaked:\n{stdout}"
+    );
+    assert!(stdout.contains("hunt***"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("safe"),
+        "innocent sibling missing:\n{stdout}"
+    );
+}
+
+#[test]
 fn show_masks_token_shaped_values_under_innocent_keys() {
     let fx = Fixture::new();
     fx.write_config(json!({}), json!({}));
@@ -217,6 +278,40 @@ fn show_masks_hook_commands_and_mcp_urls() {
 }
 
 #[test]
+fn show_secrets_does_not_disable_terminal_escaping() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    write_json(
+        &fx.claude_home.join("settings.json"),
+        &json!({
+            "hooks": {
+                "Stop": [{ "hooks": [{
+                    "type": "command",
+                    "command": "echo \u{1b}]8;;https://example.test\u{7}link\u{202e}"
+                }] }]
+            }
+        }),
+    );
+
+    let out = fx
+        .cmd()
+        .arg("show")
+        .arg(fx.root.path())
+        .arg("--show-secrets")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("\\u{1b}"), "stdout:\n{stdout}");
+    assert!(stdout.contains("\\u{7}"), "stdout:\n{stdout}");
+    assert!(stdout.contains("\\u{202e}"), "stdout:\n{stdout}");
+    assert!(!stdout.contains('\u{1b}'), "raw escape leaked:\n{stdout}");
+    assert!(
+        !stdout.contains('\u{202e}'),
+        "raw bidi control leaked:\n{stdout}"
+    );
+}
+
+#[test]
 fn show_secrets_flag_unmasks() {
     let fx = Fixture::new();
     fx.write_config(json!({}), json!({}));
@@ -255,6 +350,63 @@ fn show_lists_claude_md_files_and_flags_contradictions() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("CLAUDE.md"));
     assert!(stdout.contains("contradictions"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn claude_md_size_limit_matches_provider_boundary() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let instructions = fx.root.path().join("CLAUDE.md");
+    std::fs::write(&instructions, vec![b'x'; 4 * 1024 * 1024]).unwrap();
+    // show canonicalizes its target, and a macOS temp root is reached through
+    // a symlink (/var -> /private/var), so compare against the resolved path.
+    let instructions = instructions.canonicalize().unwrap();
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("show")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let source = report["claude_md"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["file"] == instructions.display().to_string())
+        .unwrap();
+    assert_eq!(source["load_state"], "loaded");
+
+    std::fs::write(&instructions, vec![b'x'; 4 * 1024 * 1024 + 1]).unwrap();
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("show")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let source = report["claude_md"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["file"] == instructions.display().to_string())
+        .unwrap();
+    assert_eq!(source["load_state"], "disabled");
+    assert!(
+        source["detail"]
+            .as_str()
+            .unwrap()
+            .contains("skipped by Claude")
+    );
 }
 
 #[test]
@@ -468,6 +620,135 @@ fn json_output_includes_hooks_array() {
     assert_eq!(hooks[0]["scope"], "user");
     assert_eq!(hooks[0]["matcher"], "Bash");
     assert_eq!(hooks[0]["command"], "x");
+}
+
+#[test]
+fn identical_hook_groups_are_deduplicated_across_scopes() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let group = json!([{
+        "matcher": "Bash",
+        "hooks": [{ "type": "command", "command": "echo once" }]
+    }]);
+    write_json(
+        &fx.claude_home.join("settings.json"),
+        &json!({ "hooks": { "PreToolUse": group.clone() } }),
+    );
+    write_json(
+        &fx.root.path().join(".claude/settings.json"),
+        &json!({ "hooks": { "PreToolUse": group } }),
+    );
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("show")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["hooks"].as_array().unwrap().len(), 1);
+    assert_eq!(report["hooks"][0]["scope"], "user");
+}
+
+#[test]
+fn hook_deduplication_preserves_unique_handlers_in_overlapping_groups() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    write_json(
+        &fx.claude_home.join("settings.json"),
+        &json!({
+            "hooks": { "PreToolUse": [{
+                "matcher": "Bash",
+                "hooks": [
+                    { "type": "command", "command": "echo shared" },
+                    { "type": "command", "command": "echo user" }
+                ]
+            }] }
+        }),
+    );
+    write_json(
+        &fx.root.path().join(".claude/settings.json"),
+        &json!({
+            "hooks": { "PreToolUse": [{
+                "matcher": "Bash",
+                "hooks": [
+                    { "type": "command", "command": "echo shared" },
+                    { "type": "command", "command": "echo project" }
+                ]
+            }] }
+        }),
+    );
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("show")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let commands = report["hooks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hook| hook["command"].as_str().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(commands.len(), 3);
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| **command == "echo shared")
+            .count(),
+        1
+    );
+    assert!(commands.contains(&"echo user"));
+    assert!(commands.contains(&"echo project"));
+}
+
+#[test]
+fn identical_handlers_are_deduplicated_across_overlapping_matchers_and_metadata() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    write_json(
+        &fx.claude_home.join("settings.json"),
+        &json!({
+            "hooks": { "PreToolUse": [{
+                "matcher": "Bash|Read",
+                "hooks": [{
+                    "type": "command",
+                    "command": "echo shared",
+                    "timeout": 10
+                }]
+            }] }
+        }),
+    );
+    write_json(
+        &fx.root.path().join(".claude/settings.json"),
+        &json!({
+            "hooks": { "PreToolUse": [{
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": "echo shared",
+                    "timeout": 30,
+                    "statusMessage": "Running"
+                }]
+            }] }
+        }),
+    );
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("show")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["hooks"].as_array().unwrap().len(), 1);
+    assert_eq!(report["hooks"][0]["matcher"], "Bash|Read");
 }
 
 #[test]

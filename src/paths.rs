@@ -1,3 +1,4 @@
+use anyhow::{Result, anyhow};
 use std::path::{Path, PathBuf};
 
 /// Resolved paths for the user-scope state Claude Code writes.
@@ -11,17 +12,43 @@ pub struct Env {
 }
 
 impl Env {
+    #[cfg(test)]
     pub fn new(config: Option<PathBuf>, claude_home: Option<PathBuf>) -> Self {
-        let home = home_dir();
-        Self {
-            claude_json: config.unwrap_or_else(|| home.join(".claude.json")),
-            claude_home: claude_home.unwrap_or_else(|| home.join(".claude")),
-            codex_home: std::env::var_os("CODEX_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".codex")),
-        }
+        Self::try_new(config, claude_home, None).expect("home directory must be discoverable")
     }
 
+    pub fn try_new(
+        config: Option<PathBuf>,
+        claude_home: Option<PathBuf>,
+        codex_home: Option<PathBuf>,
+    ) -> Result<Self> {
+        let env_codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from);
+        let needs_home = config.is_none()
+            || claude_home.is_none()
+            || (codex_home.is_none() && env_codex_home.is_none());
+        let home = if needs_home {
+            Some(
+                std::env::home_dir()
+                    .ok_or_else(|| anyhow!("could not determine the user's home directory"))?,
+            )
+        } else {
+            None
+        };
+        Ok(Self {
+            claude_json: config
+                .or_else(|| home.as_ref().map(|home| home.join(".claude.json")))
+                .expect("home was required for the default config path"),
+            claude_home: claude_home
+                .or_else(|| home.as_ref().map(|home| home.join(".claude")))
+                .expect("home was required for the default Claude path"),
+            codex_home: codex_home
+                .or(env_codex_home)
+                .or_else(|| home.as_ref().map(|home| home.join(".codex")))
+                .expect("home was required for the default Codex path"),
+        })
+    }
+
+    #[cfg(test)]
     pub fn with_codex_home(mut self, codex_home: Option<PathBuf>) -> Self {
         if let Some(codex_home) = codex_home {
             self.codex_home = codex_home;
@@ -61,8 +88,9 @@ impl Env {
 pub(crate) fn home_dir() -> PathBuf {
     // std::env::home_dir was un-deprecated in Rust 1.87 (< this crate's 1.95
     // MSRV) and resolves $HOME, then /etc/passwd, on the Unix platforms this
-    // tool targets. Fall back to the current directory only if no home exists.
-    std::env::home_dir().unwrap_or_else(|| PathBuf::from("."))
+    // tool targets. CLI construction rejects a missing home rather than
+    // silently resolving home-relative state against the current directory.
+    std::env::home_dir().expect("home directory was validated during CLI construction")
 }
 
 /// Project-scope paths rooted at a target directory.

@@ -30,7 +30,7 @@ SKIP_SCOPES: set[str] = set()
 #   * feat(scope): description by @user in https://...
 PR_RE = re.compile(
     r"^\*\s+"
-    r"(?:(?P<type>[a-z]+)(?:\((?P<scope>[^)]*)\))?:\s*)?"
+    r"(?:(?P<type>[a-z]+)(?:\((?P<scope>[^)]*)\))?(?P<breaking>!)?:\s*)?"
     r"(?P<desc>.+?)"
     r"(?:\s+by\s+@[\w-]+)?"
     r"(?:\s+in\s+https?://\S+)?"

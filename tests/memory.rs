@@ -104,8 +104,9 @@ fn json_inventory_has_dual_provider_parity() {
 
     let codex = provider(&inventory, "codex");
     let claude = provider(&inventory, "claude");
+    assert_eq!(codex["memory_state"], "unknown");
+    assert_eq!(claude["memory_state"], "unknown");
     for provider in [codex, claude] {
-        assert_eq!(provider["memory_state"], "enabled");
         assert_eq!(
             provider["capabilities"]["instruction_inventory"],
             "supported"
@@ -117,10 +118,10 @@ fn json_inventory_has_dual_provider_parity() {
     let codex_instruction = source(codex, &fx.root.path().join("AGENTS.md"));
     assert_eq!(codex_instruction["role"], "authority");
     assert_eq!(codex_instruction["association"], "target");
-    assert_eq!(codex_instruction["load_state"], "loaded");
+    assert_eq!(codex_instruction["load_state"], "unknown");
     let codex_summary = source(codex, &codex_memory.join("memory_summary.md"));
     assert_eq!(codex_summary["kind"], "memory-summary");
-    assert_eq!(codex_summary["load_state"], "loaded");
+    assert_eq!(codex_summary["load_state"], "unknown");
 
     let claude_instruction = source(claude, &fx.root.path().join("CLAUDE.md"));
     assert_eq!(claude_instruction["role"], "authority");
@@ -128,10 +129,10 @@ fn json_inventory_has_dual_provider_parity() {
     assert_eq!(shared_import["kind"], "imported-instruction");
     let claude_index = source(claude, &claude_memory.join("MEMORY.md"));
     assert_eq!(claude_index["kind"], "memory-index");
-    assert_eq!(claude_index["load_state"], "loaded");
+    assert_eq!(claude_index["load_state"], "unknown");
     let claude_topic = source(claude, &claude_memory.join("debugging.md"));
     assert_eq!(claude_topic["kind"], "memory-topic");
-    assert_eq!(claude_topic["load_state"], "on-demand");
+    assert_eq!(claude_topic["load_state"], "unknown");
     assert!(
         claude_topic["detail"]
             .as_str()
@@ -242,7 +243,7 @@ fn inventories_provider_native_instruction_loading() {
 }
 
 #[test]
-fn codex_instruction_budget_reports_truncated_and_disabled_sources() {
+fn codex_instruction_budget_stays_unknown_without_session_configuration() {
     let fx = Fixture::new();
     fx.write_config(json!({}), json!({}));
     fx.git(&["init", "--quiet"]);
@@ -271,14 +272,204 @@ fn codex_instruction_budget_reports_truncated_and_disabled_sources() {
     assert!(out.status.success());
     let inventory: Value = serde_json::from_slice(&out.stdout).unwrap();
     let codex = provider(&inventory, "codex");
-    assert_eq!(source(codex, &repository)["load_state"], "truncated");
+    assert_eq!(source(codex, &repository)["load_state"], "unknown");
+    assert_eq!(source(codex, &path)["load_state"], "unknown");
     assert!(
-        source(codex, &repository)["detail"]
+        codex["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| { warning["code"] == "codex-session-configuration-unresolved" })
+    );
+}
+
+#[test]
+fn codex_project_root_markers_control_instruction_ancestry() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let nested = fx.root.path().join("packages/api");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::create_dir(fx.root.path().join(".hg")).unwrap();
+    let root_instructions = fx.root.path().join("AGENTS.md");
+    write(&root_instructions, "repository instructions\n");
+    write(
+        fx.codex_home.join("config.toml"),
+        "project_root_markers = [\".hg\"]\n",
+    );
+
+    let output = fx
+        .cmd()
+        .arg("--json")
+        .arg("memory")
+        .arg("show")
+        .arg(&nested)
+        .arg("--provider")
+        .arg("codex")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let inventory: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let codex = provider(&inventory, "codex");
+    assert_eq!(source(codex, &root_instructions)["scope"], "repository");
+
+    write(
+        fx.codex_home.join("config.toml"),
+        "project_root_markers = []\n",
+    );
+    let output = fx
+        .cmd()
+        .arg("--json")
+        .arg("memory")
+        .arg("show")
+        .arg(&nested)
+        .arg("--provider")
+        .arg("codex")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let inventory: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let codex = provider(&inventory, "codex");
+    assert!(
+        codex["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| { item["path"] != root_instructions.display().to_string() })
+    );
+}
+
+#[test]
+fn codex_inventories_profile_and_project_trust_alternatives() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    fx.git(&["init", "--quiet"]);
+    write(
+        fx.codex_home.join("config.toml"),
+        "project_doc_fallback_filenames = [\"USER.md\"]\n",
+    );
+    write(
+        fx.codex_home.join("work.config.toml"),
+        "project_doc_fallback_filenames = [\"TEAM.md\"]\n",
+    );
+    write(
+        fx.root.path().join(".codex/config.toml"),
+        "project_doc_fallback_filenames = [\"PROJECT.md\"]\n",
+    );
+    let user = fx.root.path().join("USER.md");
+    let team = fx.root.path().join("TEAM.md");
+    let project = fx.root.path().join("PROJECT.md");
+    write(&user, "user fallback\n");
+    write(&team, "profile fallback\n");
+    write(&project, "project fallback\n");
+
+    let output = fx
+        .cmd()
+        .arg("--json")
+        .arg("memory")
+        .arg("show")
+        .arg(fx.root.path())
+        .arg("--provider")
+        .arg("codex")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let inventory: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let codex = provider(&inventory, "codex");
+    for candidate in [&user, &team, &project] {
+        assert_eq!(source(codex, candidate)["load_state"], "unknown");
+    }
+    let warning_codes = codex["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|warning| warning["code"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(warning_codes.contains(&"codex-profile-unresolved"));
+    assert!(warning_codes.contains(&"codex-project-trust-unresolved"));
+}
+
+#[test]
+fn codex_project_config_keeps_dependent_instruction_states_unknown() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    fx.git(&["init", "--quiet"]);
+    write(
+        fx.root.path().join(".codex/config.toml"),
+        "project_doc_fallback_filenames = [\"TEAM.md\"]\nproject_doc_max_bytes = 1\n",
+    );
+    let fallback = fx.root.path().join("TEAM.md");
+    write(&fallback, "project fallback\n");
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("memory")
+        .arg("show")
+        .arg(fx.root.path())
+        .arg("--provider")
+        .arg("codex")
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let inventory: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let codex = provider(&inventory, "codex");
+    assert_eq!(codex["memory_state"], "unknown");
+    let fallback = source(codex, &fallback);
+    assert_eq!(fallback["load_state"], "unknown");
+    assert!(
+        fallback["detail"]
             .as_str()
             .unwrap()
-            .contains("2 of 5 bytes")
+            .contains("project trust is unresolved")
     );
-    assert_eq!(source(codex, &path)["load_state"], "disabled");
+}
+
+#[cfg(unix)]
+#[test]
+fn external_codex_project_sources_are_visible_but_uninspected() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    fx.git(&["init", "--quiet"]);
+
+    let external = fx.codex_home.join("external-project-state");
+    write(
+        external.join("config.toml"),
+        "project_doc_fallback_filenames = [\"EXTERNAL.md\"]\n",
+    );
+    write(external.join("AGENTS.md"), "external instructions\n");
+    write(fx.root.path().join("EXTERNAL.md"), "must not be selected\n");
+    std::fs::create_dir_all(fx.root.path().join(".codex")).unwrap();
+    std::os::unix::fs::symlink(
+        external.join("config.toml"),
+        fx.root.path().join(".codex/config.toml"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(external.join("AGENTS.md"), fx.root.path().join("AGENTS.md"))
+        .unwrap();
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("memory")
+        .arg("show")
+        .arg(fx.root.path())
+        .arg("--provider")
+        .arg("codex")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let inventory: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let codex = provider(&inventory, "codex");
+    let config = source(codex, &fx.root.path().join(".codex/config.toml"));
+    assert_eq!(config["load_state"], "unknown");
+    assert_eq!(config["bytes"], Value::Null);
+    let instructions = source(codex, &fx.root.path().join("AGENTS.md"));
+    assert_eq!(instructions["load_state"], "unknown");
+    assert_eq!(instructions["bytes"], Value::Null);
+    assert!(codex["sources"].as_array().unwrap().iter().all(|source| {
+        source["path"] != fx.root.path().join("EXTERNAL.md").display().to_string()
+    }));
 }
 
 #[test]
@@ -305,15 +496,15 @@ fn disabled_memory_is_visible_for_both_providers() {
     let inventory: Value = serde_json::from_slice(&out.stdout).unwrap();
     let codex = provider(&inventory, "codex");
     let claude = provider(&inventory, "claude");
-    assert_eq!(codex["memory_state"], "disabled");
-    assert_eq!(claude["memory_state"], "disabled");
+    assert_eq!(codex["memory_state"], "unknown");
+    assert_eq!(claude["memory_state"], "unknown");
     assert_eq!(
         source(codex, &codex_memory.join("memory_summary.md"))["load_state"],
-        "disabled"
+        "unknown"
     );
     assert_eq!(
         source(claude, &claude_memory.join("MEMORY.md"))["load_state"],
-        "disabled"
+        "unknown"
     );
 }
 
@@ -362,18 +553,80 @@ fn claude_memory_settings_use_provider_scope_rules() {
     assert!(out.status.success());
     let inventory: Value = serde_json::from_slice(&out.stdout).unwrap();
     let claude = provider(&inventory, "claude");
-    assert_eq!(claude["memory_state"], "disabled");
-    assert_eq!(source(claude, &user_index)["load_state"], "disabled");
-    assert!(claude["sources"].as_array().unwrap().iter().all(|source| {
-        source["path"] != local_index.display().to_string()
-            && source["path"] != project_index.display().to_string()
-    }));
+    assert_eq!(claude["memory_state"], "unknown");
+    let local_source = source(claude, &local_index);
+    assert_eq!(local_source["load_state"], "unknown");
+    assert_eq!(local_source["scope"], "repository");
+    assert_eq!(local_source["association"], "target");
+    let user_source = source(claude, &user_index);
+    assert_eq!(user_source["load_state"], "unknown");
+    assert_eq!(user_source["scope"], "global");
+    assert_eq!(user_source["association"], "global");
+    assert!(
+        claude["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|source| { source["path"] != project_index.display().to_string() })
+    );
     assert!(
         claude["warnings"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|warning| warning["code"] == "unsupported-auto-memory-directory-scope")
+            .any(|warning| warning["code"] == "claude-project-trust-unresolved")
+    );
+    assert!(
+        claude["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|warning| warning["code"] != "ignored-auto-memory-directory-scope")
+    );
+}
+
+#[test]
+fn claude_project_auto_memory_directory_is_trust_conditional() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let project_memory = fx.root.path().join("project-memory");
+    let project_index = project_memory.join("MEMORY.md");
+    write_json(
+        fx.root.path().join(".claude/settings.json"),
+        json!({ "autoMemoryDirectory": project_memory }),
+    );
+    write(&project_index, "project memory\n");
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("memory")
+        .arg("show")
+        .arg(fx.root.path())
+        .arg("--provider")
+        .arg("claude")
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let inventory: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let claude = provider(&inventory, "claude");
+    let project_source = source(claude, &project_index);
+    assert_eq!(project_source["load_state"], "unknown");
+    assert_eq!(project_source["scope"], "repository");
+    assert_eq!(project_source["association"], "target");
+    assert!(
+        project_source["detail"]
+            .as_str()
+            .unwrap()
+            .contains("trusts the workspace")
+    );
+    assert!(
+        claude["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning["code"] == "claude-project-trust-unresolved")
     );
 }
 
@@ -542,6 +795,99 @@ fn claude_exclusions_and_external_imports_preserve_unknown_state() {
 }
 
 #[test]
+fn claude_external_import_approval_is_resolved_from_project_state() {
+    let fx = Fixture::new();
+    let root = fx.root.path().canonicalize().unwrap();
+    let mut projects = serde_json::Map::new();
+    projects.insert(
+        root.display().to_string(),
+        json!({ "hasClaudeMdExternalIncludesApproved": true }),
+    );
+    fx.write_config(Value::Object(projects), json!({}));
+    let external = fx.codex_home.join("approved.md");
+    write(&external, "approved\n");
+    write(
+        fx.root.path().join("CLAUDE.md"),
+        &format!("@{}\n", external.display()),
+    );
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("memory")
+        .arg("show")
+        .arg(fx.root.path())
+        .arg("--provider")
+        .arg("claude")
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let inventory: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        source(provider(&inventory, "claude"), &external)["load_state"],
+        "loaded"
+    );
+
+    let mut projects = serde_json::Map::new();
+    projects.insert(
+        root.display().to_string(),
+        json!({ "hasClaudeMdExternalIncludesApproved": false }),
+    );
+    fx.write_config(Value::Object(projects), json!({}));
+    let denied = fx
+        .cmd()
+        .arg("--json")
+        .arg("memory")
+        .arg("show")
+        .arg(fx.root.path())
+        .arg("--provider")
+        .arg("claude")
+        .output()
+        .unwrap();
+    let denied: Value = serde_json::from_slice(&denied.stdout).unwrap();
+    assert_eq!(
+        source(provider(&denied, "claude"), &external)["load_state"],
+        "disabled"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unresolved_external_import_symlink_is_not_resolved_or_inspected() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let external = fx.codex_home.join("external.md");
+    write(&external, "external\n");
+    let link = fx.root.path().join("linked.md");
+    std::os::unix::fs::symlink(&external, &link).unwrap();
+    write(fx.root.path().join("CLAUDE.md"), "@linked.md\n");
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("memory")
+        .arg("show")
+        .arg(fx.root.path())
+        .arg("--provider")
+        .arg("claude")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let inventory: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let imported = source(provider(&inventory, "claude"), &link);
+    assert_eq!(imported["load_state"], "unknown");
+    assert!(imported["bytes"].is_null());
+    assert!(
+        provider(&inventory, "claude")["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate["path"] != external.display().to_string())
+    );
+}
+
+#[test]
 fn intra_repository_imports_use_the_repository_as_the_trust_root() {
     let fx = Fixture::new();
     fx.write_config(json!({}), json!({}));
@@ -574,7 +920,7 @@ fn intra_repository_imports_use_the_repository_as_the_trust_root() {
 }
 
 #[test]
-fn claude_imports_stop_after_five_hops() {
+fn claude_imports_stop_after_four_hops() {
     let fx = Fixture::new();
     fx.write_config(json!({}), json!({}));
     write(fx.root.path().join("CLAUDE.md"), "@imports/1.md\n");
@@ -603,19 +949,19 @@ fn claude_imports_stop_after_five_hops() {
     assert!(out.status.success());
     let inventory: Value = serde_json::from_slice(&out.stdout).unwrap();
     let claude = provider(&inventory, "claude");
-    for index in 1..=5 {
+    for index in 1..=4 {
         assert_eq!(
             source(claude, &fx.root.path().join(format!("imports/{index}.md")))["load_state"],
             "loaded"
         );
     }
-    let sixth = fx.root.path().join("imports/6.md").display().to_string();
+    let fifth = fx.root.path().join("imports/5.md").display().to_string();
     assert!(
         claude["sources"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|source| source["path"] != sixth)
+            .all(|source| source["path"] != fifth)
     );
     assert!(
         claude["warnings"]
@@ -624,6 +970,134 @@ fn claude_imports_stop_after_five_hops() {
             .iter()
             .any(|warning| warning["code"] == "claude-import-depth-exceeded")
     );
+}
+
+#[test]
+fn claude_memory_index_records_truncation_while_session_state_is_unknown() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    write_json(
+        fx.claude_home.join("settings.json"),
+        json!({ "autoMemoryEnabled": true }),
+    );
+    fx.write_transcript("target", &fx.root.path().display().to_string());
+    let index = fx.transcript_project_dir("target").join("memory/MEMORY.md");
+    write(&index, &"line\n".repeat(201));
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("memory")
+        .arg("show")
+        .arg(fx.root.path())
+        .arg("--provider")
+        .arg("claude")
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let inventory: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let index = source(provider(&inventory, "claude"), &index);
+    assert_eq!(index["load_state"], "unknown");
+    assert!(
+        index["detail"]
+            .as_str()
+            .unwrap()
+            .contains("first 200 lines")
+    );
+}
+
+#[test]
+fn claude_instruction_size_limit_matches_provider_boundary() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let instructions = fx.root.path().join("CLAUDE.md");
+    std::fs::write(&instructions, vec![b'x'; 4 * 1024 * 1024]).unwrap();
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("memory")
+        .arg("show")
+        .arg(fx.root.path())
+        .arg("--provider")
+        .arg("claude")
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let inventory: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let exact_limit_source = source(provider(&inventory, "claude"), &instructions);
+    assert_eq!(exact_limit_source["load_state"], "loaded");
+
+    std::fs::write(&instructions, vec![b'x'; 4 * 1024 * 1024 + 1]).unwrap();
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("memory")
+        .arg("show")
+        .arg(fx.root.path())
+        .arg("--provider")
+        .arg("claude")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let inventory: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let oversized_source = source(provider(&inventory, "claude"), &instructions);
+    assert_eq!(oversized_source["load_state"], "disabled");
+    assert!(
+        oversized_source["detail"]
+            .as_str()
+            .unwrap()
+            .contains("skipped by Claude")
+    );
+}
+
+#[test]
+fn claude_import_fanout_is_bounded_per_source() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let imports = (0..1_100)
+        .map(|index| format!("@missing-{index:04}.md"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    write(fx.root.path().join("CLAUDE.md"), &imports);
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("memory")
+        .arg("show")
+        .arg(fx.root.path())
+        .arg("--provider")
+        .arg("claude")
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let inventory: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let warnings = provider(&inventory, "claude")["warnings"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|warning| warning["code"] == "claude-import-source-limit")
+            .count(),
+        1
+    );
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|warning| warning["code"] == "claude-import-missing")
+            .count(),
+        1_023
+    );
+    assert!(warnings.iter().all(|warning| {
+        !warning["path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("missing-1099.md"))
+    }));
 }
 
 #[test]
@@ -714,7 +1188,7 @@ fn directly_loaded_claude_md_is_not_duplicated_when_ancestor_imports_it() {
 
 #[cfg(unix)]
 #[test]
-fn claude_rules_follow_provider_supported_symlinks() {
+fn external_claude_rule_symlinks_are_traversed() {
     let fx = Fixture::new();
     fx.write_config(json!({}), json!({}));
     let shared_rules = fx.codex_home.join("shared-rules");
@@ -735,11 +1209,13 @@ fn claude_rules_follow_provider_supported_symlinks() {
         .unwrap();
     assert!(out.status.success());
     let inventory: Value = serde_json::from_slice(&out.stdout).unwrap();
-    let linked_rule = rules.join("shared/shared.md");
-    assert_eq!(
-        source(provider(&inventory, "claude"), &linked_rule)["load_state"],
-        "loaded"
+    let linked_source = source(
+        provider(&inventory, "claude"),
+        &rules.join("shared/shared.md"),
     );
+    assert_eq!(linked_source["load_state"], "loaded");
+    assert_eq!(linked_source["kind"], "rule");
+    assert!(linked_source["bytes"].as_u64().is_some());
 }
 
 #[test]
@@ -1006,16 +1482,16 @@ fn human_output_compares_provider_coverage() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("memory for"), "stdout:\n{stdout}");
     assert!(
-        stdout.contains("codex  memory enabled"),
+        stdout.contains("codex  memory unknown"),
         "stdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("claude  memory enabled"),
+        stdout.contains("claude  memory unknown"),
         "stdout:\n{stdout}"
     );
     assert!(stdout.contains("provider coverage"), "stdout:\n{stdout}");
     assert!(
-        stdout.contains("startup index: first 200 lines or 25 KiB"),
+        stdout.contains("startup index loaded in full (within 200 lines and 25 KiB)"),
         "stdout:\n{stdout}"
     );
     assert!(!stdout.contains("associated cwd:"), "stdout:\n{stdout}");

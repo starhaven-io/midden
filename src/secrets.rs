@@ -19,6 +19,43 @@ const SUSPECT_SUBSTRINGS: &[&str] = &[
     "cookie",
 ];
 
+/// Words that turn a credential noun into metadata about a credential rather
+/// than credential material itself (`tokenEndpoint`, `passwordLength`,
+/// `privateKeyPath`). This boundary affects doctor's Error findings, so false
+/// positives must not be treated as committed secrets.
+const NON_SECRET_METADATA_WORDS: &[&str] = &[
+    "algorithm",
+    "budget",
+    "command",
+    "count",
+    "duration",
+    "endpoint",
+    "env",
+    "expiry",
+    "file",
+    "format",
+    "header",
+    "id",
+    "identifier",
+    "length",
+    "limit",
+    "method",
+    "mode",
+    "name",
+    "path",
+    "port",
+    "prefix",
+    "prompt",
+    "provider",
+    "scope",
+    "source",
+    "ttl",
+    "type",
+    "url",
+    "var",
+    "variable",
+];
+
 /// Whether a key name looks like it holds a credential.
 pub fn key_looks_sensitive(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -76,10 +113,12 @@ pub fn mask(s: &str) -> String {
 /// no key of their own and would otherwise leak through unmasked.
 pub fn mask_value(value: &mut Value) {
     match value {
-        Value::String(s) => *s = mask(s),
+        Value::String(s) if !is_env_expansion(s) => *s = mask(s),
+        Value::String(_) => {}
         Value::Array(arr) => arr.iter_mut().for_each(mask_value),
         Value::Object(map) => map.values_mut().for_each(mask_value),
-        _ => {}
+        Value::Number(_) | Value::Bool(_) => *value = Value::String("***".into()),
+        Value::Null => {}
     }
 }
 
@@ -206,16 +245,184 @@ fn url_has_sensitive_query(s: &str) -> bool {
     let query = s[q + 1..].split('#').next().unwrap_or("");
     query.split('&').any(|pair| {
         matches!(pair.split_once('='),
-            Some((k, v)) if !v.is_empty() && key_looks_sensitive(k))
+            Some((k, v)) if !v.is_empty() && key_looks_sensitive(&percent_decode(k)))
     })
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+        {
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn authorization_value_ranges(s: &str) -> Vec<(usize, usize)> {
+    let lower = s.to_ascii_lowercase();
+    let marker = "authorization:";
+    let mut ranges = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative) = lower[cursor..].find(marker) {
+        let marker_start = cursor + relative;
+        let mut start = marker_start + marker.len();
+        while s.as_bytes().get(start).is_some_and(u8::is_ascii_whitespace) {
+            start += 1;
+        }
+        for scheme in ["bearer", "basic"] {
+            if lower[start..].starts_with(scheme) {
+                start += scheme.len();
+                while s.as_bytes().get(start).is_some_and(u8::is_ascii_whitespace) {
+                    start += 1;
+                }
+                break;
+            }
+        }
+        let end = s[start..]
+            .char_indices()
+            .find_map(|(offset, character)| {
+                (character.is_whitespace() || matches!(character, '\'' | '"' | ';' | ','))
+                    .then_some(start + offset)
+            })
+            .unwrap_or(s.len());
+        if end > start && !is_env_expansion(&s[start..end]) {
+            ranges.push((start, end));
+        }
+        cursor = (marker_start + marker.len()).max(end);
+    }
+    ranges
+}
+
+/// Whether a string is purely a `${VAR}` environment reference. A
+/// `${VAR:-default}` ships whatever the default holds, so it is still scanned.
+pub fn is_env_expansion(value: &str) -> bool {
+    let Some(inner) = value
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+    else {
+        return false;
+    };
+    !inner.is_empty()
+        && inner
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// Whether an argv token names an option whose next token is a credential.
+///
+/// Split argv is a stronger claim than key-name masking: treating broad words
+/// such as `auth`, `credential`, or `session` as proof would hide innocent
+/// values such as `--auth oauth` and `--credentials-file path`. Restrict this
+/// boundary to option names that specifically identify secret material.
+pub fn argument_expects_secret(argument: &str) -> bool {
+    let argument = argument.trim_matches(['\'', '"']);
+    if argument == "--" || argument.contains('=') || !argument.starts_with('-') {
+        return false;
+    }
+    let name = argument.trim_start_matches('-');
+    option_name_expects_secret(name)
+}
+
+fn option_name_expects_secret(name: &str) -> bool {
+    let words = split_words(name);
+    if words
+        .iter()
+        .any(|word| NON_SECRET_METADATA_WORDS.contains(&word.as_str()))
+    {
+        return false;
+    }
+    words.iter().any(|word| {
+        matches!(
+            word.as_str(),
+            "token" | "secret" | "password" | "passwd" | "apikey" | "bearer" | "cookie"
+        )
+    }) || words
+        .windows(2)
+        .any(|pair| pair == ["api", "key"] || pair == ["api", "keys"])
+        || words
+            .windows(2)
+            .any(|pair| pair == ["private", "key"] || pair == ["private", "keys"])
+}
+
+/// Whether a structured key specifically names secret material rather than a
+/// broader authentication/session object whose descendants need independent
+/// inspection.
+pub fn key_expects_secret_value(name: &str) -> bool {
+    let words = split_words(name);
+    if words
+        .iter()
+        .any(|word| NON_SECRET_METADATA_WORDS.contains(&word.as_str()))
+    {
+        return false;
+    }
+    words.iter().any(|word| {
+        matches!(
+            word.as_str(),
+            "token"
+                | "secret"
+                | "password"
+                | "passwd"
+                | "apikey"
+                | "credential"
+                | "credentials"
+                | "bearer"
+                | "cookie"
+        )
+    }) || words
+        .windows(2)
+        .any(|pair| pair == ["api", "key"] || pair == ["api", "keys"])
+        || words
+            .windows(2)
+            .any(|pair| pair == ["private", "key"] || pair == ["private", "keys"])
+}
+
+/// Return the credential part of `--token=value` or `TOKEN=value`.
+pub fn sensitive_argument_value(argument: &str) -> Option<&str> {
+    let argument = argument.trim_matches(['\'', '"']);
+    let (name, value) = argument.split_once('=')?;
+    let option = name.starts_with('-');
+    let name = name.trim_start_matches('-');
+    let env_name = !name.is_empty()
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_');
+    let sensitive_name = if option {
+        option_name_expects_secret(name)
+    } else {
+        env_name && key_expects_secret_value(name)
+    };
+    (!value.is_empty() && sensitive_name).then_some(value)
 }
 
 /// Whether a string value itself looks like a credential, regardless of the
 /// key it sits under.
 pub fn value_looks_sensitive(s: &str) -> bool {
     is_private_key_block(s)
-        || url_has_password(s)
-        || url_has_sensitive_query(s)
+        || url_ranges(s).iter().any(|(start, end)| {
+            url_has_password(&s[*start..*end]) || url_has_sensitive_query(&s[*start..*end])
+        })
+        || !authorization_value_ranges(s).is_empty()
+        || sensitive_argument_value(s).is_some()
         || !token_runs(s).is_empty()
 }
 
@@ -242,7 +449,7 @@ fn mask_inline(s: &str) -> String {
 
 /// Mask the credential-bearing parts of a URL: any `user:pass` userinfo and
 /// the values of credential-named (or token-shaped) query parameters.
-fn mask_url(url: &str) -> String {
+fn mask_single_url(url: &str) -> String {
     let mut out = url.to_string();
     if let Some(scheme_end) = out.find("://") {
         let auth_start = scheme_end + 3;
@@ -268,7 +475,9 @@ fn mask_url(url: &str) -> String {
             .split('&')
             .map(|pair| match pair.split_once('=') {
                 Some((k, v))
-                    if !v.is_empty() && (key_looks_sensitive(k) || value_looks_sensitive(v)) =>
+                    if !v.is_empty()
+                        && (key_looks_sensitive(&percent_decode(k))
+                            || value_looks_sensitive(v)) =>
                 {
                     format!("{k}={}", mask(v))
                 }
@@ -284,11 +493,142 @@ fn mask_url(url: &str) -> String {
     out
 }
 
+fn url_ranges(value: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative) = value[cursor..].find("://") {
+        let marker = cursor + relative;
+        let start = value[..marker]
+            .char_indices()
+            .rev()
+            .take_while(|(_, character)| {
+                character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+            })
+            .last()
+            .map_or(marker, |(index, _)| index);
+        let end = value[marker + 3..]
+            .char_indices()
+            .find_map(|(offset, character)| {
+                (character.is_whitespace() || matches!(character, '\'' | '"' | '<' | '>'))
+                    .then_some(marker + 3 + offset)
+            })
+            .unwrap_or(value.len());
+        if start < marker && end > marker + 3 {
+            ranges.push((start, end));
+        }
+        cursor = end.max(marker + 3);
+    }
+    ranges
+}
+
+fn mask_urls(value: &str) -> String {
+    let mut masked = value.to_string();
+    for (start, end) in url_ranges(value).into_iter().rev() {
+        masked.replace_range(start..end, &mask_single_url(&value[start..end]));
+    }
+    masked
+}
+
 /// Mask credential-shaped parts embedded in free-form text — hook commands,
 /// MCP URLs — keeping everything else readable. Returns the input unchanged
 /// when nothing matches.
 pub fn mask_embedded(s: &str) -> String {
-    mask_inline(&mask_url(s))
+    let mut masked = mask_urls(s);
+    let mut ranges = argument_value_ranges(&masked);
+    ranges.extend(authorization_value_ranges(&masked));
+    for (start, end) in merged_ranges(ranges).into_iter().rev() {
+        let replacement = mask(&masked[start..end]);
+        masked.replace_range(start..end, &replacement);
+    }
+    mask_inline(&masked)
+}
+
+/// Mask credentials in prose without treating adjacent words as shell
+/// arguments. Structured command and argv fields should use `mask_embedded`;
+/// diagnostics use this narrower form so text such as "for --token with" does
+/// not cause the word after the option name to disappear.
+pub fn mask_free_text(s: &str) -> String {
+    let mut masked = mask_urls(s);
+    let mut ranges = inline_argument_value_ranges(&masked);
+    ranges.extend(authorization_value_ranges(&masked));
+    for (start, end) in merged_ranges(ranges).into_iter().rev() {
+        let replacement = mask(&masked[start..end]);
+        masked.replace_range(start..end, &replacement);
+    }
+    mask_inline(&masked)
+}
+
+fn merged_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some((_, previous_end)) = merged.last_mut()
+            && start <= *previous_end
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
+fn inline_argument_value_ranges(s: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = None;
+    for (index, character) in s.char_indices().chain(std::iter::once((s.len(), ' '))) {
+        if character.is_whitespace() {
+            if let Some(start) = start.take() {
+                let token = s[start..index].trim_matches(['\'', '"']);
+                if let Some(value) = sensitive_argument_value(token) {
+                    let offset = s[start..index].find(value).unwrap_or(0);
+                    ranges.push((start + offset, start + offset + value.len()));
+                }
+            }
+        } else {
+            start.get_or_insert(index);
+        }
+    }
+    ranges
+}
+
+fn argument_value_ranges(s: &str) -> Vec<(usize, usize)> {
+    let mut tokens = Vec::new();
+    let mut start = None;
+    for (index, character) in s.char_indices() {
+        if character.is_whitespace() {
+            if let Some(start) = start.take() {
+                tokens.push((start, index));
+            }
+        } else {
+            start.get_or_insert(index);
+        }
+    }
+    if let Some(start) = start {
+        tokens.push((start, s.len()));
+    }
+
+    let mut ranges = Vec::new();
+    for (index, &(start, end)) in tokens.iter().enumerate() {
+        let token = s[start..end].trim_matches(['\'', '"']);
+        if let Some(value) = sensitive_argument_value(token) {
+            let offset = s[start..end].find(value).unwrap_or(0);
+            ranges.push((start + offset, start + offset + value.len()));
+        } else if argument_expects_secret(token)
+            && let Some(&(next_start, next_end)) = tokens.get(index + 1)
+        {
+            let next = &s[next_start..next_end];
+            let leading = next.len() - next.trim_start_matches(['\'', '"']).len();
+            let trailing = next.len() - next.trim_end_matches(['\'', '"']).len();
+            let unquoted = &next[leading..next.len().saturating_sub(trailing)];
+            if !is_env_expansion(unquoted)
+                && next_start + leading < next_end.saturating_sub(trailing)
+            {
+                ranges.push((next_start + leading, next_end - trailing));
+            }
+        }
+    }
+    ranges
 }
 
 /// Display form of a value already judged sensitive: mask just the
@@ -309,9 +649,62 @@ pub fn mask_sensitive_values(value: &mut Value) {
                 *s = masked_for_display(s);
             }
         }
-        Value::Array(arr) => arr.iter_mut().for_each(mask_sensitive_values),
+        Value::Array(arr) => {
+            let mut mask_next = false;
+            for item in arr {
+                if mask_next {
+                    if !item.as_str().is_some_and(is_env_expansion) {
+                        mask_value(item);
+                    }
+                    mask_next = false;
+                    continue;
+                }
+                if let Value::String(argument) = item {
+                    mask_next = argument_expects_secret(argument);
+                }
+                mask_sensitive_values(item);
+            }
+        }
         Value::Object(map) => map.values_mut().for_each(mask_sensitive_values),
         _ => {}
+    }
+}
+
+/// Apply both key-shaped and value-shaped masking to an arbitrary serialized
+/// tree. This is the final JSON-output safety net for free-form report fields.
+pub fn mask_tree(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if key_looks_sensitive(key) {
+                    mask_value(child);
+                } else {
+                    mask_tree(child);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            let mut mask_next = false;
+            for item in arr {
+                if mask_next {
+                    if !item.as_str().is_some_and(is_env_expansion) {
+                        mask_value(item);
+                    }
+                    mask_next = false;
+                    continue;
+                }
+                if let Value::String(argument) = item {
+                    mask_next = argument_expects_secret(argument);
+                }
+                mask_tree(item);
+            }
+        }
+        Value::String(s) => {
+            if value_looks_sensitive(s) {
+                *s = mask_free_text(s);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
 }
 
@@ -406,6 +799,9 @@ mod tests {
             "https://mcp.example.com/sse?api_key=abc123"
         ));
         assert!(!value_looks_sensitive("https://example.com/path?page=2"));
+        assert!(value_looks_sensitive(
+            "https://example.com/path?api%5Fkey=abc123"
+        ));
         assert!(
             !value_looks_sensitive("ssh://git@github.com/x.git"),
             "username alone is not a credential"
@@ -445,6 +841,48 @@ mod tests {
     }
 
     #[test]
+    fn mask_embedded_masks_argument_and_authorization_context() {
+        assert_eq!(
+            mask_embedded("cmd --token hunter2 ok"),
+            "cmd --token hunt*** ok"
+        );
+        assert_eq!(
+            mask_embedded("cmd --api-key=short"),
+            "cmd --api-key=shor***"
+        );
+        assert_eq!(
+            mask_embedded("Authorization: bearer opaquevalue"),
+            "Authorization: bearer opaq***"
+        );
+        assert_eq!(
+            mask_embedded("Authorization: bearer first-secret, Authorization: Basic second-secret"),
+            "Authorization: bearer firs***, Authorization: Basic seco***"
+        );
+        assert_eq!(
+            mask_embedded("Authorization: Bearer --token=overlapping-secret"),
+            "Authorization: Bearer --to***"
+        );
+    }
+
+    #[test]
+    fn free_text_does_not_treat_prose_as_argv() {
+        assert_eq!(
+            mask_free_text(
+                "value for --token with a masked credential ghp_AAAA1111bbbb2222cccc3333dddd4444"
+            ),
+            "value for --token with a masked credential ghp_***"
+        );
+        assert_eq!(
+            mask_free_text("use --token=plain-secret"),
+            "use --token=plai***"
+        );
+        assert_eq!(
+            mask_free_text("Authorization: Bearer --token=overlapping-secret"),
+            "Authorization: Bearer --to***"
+        );
+    }
+
+    #[test]
     fn mask_embedded_masks_url_parts() {
         let url = "https://user:s3cretpass@host.example.com/sse?token=abcd1234&page=2";
         let masked = mask_embedded(url);
@@ -454,6 +892,12 @@ mod tests {
         assert!(
             masked.contains("page=2"),
             "innocent params survive: {masked}"
+        );
+        assert_eq!(
+            mask_embedded(
+                "curl https://example.test/ok https://user:second-secret@example.test/private"
+            ),
+            "curl https://example.test/ok https://***@example.test/private"
         );
         assert_eq!(
             mask_embedded("echo done"),
@@ -488,6 +932,22 @@ mod tests {
     }
 
     #[test]
+    fn mask_tree_honors_sensitive_keys_inside_arrays() {
+        let mut value = json!({
+            "items": [
+                {"password": "hunter2", "nested": [{"api_key": 12345}]},
+                "ordinary"
+            ]
+        });
+
+        mask_tree(&mut value);
+
+        assert_eq!(value["items"][0]["password"], "hunt***");
+        assert_eq!(value["items"][0]["nested"][0]["api_key"], "***");
+        assert_eq!(value["items"][1], "ordinary");
+    }
+
+    #[test]
     fn mask_value_masks_every_string_in_subtree() {
         // Callers gate this on an already-sensitive key, so every string under
         // it is masked — including array elements, the case that used to leak.
@@ -502,8 +962,8 @@ mod tests {
         assert_eq!(v["nested"]["GITHUB_TOKEN"], "ghp_***");
         assert_eq!(v["list"][0], "sk-o***");
         assert_eq!(v["list"][1], "sk-t***");
-        // Non-string leaves are left untouched.
-        assert_eq!(v["count"], 7);
+        // A non-string leaf under a sensitive key is hidden as well.
+        assert_eq!(v["count"], "***");
     }
 
     #[test]
@@ -512,5 +972,50 @@ mod tests {
         mask_value(&mut v);
         assert_eq!(v[0], "sk-r***");
         assert_eq!(v[1], "sk-r***");
+    }
+
+    #[test]
+    fn mask_value_masks_non_string_sensitive_leaves() {
+        let mut value = json!({"numeric": 1234, "enabled": true, "unset": null});
+        mask_value(&mut value);
+        assert_eq!(value["numeric"], "***");
+        assert_eq!(value["enabled"], "***");
+        assert!(value["unset"].is_null());
+    }
+
+    #[test]
+    fn mask_sensitive_values_understands_split_argv() {
+        let mut value = json!(["cmd", "--token", "hunter2", "--mode", "safe"]);
+        mask_sensitive_values(&mut value);
+        assert_eq!(value[2], "hunt***");
+        assert_eq!(value[4], "safe");
+    }
+
+    #[test]
+    fn split_argv_does_not_mask_environment_references_or_option_metadata() {
+        let mut value = json!([
+            "cmd",
+            "--token",
+            "${SERVICE_TOKEN}",
+            "--auth",
+            "oauth",
+            "--credentials-file",
+            "/tmp/credentials.json",
+            "--session-name",
+            "work"
+        ]);
+
+        mask_tree(&mut value);
+
+        assert_eq!(value[2], "${SERVICE_TOKEN}");
+        assert_eq!(value[4], "oauth");
+        assert_eq!(value[6], "/tmp/credentials.json");
+        assert_eq!(value[8], "work");
+        assert_eq!(
+            mask_embedded(
+                "cmd --token ${SERVICE_TOKEN} --auth oauth --credentials-file=/tmp/key.json"
+            ),
+            "cmd --token ${SERVICE_TOKEN} --auth oauth --credentials-file=/tmp/key.json"
+        );
     }
 }
