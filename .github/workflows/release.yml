@@ -553,13 +553,17 @@ jobs:
           LOCAL_VERSION=$(cargo metadata --locked --no-deps --format-version 1 \
             | jq -er '.packages | map(select(.name == "midden")) | if length == 1 then .[0].version else error("expected exactly one midden package") end')
           test "${LOCAL_VERSION}" = "${VERSION}"
-          if cargo info "midden@${VERSION}" --registry crates-io >crate-info.txt 2>crate-error.txt; then
+          # cargo publish refuses a dirty working directory, so this lookup
+          # must not leave its output beside the crate sources.
+          INFO="${RUNNER_TEMP}/crate-info.txt"
+          LOOKUP_ERROR="${RUNNER_TEMP}/crate-error.txt"
+          if cargo info "midden@${VERSION}" --registry crates-io >"${INFO}" 2>"${LOOKUP_ERROR}"; then
             echo "needed=false" >> "${GITHUB_OUTPUT}"
-          elif grep -q "could not find" crate-error.txt; then
+          elif grep -q "could not find" "${LOOKUP_ERROR}"; then
             echo "needed=true" >> "${GITHUB_OUTPUT}"
           else
             echo "::error::crates.io lookup failed"
-            cat crate-error.txt
+            cat "${LOOKUP_ERROR}"
             exit 1
           fi
 
