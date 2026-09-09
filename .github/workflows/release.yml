@@ -901,6 +901,9 @@ jobs:
           HEAD_SHA: ${{ needs.validate-cask-bump.outputs.head_sha }}
         run: |
           test "$(gh api "/repos/starhaven-io/homebrew-tap/pulls/${PR_NUMBER}" --jq .head.sha)" = "${HEAD_SHA}"
+          CHECK_TIMEOUT_SECONDS=1500
+          CHECK_INTERVAL_SECONDS=10
+          DEADLINE=$((SECONDS + CHECK_TIMEOUT_SECONDS))
           REQUIRED_CHECKS=0
           for attempt in {1..30}; do
             REQUIRED_CHECKS=$(gh pr checks "${PR_NUMBER}" \
@@ -909,14 +912,45 @@ jobs:
               break
             fi
             if [[ "${attempt}" == 30 ]]; then
-              echo "::error::no required checks appeared for the cask pull request"
+              echo "::error::no required checks appeared before the cask check timeout"
               exit 1
             fi
-            sleep 10
+            sleep "${CHECK_INTERVAL_SECONDS}"
           done
-          gh pr checks "${PR_NUMBER}" --repo starhaven-io/homebrew-tap \
-            --required --watch --fail-fast
-          test "$(gh api "/repos/starhaven-io/homebrew-tap/pulls/${PR_NUMBER}" --jq .head.sha)" = "${HEAD_SHA}"
+          CHECKS_READY=false
+          MERGE_STATE=UNKNOWN
+          while (( SECONDS < DEADLINE )); do
+            CHECK_STATUS=0
+            gh pr checks "${PR_NUMBER}" --repo starhaven-io/homebrew-tap --required \
+              || CHECK_STATUS=$?
+            case "${CHECK_STATUS}" in
+              0) CHECK_SUMMARY=passing ;;
+              8) CHECK_SUMMARY=pending ;;
+              *)
+                echo "::error::a required cask check failed"
+                exit "${CHECK_STATUS}"
+                ;;
+            esac
+            PR_STATE=$(gh pr view "${PR_NUMBER}" --repo starhaven-io/homebrew-tap \
+              --json headRefOid,mergeStateStatus)
+            if ! jq -e --arg head "${HEAD_SHA}" \
+              '.headRefOid == $head' <<< "${PR_STATE}" >/dev/null; then
+              echo "::error::cask pull request head changed while waiting for required checks"
+              exit 1
+            fi
+            MERGE_STATE=$(jq -r '.mergeStateStatus' <<< "${PR_STATE}")
+            echo "Required cask checks: ${CHECK_SUMMARY}; merge state: ${MERGE_STATE}"
+            if (( CHECK_STATUS == 0 )) \
+              && [[ "${MERGE_STATE}" == "CLEAN" || "${MERGE_STATE}" == "UNSTABLE" ]]; then
+              CHECKS_READY=true
+              break
+            fi
+            sleep "${CHECK_INTERVAL_SECONDS}"
+          done
+          if [[ "${CHECKS_READY}" != true ]]; then
+            echo "::error::required cask checks did not satisfy branch policy before the timeout (merge state: ${MERGE_STATE})"
+            exit 1
+          fi
 
       - name: Mint bot token for tap
         id: tap-token
