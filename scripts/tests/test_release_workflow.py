@@ -151,6 +151,68 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("and .author.name == $name and .author.email == $email", write)
         self.assertIn("and .committer.name == $name and .committer.email == $email", write)
 
+    def test_cask_check_wait_does_not_accept_partial_registration(self) -> None:
+        merge = job(self.source, "merge-cask-bump")
+        wait = next(block for block in run_blocks(merge) if "CHECK_TIMEOUT_SECONDS" in block)
+        wait = textwrap.dedent(wait).replace("CHECK_INTERVAL_SECONDS=10", "CHECK_INTERVAL_SECONDS=0")
+        stub = r'''
+        gh() {
+          if [[ "$1" == api && "$2" == "/repos/starhaven-io/homebrew-tap/pulls/${PR_NUMBER}" ]]; then
+            printf '%s\n' validated-head
+            return
+          fi
+          if [[ "$1" == pr && "$2" == checks && "$*" == *--json* ]]; then
+            printf '1\n'
+            return
+          fi
+          if [[ "$1" == pr && "$2" == checks ]]; then
+            index=$(< "${GH_FIXTURE_COUNTER}")
+            if [[ "${index}" == 1 ]]; then
+              printf 'conclusion pending\n'
+              return 8
+            fi
+            printf 'visible required checks passed\n'
+            return
+          fi
+          if [[ "$1" == pr && "$2" == view ]]; then
+            index=$(< "${GH_FIXTURE_COUNTER}")
+            printf '%s\n' "$((index + 1))" > "${GH_FIXTURE_COUNTER}"
+            cat "${GH_FIXTURE_DIR}/${index}.json"
+            return
+          fi
+          printf 'unexpected gh call: %s\n' "$*" >&2
+          return 1
+        }
+        '''
+        fixtures = [
+            {"headRefOid": "validated-head", "mergeStateStatus": "BLOCKED"},
+            {"headRefOid": "validated-head", "mergeStateStatus": "BLOCKED"},
+            {"headRefOid": "validated-head", "mergeStateStatus": "CLEAN"},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            counter = path / "counter"
+            counter.write_text("0\n")
+            for index, fixture in enumerate(fixtures):
+                (path / f"{index}.json").write_text(json.dumps(fixture))
+            result = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", textwrap.dedent(stub) + wait],
+                env={
+                    **os.environ,
+                    "GH_FIXTURE_COUNTER": str(counter),
+                    "GH_FIXTURE_DIR": str(path),
+                    "PR_NUMBER": "159",
+                    "HEAD_SHA": "validated-head",
+                },
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(counter.read_text().strip(), "3")
+        self.assertIn("Required cask checks: passing; merge state: BLOCKED", result.stdout)
+        self.assertIn("Required cask checks: pending; merge state: BLOCKED", result.stdout)
+        self.assertIn("Required cask checks: passing; merge state: CLEAN", result.stdout)
+
     def test_cask_validation_is_unprivileged_and_head_bound(self) -> None:
         preparation = job(self.source, "prepare-cask-bump")
         write = job(self.source, "write-cask-bump")
@@ -199,8 +261,20 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("APP_PRIVATE_KEY", validation)
         self.assertNotIn("actions/checkout", merge)
         self.assertIn("gh pr checks", merge)
-        self.assertIn("--required --watch --fail-fast", merge)
-        self.assertIn("no required checks appeared", merge)
+        self.assertIn("CHECK_STATUS=0", merge)
+        self.assertIn("8) CHECK_SUMMARY=pending", merge)
+        self.assertIn("mergeStateStatus", merge)
+        self.assertIn("CHECK_STATUS == 0", merge)
+        self.assertIn(
+            '[[ "${MERGE_STATE}" == "CLEAN" || "${MERGE_STATE}" == "UNSTABLE" ]]',
+            merge,
+        )
+        self.assertIn("CHECK_TIMEOUT_SECONDS=1500", merge)
+        self.assertIn("no required checks appeared before the cask check timeout", merge)
+        self.assertIn("did not satisfy branch policy before the timeout", merge)
+        self.assertIn("a required cask check failed", merge)
+        self.assertNotIn("--watch", merge)
+        self.assertNotIn("--fail-fast", merge)
         self.assertNotIn("--auto", merge)
         self.assertIn('--match-head-commit "${HEAD_SHA}"', merge)
 
