@@ -182,7 +182,7 @@ jobs:
 
       - name: Release note formatter tests
         if: matrix.check == 'lint'
-        run: python3 -m unittest discover --start-directory scripts/tests
+        run: python3 -B -m unittest discover --start-directory scripts/tests
 
       - name: Cargo deny
         if: matrix.check == 'lint'

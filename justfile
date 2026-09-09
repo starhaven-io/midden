@@ -69,7 +69,7 @@ check:
     }
     run cargo clippy --locked --all-targets -- -D warnings
     run cargo fmt -- --check
-    run python3 -m unittest discover --start-directory scripts/tests
+    run python3 -B -m unittest discover --start-directory scripts/tests
     if command -v typos &>/dev/null; then
         run typos
     else
