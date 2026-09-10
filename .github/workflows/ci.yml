@@ -362,36 +362,37 @@ jobs:
           ZIZMOR_RESULT: ${{ needs.zizmor.result }}
           PINPRICK_RESULT: ${{ needs.pinprick.result }}
         run: |
+          require_result() {
+            local name="$1" result="$2" required="$3"
+            case "${required}" in
+              true) test "${result}" = success ;;
+              false) test "${result}" = skipped ;;
+              *) echo "::error::Invalid routing decision for ${name}."; return 1 ;;
+            esac || { echo "::error::${name} ended with ${result:-no result}."; return 1; }
+          }
+
           test "${GENERATE_RESULT}" = "success"
-          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
-            test "${COMMITS_RESULT}" = "success"
-          else
-            test "${COMMITS_RESULT}" = "skipped"
-          fi
-          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
-            test "${FLEET_RESULT}" = "success"
-          else
-            test "${FLEET_RESULT}" = "skipped"
-          fi
+          case "${EVENT_NAME}" in
+            pull_request) REQUIRE_PR_CHECKS=true ;;
+            push) REQUIRE_PR_CHECKS=false ;;
+            *) echo "::error::Unexpected CI event."; exit 1 ;;
+          esac
+          require_result commits "${COMMITS_RESULT}" "${REQUIRE_PR_CHECKS}"
+          require_result fleet "${FLEET_RESULT}" "${REQUIRE_PR_CHECKS}"
           if [[ "${MATRIX}" == "[]" ]]; then
-            test "${CHECK_RESULT}" = "skipped"
+            require_result check "${CHECK_RESULT}" false
+          elif [[ -n "${MATRIX}" ]]; then
+            require_result check "${CHECK_RESULT}" true
           else
-            test "${CHECK_RESULT}" = "success"
+            echo "::error::The check matrix could not be determined."
+            exit 1
           fi
-          if [[ "${COVERAGE}" == "true" && "${CODECOV_ELIGIBLE}" == "true" ]]; then
-            test "${CODECOV_RESULT}" = "success"
-          else
-            test "${CODECOV_RESULT}" = "skipped"
-          fi
-          if [[ "${LINKS}" == "true" ]]; then
-            test "${LINKS_RESULT}" = "success"
-          else
-            test "${LINKS_RESULT}" = "skipped"
-          fi
-          if [[ "${ZIZMOR}" == "true" ]]; then
-            test "${ZIZMOR_RESULT}" = "success"
-            test "${PINPRICK_RESULT}" = "success"
-          else
-            test "${ZIZMOR_RESULT}" = "skipped"
-            test "${PINPRICK_RESULT}" = "skipped"
-          fi
+          case "${COVERAGE}:${CODECOV_ELIGIBLE}" in
+            true:true) CODECOV_REQUIRED=true ;;
+            true:false | false:true | false:false) CODECOV_REQUIRED=false ;;
+            *) echo "::error::Invalid Codecov routing decision."; exit 1 ;;
+          esac
+          require_result codecov "${CODECOV_RESULT}" "${CODECOV_REQUIRED}"
+          require_result links "${LINKS_RESULT}" "${LINKS}"
+          require_result zizmor "${ZIZMOR_RESULT}" "${ZIZMOR}"
+          require_result pinprick "${PINPRICK_RESULT}" "${ZIZMOR}"
