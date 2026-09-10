@@ -66,6 +66,61 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("existing release asset", publication)
         self.assertNotIn("--clobber", publication)
 
+    def test_api_status_preserves_http_and_transport_contracts(self) -> None:
+        helpers = [
+            re.search(r"(?ms)^api_status\(\) \{\n.*?^\}", textwrap.dedent(block)).group()
+            for block in run_blocks(self.source) if "api_status()" in block
+        ]
+        self.assertEqual(len(helpers), 2)
+        curl = r'''#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+assert args[:5] == ["--silent", "--show-error", "--retry", "3", "--header"]
+assert "--fail" not in args
+assert args[args.index("--write-out") + 1] == "%{http_code}"
+assert args[-1] == "https://api.github.test/resource"
+Path(args[args.index("--output") + 1]).write_text(os.environ["RESPONSE_BODY"])
+print(os.environ["HTTP_STATUS"], end="")
+sys.exit(int(os.environ["CURL_STATUS"]))
+'''
+        for helper_index, helper in enumerate(helpers):
+            for target in ("tag.json", "tag-commit.json", "release.json", "branch-ref.json"):
+                for http_status, curl_status in (("200", 0), ("404", 0), ("500", 0), ("000", 7), ("200", 18)):
+                    with self.subTest(helper=helper_index, target=target, http=http_status, curl=curl_status):
+                        with tempfile.TemporaryDirectory() as directory:
+                            path = Path(directory)
+                            (path / "curl").write_text(curl)
+                            (path / "curl").chmod(0o755)
+                            body = json.dumps({"status": http_status, "target": target})
+                            environment = {
+                                **os.environ, "PATH": f"{path}:{os.environ['PATH']}",
+                                "GH_TOKEN": "fixture-token", "HTTP_STATUS": http_status,
+                                "CURL_STATUS": str(curl_status), "RESPONSE_BODY": body,
+                            }
+                            invocation = f'api_status https://api.github.test/resource {target}'
+                            result = subprocess.run(
+                                ["bash", "-euo", "pipefail", "-c", helper + "\n" + invocation],
+                                cwd=path, env=environment, capture_output=True, text=True,
+                            )
+                            self.assertEqual(result.returncode, curl_status, result.stderr)
+                            self.assertEqual(result.stdout, http_status)
+                            if curl_status == 0:
+                                self.assertEqual((path / target).read_text(), body)
+                                self.assertFalse((path / "api-response.json").exists())
+                            else:
+                                self.assertFalse((path / target).exists())
+                                caller = subprocess.run(
+                                    ["bash", "-euo", "pipefail", "-c",
+                                     helper + f'\nSTATUS=$({invocation})\nprintf continued'],
+                                    cwd=path, env=environment, capture_output=True, text=True,
+                                )
+                                self.assertEqual(caller.returncode, curl_status)
+                                self.assertEqual(caller.stdout, "")
+
     def test_linux_build_has_no_attestation_authority(self) -> None:
         build = job(self.source, "build-linux")
         attest = job(self.source, "attest-linux")
