@@ -449,7 +449,8 @@ jobs:
               --header "Accept: application/vnd.github+json" \
               --header "Authorization: Bearer ${GH_TOKEN}" \
               --header "X-GitHub-Api-Version: 2022-11-28" \
-              --output "$2" --write-out '%{http_code}' "$1"
+              --output api-response.json --write-out '%{http_code}' "$1" || return
+            mv -- api-response.json "$2"
           }
 
           STATUS=$(api_status "${API_URL}/repos/${REPOSITORY}/git/ref/tags/${TAG}" tag.json)
@@ -730,7 +731,8 @@ jobs:
               --header "Accept: application/vnd.github+json" \
               --header "Authorization: Bearer ${GH_TOKEN}" \
               --header "X-GitHub-Api-Version: 2022-11-28" \
-              --output "$2" --write-out '%{http_code}' "$1"
+              --output api-response.json --write-out '%{http_code}' "$1" || return
+            mv -- api-response.json "$2"
           }
           create_pull_request() {
             gh api --method POST "repos/${TAP_REPO}/pulls" \
