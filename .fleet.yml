@@ -24,10 +24,18 @@ params:
     schedule: "0 14 * * 1"
     concurrency-group: "link-check"
   codeql:
-    languages: ["actions"]
-    paths: [".github/workflows/**"]
-    runner: "ubuntu-slim"
+    languages: ["actions", "rust"]
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - "**/rust-toolchain*"
+      - "**/rust-project.json"
+      - "**/.cargo/**"
+      - ".github/workflows/**"
+    runner: "ubuntu-24.04"
     timeout-minutes: 30
+    build-mode: "none"
   pinprick-audit:
     advanced-security: "${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}"
     fail-on-findings: true
