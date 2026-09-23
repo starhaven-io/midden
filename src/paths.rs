@@ -115,10 +115,6 @@ impl ProjectPaths {
         self.root.join(".mcp.json")
     }
 
-    pub fn managed_mcp_json(&self) -> PathBuf {
-        self.root.join(".claude").join("managed-mcp.json")
-    }
-
     pub fn skills_dir(&self) -> PathBuf {
         self.root.join(".claude").join("skills")
     }
@@ -156,6 +152,25 @@ pub fn managed_settings_paths() -> Vec<PathBuf> {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         vec![]
+    }
+}
+
+/// Managed MCP configuration exists only at this system path; a repository's
+/// `.claude/managed-mcp.json` is not read by Claude Code.
+pub fn managed_mcp_path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(PathBuf::from(
+            "/Library/Application Support/ClaudeCode/managed-mcp.json",
+        ))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Some(PathBuf::from("/etc/claude-code/managed-mcp.json"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
     }
 }
 

@@ -175,7 +175,7 @@ Present but malformed or unreadable settings and MCP files make `show` fail with
 
 Hooks show command, HTTP, MCP tool, prompt, and agent handlers with provenance. JSON retains the complete handler definition with secrets masked by default.
 
-MCP servers are gathered from all four scopes: user (`~/.claude.json`), **local** (the per-project entry inside `~/.claude.json` — where `claude mcp add` writes by default), project (`.mcp.json`), and managed (`.claude/managed-mcp.json`).
+MCP servers are gathered from all four scopes: user (`~/.claude.json`), **local** (the per-project entry inside `~/.claude.json` — where `claude mcp add` writes by default), project (`.mcp.json`), and managed (the system `managed-mcp.json` in `/Library/Application Support/ClaudeCode/` on macOS or `/etc/claude-code/` on Linux). A deployed managed file is exclusive, so servers from every other scope are listed as not loaded.
 
 Secrets are masked to `abcd***` by default — both by key name (`*_token`, `*_api_key`, `password`, `credential`, …) and by value shape under innocent keys: known token prefixes (`sk-`, `ghp_`, `xoxb-`, AWS key ids, JWTs, private-key blocks), `user:pass` URLs, credential-named query parameters, and `Bearer` tokens inside hook commands. Pass `--show-secrets` to unmask.
 
@@ -242,7 +242,7 @@ When a derived `cwd` is provably absent, `prune --transcripts` reports the sessi
 | `secret-in-committed-settings` | Error | no | Suspect secret in a Git-tracked `settings.json`, by key name, argument context, or value shape (masked by default) |
 | `secret-in-unignored-settings` | Warn | no | Suspect secret in an untracked, non-ignored `settings.json` |
 | `secret-exposure-unverifiable-settings` | Warn | no | Suspect settings secret whose Git state cannot be established |
-| `secret-in-committed-mcp` | Error | no | Suspect secret in a Git-tracked `.mcp.json` / `managed-mcp.json`; pure `${VAR}` references are exempt |
+| `secret-in-committed-mcp` | Error | no | Suspect secret in a Git-tracked `.mcp.json`; pure `${VAR}` references are exempt |
 | `secret-in-unignored-mcp` | Warn | no | Suspect secret in an untracked, non-ignored MCP JSON file |
 | `secret-exposure-unverifiable-mcp` | Warn | no | Suspect MCP secret whose Git state cannot be established |
 | `local-settings-tracked` | Warn | no | `settings.local.json` tracked by git (meant to stay machine-local) |
