@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use walkdir::WalkDir;
 
 use crate::claude_json;
-use crate::paths::{Env, ProjectPaths, managed_settings_files, serialize_path};
+use crate::paths::{Env, ProjectPaths, managed_mcp_path, managed_settings_files, serialize_path};
 use crate::safe_io;
 use crate::secrets;
 use crate::terminal;
@@ -53,6 +53,8 @@ struct Contribution {
 #[derive(Debug, Serialize)]
 struct Resolved {
     key: String,
+    #[serde(skip)]
+    path: Vec<String>,
     effective: Value,
     contributions: Vec<Contribution>,
 }
@@ -79,7 +81,7 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
         .into_iter()
         // Hooks have their own section — drop them from the generic settings
         // dump so they aren't shown twice as opaque JSON blobs.
-        .filter(|r| !r.key.starts_with("hooks."))
+        .filter(|r| !(r.path.len() > 1 && r.path[0] == "hooks"))
         .collect();
     let mut claude_mds = collect_claude_md(&project, env, opts.show_secrets);
     let (contradictions, contradictions_truncated) = detect_contradictions(&mut claude_mds);
@@ -96,13 +98,13 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
         &[env.user_agents_dir(), project.agents_dir()],
         opts.show_secrets,
     );
-    let mut mcp_servers = collect_mcp_servers(env, &project)?;
+    let mut mcp_servers = collect_mcp_servers(env, &project, managed_mcp_path().as_deref())?;
     let worktrees = collect_worktrees(&project, opts.show_secrets);
 
     let mut resolved = resolved;
     if !opts.show_secrets {
         for r in &mut resolved {
-            if path_looks_sensitive(&r.key) {
+            if path_looks_sensitive(&r.path.join(".")) {
                 secrets::mask_value(&mut r.effective);
                 for c in &mut r.contributions {
                     secrets::mask_value(&mut c.value);
@@ -246,10 +248,10 @@ pub(crate) fn effective_setting(sources: &[(Scope, PathBuf, Value)], key: &str) 
 fn resolve_settings(sources: &[(Scope, PathBuf, Value)]) -> Vec<Resolved> {
     // Flatten each source into (path, value) pairs. Objects recurse; arrays
     // and scalars are leaves.
-    let mut by_path: BTreeMap<String, Vec<(Scope, PathBuf, Value)>> = BTreeMap::new();
+    let mut by_path: BTreeMap<Vec<String>, Vec<(Scope, PathBuf, Value)>> = BTreeMap::new();
     for (scope, file, value) in sources {
         let mut leaves = Vec::new();
-        flatten(value, String::new(), &mut leaves);
+        flatten(value, Vec::new(), &mut leaves);
         for (k, v) in leaves {
             by_path
                 .entry(k)
@@ -259,7 +261,7 @@ fn resolve_settings(sources: &[(Scope, PathBuf, Value)]) -> Vec<Resolved> {
     }
 
     let mut out = Vec::new();
-    for (key, mut contribs) in by_path {
+    for (path, mut contribs) in by_path {
         // Sort highest scope last; for scalars that's the winner.
         contribs.sort_by_key(|(s, _, _)| *s);
 
@@ -305,7 +307,8 @@ fn resolve_settings(sources: &[(Scope, PathBuf, Value)]) -> Vec<Resolved> {
         };
 
         out.push(Resolved {
-            key,
+            key: display_key(&path),
+            path,
             effective,
             contributions,
         });
@@ -313,21 +316,38 @@ fn resolve_settings(sources: &[(Scope, PathBuf, Value)]) -> Vec<Resolved> {
     out
 }
 
-fn flatten(value: &Value, prefix: String, out: &mut Vec<(String, Value)>) {
+fn flatten(value: &Value, prefix: Vec<String>, out: &mut Vec<(Vec<String>, Value)>) {
     match value {
         Value::Object(map) => {
             for (k, v) in map {
-                let new = if prefix.is_empty() {
-                    k.clone()
-                } else {
-                    format!("{prefix}.{k}")
-                };
-                flatten(v, new, out);
+                let mut path = prefix.clone();
+                path.push(k.clone());
+                flatten(v, path, out);
             }
         }
         // Arrays + scalars are leaves.
         _ => out.push((prefix, value.clone())),
     }
+}
+
+/// A literal key such as `"env.ANTHROPIC_BASE_URL"` is not the nested `env`
+/// entry Claude Code reads, so a segment that would read as a separator is
+/// quoted rather than joined.
+fn display_key(path: &[String]) -> String {
+    let mut key = String::new();
+    for segment in path {
+        if segment.is_empty() || segment.contains(['.', '[', ']', '"']) {
+            key.push('[');
+            key.push_str(&Value::from(segment.as_str()).to_string());
+            key.push(']');
+        } else {
+            if !key.is_empty() {
+                key.push('.');
+            }
+            key.push_str(segment);
+        }
+    }
+    key
 }
 
 fn path_looks_sensitive(dotted: &str) -> bool {
@@ -820,10 +840,15 @@ struct McpServer {
     command: Option<String>,
     url: Option<String>,
     disabled: bool,
+    excluded: bool,
     definition: Value,
 }
 
-fn collect_mcp_servers(env: &Env, project: &ProjectPaths) -> Result<Vec<McpServer>> {
+fn collect_mcp_servers(
+    env: &Env,
+    project: &ProjectPaths,
+    managed: Option<&Path>,
+) -> Result<Vec<McpServer>> {
     let mut out = Vec::new();
     // User and local scope both live in ~/.claude.json: the top-level
     // `mcpServers` map is user scope; the per-project entry's `mcpServers` is
@@ -834,13 +859,19 @@ fn collect_mcp_servers(env: &Env, project: &ProjectPaths) -> Result<Vec<McpServe
             .and_then(|entry| entry.get("mcpServers"));
         push_mcp_servers(local, "local", &env.claude_json, &mut out);
     }
-    for (scope, path) in [
-        ("project", project.mcp_json()),
-        ("managed", project.managed_mcp_json()),
-    ] {
-        if let Some(v) = read_json(&path)? {
-            push_mcp_servers(v.get("mcpServers"), scope, &path, &mut out);
+    let mcp_json = project.mcp_json();
+    if let Some(v) = read_json(&mcp_json)? {
+        push_mcp_servers(v.get("mcpServers"), "project", &mcp_json, &mut out);
+    }
+    if let Some(path) = managed
+        && let Some(v) = read_json(path)?
+    {
+        // A deployed managed-mcp.json is exclusive: Claude Code loads none of
+        // the user, local, or project servers alongside it.
+        for server in &mut out {
+            server.excluded = true;
         }
+        push_mcp_servers(v.get("mcpServers"), "managed", path, &mut out);
     }
     Ok(out)
 }
@@ -865,6 +896,7 @@ fn push_mcp_servers(
                 .get("disabled")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            excluded: false,
             definition: def.clone(),
         });
     }
@@ -1114,7 +1146,11 @@ fn emit_human(report: &Report, show_secrets: bool) {
                 .as_deref()
                 .or(s.url.as_deref())
                 .unwrap_or("<unreachable>");
-            let dis = if s.disabled {
+            let dis = if s.excluded {
+                " (not loaded: managed-mcp.json is exclusive)"
+                    .red()
+                    .to_string()
+            } else if s.disabled {
                 " (disabled)".red().to_string()
             } else {
                 String::new()
@@ -1315,6 +1351,18 @@ mod tests {
     }
 
     #[test]
+    fn literal_dotted_keys_do_not_merge_with_nested_keys() {
+        let sources = vec![s(Scope::Project, "p", json!({ "a": { "b": 1 }, "a.b": 2 }))];
+        let r = resolve_settings(&sources);
+        let nested = r.iter().find(|r| r.key == "a.b").unwrap();
+        assert_eq!(nested.effective, json!(1));
+        assert!(nested.contributions.iter().all(|c| !c.shadowed));
+        let literal = r.iter().find(|r| r.key == r#"["a.b"]"#).unwrap();
+        assert_eq!(literal.effective, json!(2));
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
     fn parse_directive_detects_polarity() {
         let (pol, kw, _) = parse_directive("- never commit secrets to git").unwrap();
         assert_eq!(pol, Polarity::Dont);
@@ -1434,6 +1482,39 @@ mod tests {
     }
 
     #[test]
+    fn managed_mcp_file_excludes_every_other_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join(".mcp.json"),
+            r#"{"mcpServers":{"repo":{"command":"repo-mcp"}}}"#,
+        )
+        .unwrap();
+        let managed = root.join("managed-mcp.json");
+        std::fs::write(
+            &managed,
+            r#"{"mcpServers":{"corp":{"command":"corp-mcp"}}}"#,
+        )
+        .unwrap();
+        let project = ProjectPaths::new(root);
+        let env = Env::new(
+            Some(root.join(".claude.json")),
+            Some(root.join(".claude-home")),
+        );
+
+        let servers = collect_mcp_servers(&env, &project, Some(&managed)).unwrap();
+        let repo = servers.iter().find(|s| s.name == "repo").unwrap();
+        assert_eq!(repo.scope, "project");
+        assert!(repo.excluded);
+        let corp = servers.iter().find(|s| s.name == "corp").unwrap();
+        assert_eq!(corp.scope, "managed");
+        assert!(!corp.excluded);
+
+        let servers = collect_mcp_servers(&env, &project, None).unwrap();
+        assert!(servers.iter().all(|s| !s.excluded));
+    }
+
+    #[test]
     fn ancestor_claude_md_files_are_active_for_nested_targets() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1528,6 +1609,7 @@ mod tests {
             root: path.clone(),
             resolved: vec![Resolved {
                 key: "model".into(),
+                path: vec!["model".into()],
                 effective: json!("example"),
                 contributions: vec![Contribution {
                     scope: Scope::Project,
