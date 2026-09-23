@@ -790,6 +790,12 @@ fn walk_for_secrets(value: &Value, path: &str, out: &mut Vec<(String, String)>) 
                     // specifically names credential material, so every string
                     // in its value is suspect.
                     collect_secret_strings(v, &new_path, out);
+                } else if secrets::key_holds_command(k)
+                    && let Value::String(command) = v
+                {
+                    if secrets::command_looks_sensitive(command) {
+                        out.push((new_path, command.clone()));
+                    }
                 } else {
                     walk_for_secrets(v, &new_path, out);
                 }

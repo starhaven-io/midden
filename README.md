@@ -177,7 +177,7 @@ Hooks show command, HTTP, MCP tool, prompt, and agent handlers with provenance. 
 
 MCP servers are gathered from all four scopes: user (`~/.claude.json`), **local** (the per-project entry inside `~/.claude.json` — where `claude mcp add` writes by default), project (`.mcp.json`), and managed (the system `managed-mcp.json` in `/Library/Application Support/ClaudeCode/` on macOS or `/etc/claude-code/` on Linux). A deployed managed file is exclusive, so servers from every other scope are listed as not loaded.
 
-Secrets are masked to `abcd***` by default — both by key name (`*_token`, `*_api_key`, `password`, `credential`, …) and by value shape under innocent keys: known token prefixes (`sk-`, `ghp_`, `xoxb-`, AWS key ids, JWTs, private-key blocks), `user:pass` URLs, credential-named query parameters, and `Bearer` tokens inside hook commands. Pass `--show-secrets` to unmask.
+Secrets are masked to `abcd***` by default — both by key name (`*_token`, `*_api_key`, `*_pass`, `password`, `passphrase`, `credential`, …) and by value shape under innocent keys: known token prefixes (`sk-`, `ghp_`, `xoxb-`, AWS key ids, JWTs, private-key blocks), `user:pass` URLs, credential-named query parameters, and `Bearer` tokens inside hook commands. Hook, MCP, and settings `command` strings are read as argv, so the value after an option such as `--token` or curl's `-u` is masked too. Pass `--show-secrets` to unmask.
 
 ### Doctor
 

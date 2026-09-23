@@ -1368,3 +1368,62 @@ fn doctor_never_uses_an_embedded_git_directory() {
 
     assert!(!marker.exists(), "doctor ran the embedded fsmonitor hook");
 }
+
+#[test]
+fn flags_password_names_and_command_arguments_in_committed_settings() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    write_json(
+        &fx.root.path().join(".claude/settings.json"),
+        &json!({
+            "env": { "DB_PASS": "hunter2-plain", "SMTP_PASSPHRASE": "correct-horse" },
+            "statusLine": { "type": "command", "command": "fetch-status --token tok_plain_status" },
+            "hooks": { "PreToolUse": [{ "matcher": "Bash", "hooks": [
+                { "type": "command", "command": "curl -u admin:S3cretPass https://hooks.example" },
+                { "type": "command", "command": "gh api --token \"$GITHUB_TOKEN\"" }
+            ]}]}
+        }),
+    );
+    track(&fx, ".claude/settings.json");
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("doctor")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "stdout:\n{stdout}");
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let flagged: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["id"] == "secret-in-committed-settings")
+        .filter_map(|f| f["location"]["key_path"].as_str())
+        .collect();
+    for key_path in [
+        "env.DB_PASS",
+        "env.SMTP_PASSPHRASE",
+        "statusLine.command",
+        "hooks.PreToolUse[0].hooks[0].command",
+    ] {
+        assert!(
+            flagged.contains(&key_path),
+            "{key_path} not flagged: {flagged:?}"
+        );
+    }
+    assert!(
+        !flagged.contains(&"hooks.PreToolUse[0].hooks[1].command"),
+        "a shell reference is not a committed secret: {flagged:?}"
+    );
+    for secret in [
+        "hunter2-plain",
+        "correct-horse",
+        "tok_plain_status",
+        "S3cretPass",
+    ] {
+        assert!(!stdout.contains(secret), "{secret} leaked:\n{stdout}");
+    }
+}

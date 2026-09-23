@@ -1167,3 +1167,42 @@ fn hook_and_mcp_definition_commands_share_argument_masking() {
     );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("example-private-value"));
 }
+
+#[test]
+fn show_masks_password_names_and_command_arguments() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    write_json(
+        &fx.root.path().join(".claude/settings.json"),
+        &json!({
+            "env": { "DB_PASS": "hunter2-plain", "SMTP_PASSPHRASE": "correct-horse" },
+            "statusLine": { "type": "command", "command": "fetch-status --token tok_plain_status" },
+            "hooks": { "PreToolUse": [{ "matcher": "Bash", "hooks": [{
+                "type": "command",
+                "command": "curl -u admin:S3cretPass https://hooks.example"
+            }]}]}
+        }),
+    );
+
+    for json in [false, true] {
+        let mut cmd = fx.cmd();
+        if json {
+            cmd.arg("--json");
+        }
+        let out = cmd.arg("show").arg(fx.root.path()).output().unwrap();
+        assert!(
+            out.status.success(),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for secret in [
+            "hunter2-plain",
+            "correct-horse",
+            "tok_plain_status",
+            "S3cretPass",
+        ] {
+            assert!(!stdout.contains(secret), "{secret} leaked:\n{stdout}");
+        }
+    }
+}

@@ -109,6 +109,16 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
                 for c in &mut r.contributions {
                     secrets::mask_value(&mut c.value);
                 }
+            } else if r
+                .key
+                .rsplit('.')
+                .next()
+                .is_some_and(secrets::key_holds_command)
+            {
+                mask_command(&mut r.effective);
+                for c in &mut r.contributions {
+                    mask_command(&mut c.value);
+                }
             }
             // Token-shaped values hide under innocent keys too — args arrays,
             // env.DATABASE_URL — so mask by content as well as by key name.
@@ -158,10 +168,16 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
 }
 
 fn mask_definition(definition: &mut Value) {
-    if let Some(Value::String(command)) = definition.get_mut("command") {
-        *command = secrets::mask_embedded(command);
+    if let Some(command) = definition.get_mut("command") {
+        mask_command(command);
     }
     secrets::mask_tree(definition);
+}
+
+fn mask_command(value: &mut Value) {
+    if let Value::String(command) = value {
+        *command = secrets::mask_embedded(command);
+    }
 }
 
 fn read_json(path: &Path) -> Result<Option<Value>> {
