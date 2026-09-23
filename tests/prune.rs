@@ -1027,3 +1027,50 @@ fn mixed_known_and_unknown_transcript_metadata_is_preserved() {
         assert!(known.exists() && unknown.exists() && artifacts.exists());
     }
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn transcript_failure_still_reports_the_config_backup_and_progress() {
+    let fx = Fixture::new();
+    let live = fx.touch_dir("live");
+    fx.write_config(
+        json!({ &live: {}, "/config/orphan": {} }),
+        standard_extras(),
+    );
+    for slug in ["a-dead", "b-dead"] {
+        let cwd = fx.root.path().join(format!("missing-{slug}"));
+        fx.write_transcript(slug, &cwd.to_string_lossy());
+    }
+    let locked = fx.session_artifact_dir("b-dead").join("artifact.txt");
+    let chflags = |flag: &str, path: &std::path::Path| {
+        std::process::Command::new("chflags")
+            .args(["-R", flag])
+            .arg(path)
+            .status()
+            .unwrap()
+    };
+    assert!(chflags("uchg", &locked).success());
+
+    let out = fx
+        .cmd()
+        .env("MIDDEN_TEST_ASSUME_NO_CLAUDE_PROCESS", &fx.config)
+        .args(["--json", "prune", "--transcripts", "--apply"])
+        .output()
+        .unwrap();
+    chflags("nouchg", &fx.claude_home);
+
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("deletion stopped"));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["removed"], true);
+    assert!(v["backup"].as_str().is_some());
+    let dirs = v["transcripts"]["dirs"].as_array().unwrap();
+    let cleanup = |slug: &str| {
+        dirs.iter()
+            .find(|d| d["path"].as_str().unwrap().ends_with(slug))
+            .unwrap()["cleanup"]
+            .clone()
+    };
+    assert_eq!(cleanup("a-dead"), "removed-dir");
+    assert_eq!(cleanup("b-dead"), "failed");
+}

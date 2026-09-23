@@ -26,6 +26,14 @@ pub struct Options {
 type ProjectApplyResult = Option<(PathBuf, usize, usize)>;
 type TranscriptApplyResult = Option<transcripts::Report>;
 
+struct CombinedApply {
+    prune: ProjectApplyResult,
+    transcripts: TranscriptApplyResult,
+    /// Transcript deletion runs after the config write and keeps no backup, so
+    /// a failure is reported alongside what already happened, not instead of it.
+    failure: Option<anyhow::Error>,
+}
+
 fn display_text(value: &str) -> String {
     terminal::escape(&secrets::mask_free_text(value))
 }
@@ -163,13 +171,15 @@ fn run_with_transcripts(env: &Env, opts: Options) -> Result<ExitCode> {
     };
 
     if opts.json {
-        let (applied_prune, applied_transcripts) = if opts.apply {
-            apply_prune_and_transcripts(env, &opts)?
+        let applied = if opts.apply {
+            Some(apply_prune_and_transcripts(env, &opts)?)
         } else {
-            (None, None)
+            None
         };
-        let transcript_json = applied_transcripts
+        let applied_prune = applied.as_ref().and_then(|applied| applied.prune.as_ref());
+        let transcript_json = applied
             .as_ref()
+            .and_then(|applied| applied.transcripts.as_ref())
             .unwrap_or(&transcript_report)
             .to_json();
         emit_json(json!({
@@ -185,10 +195,13 @@ fn run_with_transcripts(env: &Env, opts: Options) -> Result<ExitCode> {
                 .or_else(|| new_raw.as_ref().map(String::len))
                 .unwrap_or(config.raw.len()),
             "removed": applied_prune.is_some(),
-            "backup": applied_prune.as_ref().map(|(p, _, _)| p.display().to_string()),
+            "backup": applied_prune.map(|(p, _, _)| p.display().to_string()),
             "transcripts": transcript_json,
         }));
-        return Ok(ExitCode::SUCCESS);
+        return match applied.and_then(|applied| applied.failure) {
+            Some(error) => Err(error),
+            None => Ok(ExitCode::SUCCESS),
+        };
     }
 
     print_project_preview(path, &config, total, &orphans, new_raw.as_deref())?;
@@ -203,17 +216,20 @@ fn run_with_transcripts(env: &Env, opts: Options) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let (applied_prune, applied_transcripts) = apply_prune_and_transcripts(env, &opts)?;
+    let applied = apply_prune_and_transcripts(env, &opts)?;
 
-    print_project_apply(env, applied_prune);
-    if let Some(report) = applied_transcripts {
-        print_transcript_apply(&report);
+    print_project_apply(env, applied.prune);
+    if let Some(report) = &applied.transcripts {
+        print_transcript_apply(report, applied.failure.is_some());
     } else {
         println!();
         println!("no orphaned transcript artifacts to remove.");
     }
 
-    Ok(ExitCode::SUCCESS)
+    match applied.failure {
+        Some(error) => Err(error),
+        None => Ok(ExitCode::SUCCESS),
+    }
 }
 
 fn print_project_preview(
@@ -345,7 +361,7 @@ fn print_kept_transcript_storage(report: &transcripts::Report) {
     }
 }
 
-fn print_transcript_apply(report: &transcripts::Report) {
+fn print_transcript_apply(report: &transcripts::Report, stopped: bool) {
     println!();
     println!("transcripts");
     if report.dead_count() == 0 {
@@ -353,13 +369,23 @@ fn print_transcript_apply(report: &transcripts::Report) {
         return;
     }
 
-    println!(
-        "  removed {} artifacts from {} dead dirs; reclaimed ~{}.",
-        report.dirs.iter().map(|d| d.deleted.len()).sum::<usize>(),
-        report.dead_count(),
-        output::human_bytes(report.bytes()),
-    );
-    for dir in report.dirs.iter().filter(|d| d.is_dead()) {
+    let deleted = report.dirs.iter().map(|d| d.deleted.len()).sum::<usize>();
+    if stopped {
+        println!(
+            "  deletion stopped after removing {deleted} artifacts; nothing further was deleted."
+        );
+    } else {
+        println!(
+            "  removed {} artifacts from {} dead dirs; reclaimed ~{}.",
+            deleted,
+            report.dead_count(),
+            output::human_bytes(report.bytes()),
+        );
+    }
+    for dir in report.dirs.iter().filter(|d| {
+        d.is_dead()
+            && (!stopped || !d.deleted.is_empty() || d.cleanup == transcripts::Cleanup::Failed)
+    }) {
         println!("  - {}", display_path(&dir.path));
         for target in &dir.deleted {
             println!("      deleted {}", display_path(target));
@@ -382,14 +408,14 @@ fn print_cleanup_note(dir: &transcripts::DirReport) {
         transcripts::Cleanup::RemovedDir => {
             println!("      directory removed");
         }
+        transcripts::Cleanup::Failed => {
+            println!("      deletion failed here; see the error below");
+        }
         transcripts::Cleanup::None => {}
     }
 }
 
-fn apply_prune_and_transcripts(
-    env: &Env,
-    opts: &Options,
-) -> Result<(ProjectApplyResult, TranscriptApplyResult)> {
+fn apply_prune_and_transcripts(env: &Env, opts: &Options) -> Result<CombinedApply> {
     let mut config = ClaudeJson::load(&env.claude_json)?;
     let total = config.projects().map(|p| p.len()).unwrap_or(0);
     let drop: BTreeSet<String> = match config.projects() {
@@ -399,18 +425,24 @@ fn apply_prune_and_transcripts(
             .collect(),
         None => BTreeSet::new(),
     };
-    let transcript_report = transcripts::discover(&env.claude_home, opts.worktrees_only)?;
+    let mut transcript_report = transcripts::discover(&env.claude_home, opts.worktrees_only)?;
 
     ensure_apply_gates(env, opts, drop.len(), total, &transcript_report)?;
 
-    let applied_prune = apply_project_drop(env, &mut config, &drop)?;
-    let applied_transcripts = if transcript_report.dead_count() == 0 {
-        None
-    } else {
-        Some(transcripts::delete_dead(transcript_report)?)
-    };
-
-    Ok((applied_prune, applied_transcripts))
+    let prune = apply_project_drop(env, &mut config, &drop)?;
+    if transcript_report.dead_count() == 0 {
+        return Ok(CombinedApply {
+            prune,
+            transcripts: None,
+            failure: None,
+        });
+    }
+    let failure = transcripts::delete_dead(&mut transcript_report).err();
+    Ok(CombinedApply {
+        prune,
+        transcripts: Some(transcript_report),
+        failure,
+    })
 }
 
 fn ensure_apply_gates(
