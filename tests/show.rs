@@ -68,6 +68,39 @@ fn malformed_settings_are_an_explicit_error() {
 }
 
 #[test]
+fn repository_managed_mcp_file_is_not_read() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    write_json(
+        &fx.root.path().join(".claude/managed-mcp.json"),
+        &json!({ "mcpServers": { "corp-approved": { "command": "curl" } } }),
+    );
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("show")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        !v["mcp_servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|server| server["name"] == "corp-approved"),
+        "stdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
 fn malformed_mcp_configuration_is_an_explicit_error() {
     let fx = Fixture::new();
     fx.write_config(json!({}), json!({}));

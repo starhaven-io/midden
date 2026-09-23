@@ -15,7 +15,7 @@ use crate::claude_json::{self, ClaudeJson};
 use crate::git;
 use crate::orphans;
 use crate::output;
-use crate::paths::{Env, ProjectPaths, managed_settings_files, serialize_path};
+use crate::paths::{Env, ProjectPaths, managed_mcp_path, managed_settings_files, serialize_path};
 use crate::process;
 use crate::safe_io;
 use crate::secrets;
@@ -591,21 +591,19 @@ fn check_secrets_in_committed_settings(
     )?;
     // .mcp.json is committed by design, and MCP server definitions are exactly
     // where credentials land: env blocks, headers, tokens in args.
-    for path in [project.mcp_json(), project.managed_mcp_json()] {
-        scan_committed_secret_file(
-            project,
-            &path,
-            "secret-in-committed-mcp",
-            |key_path| {
-                format!(
-                    "replace `{key_path}` with a ${{VAR}} expansion, or define the server at \
-                     local scope (`claude mcp add` without `--scope project`)"
-                )
-            },
-            out,
-            show_secrets,
-        )?;
-    }
+    scan_committed_secret_file(
+        project,
+        &project.mcp_json(),
+        "secret-in-committed-mcp",
+        |key_path| {
+            format!(
+                "replace `{key_path}` with a ${{VAR}} expansion, or define the server at \
+                 local scope (`claude mcp add` without `--scope project`)"
+            )
+        },
+        out,
+        show_secrets,
+    )?;
     Ok(())
 }
 
@@ -1203,7 +1201,7 @@ fn check_disabled_mcp_servers(
         }
     }
     // Project and managed scopes live in their own files.
-    for path in [project.mcp_json(), project.managed_mcp_json()] {
+    for path in std::iter::once(project.mcp_json()).chain(managed_mcp_path()) {
         let Some(v) = read_optional_json_for_audit(&path, out) else {
             continue;
         };
@@ -1318,12 +1316,10 @@ fn check_mcpjson_approvals(
         return;
     };
     let mut defined: HashSet<String> = HashSet::new();
-    for path in [project.mcp_json(), project.managed_mcp_json()] {
-        if let Some(v) = read_optional_json_for_audit(&path, out)
-            && let Some(servers) = v.get("mcpServers").and_then(Value::as_object)
-        {
-            defined.extend(servers.keys().cloned());
-        }
+    if let Some(v) = read_optional_json_for_audit(&project.mcp_json(), out)
+        && let Some(servers) = v.get("mcpServers").and_then(Value::as_object)
+    {
+        defined.extend(servers.keys().cloned());
     }
     for list in ["enabledMcpjsonServers", "disabledMcpjsonServers"] {
         let Some(names) = entry.get(list).and_then(Value::as_array) else {

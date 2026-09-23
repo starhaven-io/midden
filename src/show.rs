@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use walkdir::WalkDir;
 
 use crate::claude_json;
-use crate::paths::{Env, ProjectPaths, managed_settings_files, serialize_path};
+use crate::paths::{Env, ProjectPaths, managed_mcp_path, managed_settings_files, serialize_path};
 use crate::safe_io;
 use crate::secrets;
 use crate::terminal;
@@ -96,7 +96,7 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
         &[env.user_agents_dir(), project.agents_dir()],
         opts.show_secrets,
     );
-    let mut mcp_servers = collect_mcp_servers(env, &project)?;
+    let mut mcp_servers = collect_mcp_servers(env, &project, managed_mcp_path().as_deref())?;
     let worktrees = collect_worktrees(&project, opts.show_secrets);
 
     let mut resolved = resolved;
@@ -804,10 +804,15 @@ struct McpServer {
     command: Option<String>,
     url: Option<String>,
     disabled: bool,
+    excluded: bool,
     definition: Value,
 }
 
-fn collect_mcp_servers(env: &Env, project: &ProjectPaths) -> Result<Vec<McpServer>> {
+fn collect_mcp_servers(
+    env: &Env,
+    project: &ProjectPaths,
+    managed: Option<&Path>,
+) -> Result<Vec<McpServer>> {
     let mut out = Vec::new();
     // User and local scope both live in ~/.claude.json: the top-level
     // `mcpServers` map is user scope; the per-project entry's `mcpServers` is
@@ -818,13 +823,19 @@ fn collect_mcp_servers(env: &Env, project: &ProjectPaths) -> Result<Vec<McpServe
             .and_then(|entry| entry.get("mcpServers"));
         push_mcp_servers(local, "local", &env.claude_json, &mut out);
     }
-    for (scope, path) in [
-        ("project", project.mcp_json()),
-        ("managed", project.managed_mcp_json()),
-    ] {
-        if let Some(v) = read_json(&path)? {
-            push_mcp_servers(v.get("mcpServers"), scope, &path, &mut out);
+    let mcp_json = project.mcp_json();
+    if let Some(v) = read_json(&mcp_json)? {
+        push_mcp_servers(v.get("mcpServers"), "project", &mcp_json, &mut out);
+    }
+    if let Some(path) = managed
+        && let Some(v) = read_json(path)?
+    {
+        // A deployed managed-mcp.json is exclusive: Claude Code loads none of
+        // the user, local, or project servers alongside it.
+        for server in &mut out {
+            server.excluded = true;
         }
+        push_mcp_servers(v.get("mcpServers"), "managed", path, &mut out);
     }
     Ok(out)
 }
@@ -849,6 +860,7 @@ fn push_mcp_servers(
                 .get("disabled")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            excluded: false,
             definition: def.clone(),
         });
     }
@@ -1098,7 +1110,11 @@ fn emit_human(report: &Report, show_secrets: bool) {
                 .as_deref()
                 .or(s.url.as_deref())
                 .unwrap_or("<unreachable>");
-            let dis = if s.disabled {
+            let dis = if s.excluded {
+                " (not loaded: managed-mcp.json is exclusive)"
+                    .red()
+                    .to_string()
+            } else if s.disabled {
                 " (disabled)".red().to_string()
             } else {
                 String::new()
@@ -1415,6 +1431,39 @@ mod tests {
             !paths.iter().any(|p| p == &nested_legit.join("CLAUDE.md")),
             "descendant CLAUDE.md should apply only when that descendant is targeted: {paths:?}"
         );
+    }
+
+    #[test]
+    fn managed_mcp_file_excludes_every_other_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join(".mcp.json"),
+            r#"{"mcpServers":{"repo":{"command":"repo-mcp"}}}"#,
+        )
+        .unwrap();
+        let managed = root.join("managed-mcp.json");
+        std::fs::write(
+            &managed,
+            r#"{"mcpServers":{"corp":{"command":"corp-mcp"}}}"#,
+        )
+        .unwrap();
+        let project = ProjectPaths::new(root);
+        let env = Env::new(
+            Some(root.join(".claude.json")),
+            Some(root.join(".claude-home")),
+        );
+
+        let servers = collect_mcp_servers(&env, &project, Some(&managed)).unwrap();
+        let repo = servers.iter().find(|s| s.name == "repo").unwrap();
+        assert_eq!(repo.scope, "project");
+        assert!(repo.excluded);
+        let corp = servers.iter().find(|s| s.name == "corp").unwrap();
+        assert_eq!(corp.scope, "managed");
+        assert!(!corp.excluded);
+
+        let servers = collect_mcp_servers(&env, &project, None).unwrap();
+        assert!(servers.iter().all(|s| !s.excluded));
     }
 
     #[test]
