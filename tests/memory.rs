@@ -1715,3 +1715,75 @@ fn incomplete_transcript_metadata_cannot_associate_memory() {
         "unknown"
     );
 }
+
+#[test]
+fn claude_memory_association_reads_every_transcript() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let root = fx.root.path().display().to_string();
+    for _ in 0..17 {
+        fx.write_transcript("busy-project", &root);
+    }
+    let memory = fx
+        .transcript_project_dir("busy-project")
+        .join("memory/MEMORY.md");
+    write(&memory, "busy project memory\n");
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("memory")
+        .arg("show")
+        .arg(fx.root.path())
+        .arg("--provider")
+        .arg("claude")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let inventory: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        source(provider(&inventory, "claude"), &memory)["association"],
+        "target"
+    );
+}
+
+#[test]
+fn claude_memory_association_is_unknown_when_a_late_transcript_disagrees() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    fx.git(&["init", "--quiet"]);
+    let other = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(other.path())
+        .args(["init", "--quiet"])
+        .output()
+        .unwrap();
+    let root = fx.root.path().display().to_string();
+    for _ in 0..16 {
+        fx.write_transcript("mixed-project", &root);
+    }
+    fx.write_transcript("mixed-project", &other.path().display().to_string());
+    let memory = fx
+        .transcript_project_dir("mixed-project")
+        .join("memory/MEMORY.md");
+    write(&memory, "mixed project memory\n");
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("memory")
+        .arg("show")
+        .arg(fx.root.path())
+        .arg("--provider")
+        .arg("claude")
+        .arg("--all")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let inventory: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        source(provider(&inventory, "claude"), &memory)["association"],
+        "unknown"
+    );
+}
