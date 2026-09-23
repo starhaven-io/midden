@@ -1304,3 +1304,67 @@ fn inaccessible_central_state_is_not_treated_as_absent() {
         .code(2)
         .stderr(contains("inspect"));
 }
+
+#[cfg(unix)]
+fn fsmonitor_hook(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let marker = dir.join("marker");
+    let hook = dir.join("fsmonitor.sh");
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\necho ran >> '{}'\nexit 1\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (hook, marker)
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_never_runs_the_repository_fsmonitor() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let hooks = tempfile::tempdir().unwrap();
+    let (hook, marker) = fsmonitor_hook(hooks.path());
+    fx.git(&["init", "--quiet"]);
+    fx.git(&["config", "core.fsmonitor", &hook.to_string_lossy()]);
+    write_json(
+        &fx.root.path().join(".claude/settings.local.json"),
+        &json!({}),
+    );
+
+    fx.cmd()
+        .arg("doctor")
+        .arg(fx.root.path())
+        .assert()
+        .success();
+
+    assert!(!marker.exists(), "doctor ran the repository fsmonitor hook");
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_never_uses_an_embedded_git_directory() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let hooks = tempfile::tempdir().unwrap();
+    let (hook, marker) = fsmonitor_hook(hooks.path());
+    // Committed files laid out as a Git directory survive a plain clone.
+    let embedded = fx.root.path().join("embedded");
+    std::fs::create_dir_all(embedded.join("objects")).unwrap();
+    std::fs::create_dir_all(embedded.join("refs/heads")).unwrap();
+    std::fs::write(embedded.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(
+        embedded.join("config"),
+        format!(
+            "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tworktree = .\n\tfsmonitor = {}\n",
+            hook.display()
+        ),
+    )
+    .unwrap();
+    write_json(&embedded.join(".claude/settings.local.json"), &json!({}));
+
+    fx.cmd().arg("doctor").arg(&embedded).assert().success();
+
+    assert!(!marker.exists(), "doctor ran the embedded fsmonitor hook");
+}
