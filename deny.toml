@@ -36,5 +36,8 @@ unmaintained = "all"
 yanked = "deny"
 
 [sources]
+# A dependency from an unlisted registry or git source must fail CI, not pass it with a warning (default: warn).
+unknown-registry = "deny"
+unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = []
