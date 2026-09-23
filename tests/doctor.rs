@@ -1304,3 +1304,35 @@ fn inaccessible_central_state_is_not_treated_as_absent() {
         .code(2)
         .stderr(contains("inspect"));
 }
+
+#[test]
+fn flags_secrets_in_committed_settings_with_invalid_utf8() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let settings = fx.root.path().join(".claude/settings.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(
+        &settings,
+        b"{\"env\":{\"ANTHROPIC_API_KEY\":\"sk-very-real-token-abc123\",\"NOTE\":\"\xff\"}}",
+    )
+    .unwrap();
+    track(&fx, ".claude/settings.json");
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("doctor")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "stdout:\n{stdout}");
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        v["findings"].as_array().unwrap().iter().any(|f| {
+            f["id"] == "secret-in-committed-settings"
+                && f["location"]["key_path"] == "env.ANTHROPIC_API_KEY"
+        }),
+        "stdout:\n{stdout}"
+    );
+}
