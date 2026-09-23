@@ -20,7 +20,7 @@ LINT_MATRIX = [{"name": "Lint", "check": "lint", "runner": "ubuntu-24.04"}]
 
 RUST_OR_BUILD = re.compile(
     r"(?:\.rs$|^Cargo\.(?:toml|lock)$|^\.cargo/config(?:\.toml)?$|"
-    r"^rust-toolchain\.toml$|^clippy\.toml$|^rustfmt\.toml$|"
+    r"^rust-toolchain(?:\.toml)?$|^\.?clippy\.toml$|^\.?rustfmt\.toml$|"
     r"^\.config/nextest\.toml$|^tests/|"
     r"^\.github/workflows/(?:ci|cargo-deny|release)\.yml$)"
 )

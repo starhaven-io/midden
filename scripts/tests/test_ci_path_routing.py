@@ -1,5 +1,8 @@
 import importlib.util
+import os
 import re
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -74,6 +77,55 @@ class CiPathRoutingTests(unittest.TestCase):
         result = ROUTING.route(["tests/fixtures/provider-state.json"])
         self.assertEqual(result["matrix"], ROUTING.FULL_MATRIX)
         self.assertTrue(result["coverage"])
+
+    def test_toolchain_and_lint_config_variants_run_the_full_matrix(self) -> None:
+        for path in ("rust-toolchain", ".rustfmt.toml", ".clippy.toml"):
+            with self.subTest(path=path):
+                self.assertEqual(ROUTING.route([path])["matrix"], ROUTING.FULL_MATRIX)
+
+    def test_renaming_a_rust_source_away_runs_the_full_matrix(self) -> None:
+        command = next(
+            line.strip().removesuffix("\\").strip()
+            for line in WORKFLOW.read_text().splitlines()
+            if line.strip().startswith("git diff ")
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            env = {
+                **os.environ,
+                "HOME": directory,
+                "XDG_CONFIG_HOME": directory,
+                "GIT_CONFIG_NOSYSTEM": "1",
+            }
+            repo = Path(directory) / "repo"
+            (repo / "src").mkdir(parents=True)
+            (repo / "src/lib.rs").write_text("pub fn f() {}\n")
+
+            def git(*args: str) -> str:
+                return subprocess.run(
+                    ["git", "-c", "user.name=ci", "-c", "user.email=ci@example.com", *args],
+                    cwd=repo,
+                    env=env,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout
+
+            git("init", "--quiet")
+            git("add", "-A")
+            git("commit", "--quiet", "-m", "base")
+            base = git("rev-parse", "HEAD").strip()
+            git("mv", "src/lib.rs", "src/lib.rs.bak")
+            git("commit", "--quiet", "-m", "rename")
+            changed = subprocess.run(
+                ["bash", "-c", command],
+                cwd=repo,
+                env={**env, "BASE_SHA": base},
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+
+        self.assertEqual(ROUTING.route(changed)["matrix"], ROUTING.FULL_MATRIX)
 
     def test_unrelated_path_does_not_schedule_checks(self) -> None:
         result = ROUTING.route(["assets/example.txt"])
