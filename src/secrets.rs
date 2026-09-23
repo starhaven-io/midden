@@ -67,7 +67,15 @@ pub fn key_looks_sensitive(name: &str) -> bool {
     // match would over-trigger; no match at all misses real credentials.
     // "public" exempts the one kind of key that is meant to be shared.
     let words = split_words(name);
-    words.iter().any(|w| w == "key" || w == "keys") && !words.iter().any(|w| w == "public")
+    names_password(&words)
+        || (words.iter().any(|w| w == "key" || w == "keys") && !words.iter().any(|w| w == "public"))
+}
+
+/// `pass` names a credential only as the trailing word (`DB_PASS`); elsewhere
+/// it usually starts an unrelated compound such as `PASS_THROUGH`, and a
+/// substring match would also catch `bypassPermissions`.
+fn names_password(words: &[String]) -> bool {
+    words.last().is_some_and(|word| word == "pass") || words.iter().any(|word| word == "passphrase")
 }
 
 /// Lowercased word segments of a key name, split on non-alphanumerics and
@@ -354,7 +362,14 @@ fn option_name_expects_secret(name: &str) -> bool {
     words.iter().any(|word| {
         matches!(
             word.as_str(),
-            "token" | "secret" | "password" | "passwd" | "apikey" | "bearer" | "cookie"
+            "token"
+                | "secret"
+                | "password"
+                | "passwd"
+                | "passphrase"
+                | "apikey"
+                | "bearer"
+                | "cookie"
         )
     }) || words
         .windows(2)
@@ -388,12 +403,29 @@ pub fn key_expects_secret_value(name: &str) -> bool {
                 | "bearer"
                 | "cookie"
         )
-    }) || words
-        .windows(2)
-        .any(|pair| pair == ["api", "key"] || pair == ["api", "keys"])
+    }) || names_password(&words)
+        || words
+            .windows(2)
+            .any(|pair| pair == ["api", "key"] || pair == ["api", "keys"])
         || words
             .windows(2)
             .any(|pair| pair == ["private", "key"] || pair == ["private", "keys"])
+}
+
+/// Settings whose string value is a shell command, and so is argv rather than
+/// prose: an option such as `--token` names the credential in the next word.
+pub fn key_holds_command(name: &str) -> bool {
+    name == "command"
+}
+
+/// Whether a command string carries a credential, including the word after an
+/// option such as `--token`. A shell reference like `"$GITHUB_TOKEN"` commits
+/// nothing, so it does not count.
+pub fn command_looks_sensitive(command: &str) -> bool {
+    value_looks_sensitive(command)
+        || argument_value_ranges(command)
+            .iter()
+            .any(|&(start, end)| !command[start..end].starts_with('$'))
 }
 
 /// Return the credential part of `--token=value` or `TOKEN=value`.
@@ -609,12 +641,27 @@ fn argument_value_ranges(s: &str) -> Vec<(usize, usize)> {
     }
 
     let mut ranges = Vec::new();
+    // `-u user:password` is curl's credential option; other tools use `-u`
+    // for users or groups (`docker run -u www-data:www-data`).
+    let mut in_curl = false;
     for (index, &(start, end)) in tokens.iter().enumerate() {
         let token = s[start..end].trim_matches(['\'', '"']);
-        if let Some(value) = sensitive_argument_value(token) {
+        if matches!(token, "&&" | "||" | "|" | ";") {
+            in_curl = false;
+            continue;
+        }
+        if token.rsplit('/').next() == Some("curl") {
+            in_curl = true;
+        }
+        let curl_user = in_curl && matches!(token, "-u" | "--user");
+        if let Some(value) = sensitive_argument_value(token).or_else(|| {
+            token
+                .strip_prefix("--user=")
+                .filter(|value| in_curl && !value.is_empty())
+        }) {
             let offset = s[start..end].find(value).unwrap_or(0);
             ranges.push((start + offset, start + offset + value.len()));
-        } else if argument_expects_secret(token)
+        } else if (argument_expects_secret(token) || curl_user)
             && let Some(&(next_start, next_end)) = tokens.get(index + 1)
         {
             let next = &s[next_start..next_end];
@@ -741,6 +788,50 @@ mod tests {
             !key_looks_sensitive("publicKey"),
             "public keys are shareable"
         );
+    }
+
+    #[test]
+    fn pass_names_a_credential_only_as_the_last_word() {
+        assert!(key_looks_sensitive("DB_PASS"));
+        assert!(key_looks_sensitive("SMTP_PASSPHRASE"));
+        assert!(key_expects_secret_value("DB_PASS"));
+        assert!(key_expects_secret_value("smtpPassphrase"));
+        assert!(!key_looks_sensitive("bypassPermissions"));
+        assert!(!key_looks_sensitive("PASS_THROUGH"));
+        assert!(!key_expects_secret_value("passphraseLength"));
+    }
+
+    #[test]
+    fn curl_user_credentials_are_masked_only_for_curl() {
+        assert_eq!(
+            mask_embedded("curl -u user:S3cretPass https://x.example"),
+            "curl -u user*** https://x.example"
+        );
+        assert_eq!(
+            mask_embedded("bash -c 'curl --user=user:S3cretPass https://x.example'"),
+            "bash -c 'curl --user=user*** https://x.example'"
+        );
+        assert_eq!(
+            mask_embedded("docker run -u www-data:www-data image"),
+            "docker run -u www-data:www-data image"
+        );
+        assert_eq!(
+            mask_embedded("curl https://x.example && sort -u list"),
+            "curl https://x.example && sort -u list"
+        );
+    }
+
+    #[test]
+    fn commands_are_sensitive_when_an_option_carries_a_credential() {
+        assert!(command_looks_sensitive(
+            "fetch-status --token tok_plain_status"
+        ));
+        assert!(command_looks_sensitive(
+            "curl -u user:S3cretPass https://x.example"
+        ));
+        assert!(!command_looks_sensitive("gh api --token \"$GITHUB_TOKEN\""));
+        assert!(!command_looks_sensitive("gh api --token ${GITHUB_TOKEN}"));
+        assert!(!command_looks_sensitive("npm run lint"));
     }
 
     /// Joins a credential prefix to a dummy body at runtime, so the source
