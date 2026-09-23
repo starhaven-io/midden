@@ -1427,3 +1427,35 @@ fn flags_password_names_and_command_arguments_in_committed_settings() {
         assert!(!stdout.contains(secret), "{secret} leaked:\n{stdout}");
     }
 }
+
+#[test]
+fn flags_secrets_in_committed_settings_with_invalid_utf8() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let settings = fx.root.path().join(".claude/settings.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(
+        &settings,
+        b"{\"env\":{\"ANTHROPIC_API_KEY\":\"sk-very-real-token-abc123\",\"NOTE\":\"\xff\"}}",
+    )
+    .unwrap();
+    track(&fx, ".claude/settings.json");
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("doctor")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "stdout:\n{stdout}");
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        v["findings"].as_array().unwrap().iter().any(|f| {
+            f["id"] == "secret-in-committed-settings"
+                && f["location"]["key_path"] == "env.ANTHROPIC_API_KEY"
+        }),
+        "stdout:\n{stdout}"
+    );
+}

@@ -637,7 +637,7 @@ fn scan_committed_secret_file(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let raw = match safe_io::read_to_string(file, safe_io::MAX_CONFIG_BYTES) {
+    let raw = match safe_io::read_to_string_lossy(file, safe_io::MAX_CONFIG_BYTES) {
         Ok(raw) => raw,
         Err(error) => {
             push_inaccessible(

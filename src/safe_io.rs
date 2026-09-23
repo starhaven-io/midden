@@ -11,6 +11,22 @@ pub const MAX_INSTRUCTION_BYTES: usize = 4 * 1024 * 1024;
 /// regular files remain supported because both providers support them in
 /// user-controlled configuration trees.
 pub fn read_to_string(path: &Path, max_bytes: usize) -> io::Result<String> {
+    String::from_utf8(read_bytes(path, max_bytes)?).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not valid UTF-8: {error}", path.display()),
+        )
+    })
+}
+
+/// Claude Code reads configuration through Node, which decodes invalid UTF-8
+/// with replacement characters instead of rejecting the file, so a scan of
+/// what Claude loads must not stop at an encoding error.
+pub fn read_to_string_lossy(path: &Path, max_bytes: usize) -> io::Result<String> {
+    Ok(String::from_utf8_lossy(&read_bytes(path, max_bytes)?).into_owned())
+}
+
+fn read_bytes(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
     let file = open_regular(path, true)?;
     let metadata = file.metadata()?;
     if metadata.len() > max_bytes as u64 {
@@ -22,12 +38,7 @@ pub fn read_to_string(path: &Path, max_bytes: usize) -> io::Result<String> {
     if bytes.len() > max_bytes {
         return Err(too_large(path, max_bytes));
     }
-    String::from_utf8(bytes).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} is not valid UTF-8: {error}", path.display()),
-        )
-    })
+    Ok(bytes)
 }
 
 fn too_large(path: &Path, max_bytes: usize) -> io::Error {
@@ -89,6 +100,7 @@ mod tests {
             read_to_string(&path, 4).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+        assert_eq!(read_to_string_lossy(&path, 4).unwrap(), "\u{fffd}");
     }
 
     #[cfg(unix)]
