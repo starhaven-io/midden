@@ -23,7 +23,6 @@ const MAX_MEMORY_FILES: usize = 1024;
 const MAX_MEMORY_ENTRIES: usize = 8192;
 const MAX_PROJECT_DIRS: usize = 4096;
 const MAX_PROJECT_ENTRIES: usize = 16384;
-const MAX_PROJECT_TRANSCRIPTS: usize = 16;
 const MAX_RULE_ENTRIES: usize = 4096;
 const MAX_IMPORTED_SOURCES: usize = 1024;
 
@@ -988,18 +987,17 @@ fn collect_default_memory_dirs(
     }
 
     for directory in directories {
-        let (cwds, incomplete) =
-            match transcripts::project_cwds(&directory, MAX_PROJECT_TRANSCRIPTS) {
-                Ok(result) => result,
-                Err(error) => {
-                    inventory.warnings.push(Warning::at(
-                        "claude-project-association-unavailable",
-                        error.to_string(),
-                        directory,
-                    ));
-                    continue;
-                }
-            };
+        let (cwds, incomplete) = match transcripts::project_cwds(&directory) {
+            Ok(result) => result,
+            Err(error) => {
+                inventory.warnings.push(Warning::at(
+                    "claude-project-association-unavailable",
+                    error.to_string(),
+                    directory,
+                ));
+                continue;
+            }
+        };
         let complete_association = classify_cwds(
             repository_root,
             target_identity.as_deref(),

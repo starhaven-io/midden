@@ -267,7 +267,10 @@ pub fn delete_dead(mut report: Report) -> Result<Report> {
     Ok(report)
 }
 
-pub(crate) fn project_cwds(path: &Path, limit: usize) -> Result<(Vec<PathBuf>, bool)> {
+/// Every transcript head is read: an unread transcript could name a different
+/// cwd, so a sample can never establish association. Only the directory-entry
+/// bound leaves the evidence incomplete.
+pub(crate) fn project_cwds(path: &Path) -> Result<(Vec<PathBuf>, bool)> {
     let entries = fs::read_dir(path).with_context(|| format!("read {}", path.display()))?;
     let mut jsonl_files = Vec::new();
     let mut entry_limit_reached = false;
@@ -284,9 +287,7 @@ pub(crate) fn project_cwds(path: &Path, limit: usize) -> Result<(Vec<PathBuf>, b
             jsonl_files.push(path);
         }
     }
-    jsonl_files.sort();
-    let mut incomplete = entry_limit_reached || jsonl_files.len() > limit;
-    jsonl_files.truncate(limit);
+    let mut incomplete = entry_limit_reached;
     let mut cwds = BTreeSet::new();
     for jsonl in &jsonl_files {
         if let Some(cwd) = cwd_from_jsonl(jsonl)? {
