@@ -66,6 +66,15 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("existing release asset", publication)
         self.assertNotIn("--clobber", publication)
 
+    def test_tag_authority_is_limited_to_publication(self) -> None:
+        publication = job(self.source, "release")
+        token = publication.split("id: release-token\n", 1)[1].split("\n      - name:", 1)[0]
+        permissions = dict(re.findall(r"permission-([\w-]+): (\w+)", token))
+        self.assertEqual(permissions, {"contents": "write", "workflows": "write"})
+        self.assertIn("repositories: ${{ github.event.repository.name }}", token)
+        self.assertNotIn("actions/checkout", publication)
+        self.assertEqual(self.source.count("permission-workflows:"), 1)
+
     def test_api_status_preserves_http_and_transport_contracts(self) -> None:
         helpers = [
             re.search(r"(?ms)^api_status\(\) \{\n.*?^\}", textwrap.dedent(block)).group()
