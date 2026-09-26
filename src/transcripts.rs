@@ -45,6 +45,7 @@ pub enum Cleanup {
     RemovedDir,
     MemoryPreserved,
     PartiallyCleaned,
+    Failed,
 }
 
 impl Cleanup {
@@ -55,6 +56,7 @@ impl Cleanup {
             Self::RemovedDir => "removed-dir",
             Self::MemoryPreserved => "memory-preserved",
             Self::PartiallyCleaned => "partially-cleaned",
+            Self::Failed => "failed",
         }
     }
 }
@@ -242,17 +244,23 @@ pub fn discover(claude_home: &Path, worktrees_only: bool) -> Result<Report> {
     })
 }
 
-pub fn delete_dead(mut report: Report) -> Result<Report> {
+/// Deletion is not backed up, so on failure `report` still records what was
+/// removed and which directory stopped the run.
+pub fn delete_dead(report: &mut Report) -> Result<()> {
     #[cfg(unix)]
     let projects = open_verified_directory(&report.projects_dir, report.projects_identity)
         .with_context(|| format!("re-open {}", report.projects_dir.display()))?;
+    report.applied = true;
     for dir in &mut report.dirs {
         if !dir.is_dead() {
             continue;
         }
 
         #[cfg(unix)]
-        delete_dir_artifacts(&projects, &report.projects_dir, dir)?;
+        if let Err(error) = delete_dir_artifacts(&projects, &report.projects_dir, dir) {
+            dir.cleanup = Cleanup::Failed;
+            return Err(error);
+        }
         #[cfg(not(unix))]
         {
             for target in dir.delete.clone() {
@@ -263,8 +271,7 @@ pub fn delete_dead(mut report: Report) -> Result<Report> {
             dir.cleanup = cleanup_after_delete(&dir.path, &dir.delete)?;
         }
     }
-    report.applied = true;
-    Ok(report)
+    Ok(())
 }
 
 /// Every transcript head is read: an unread transcript could name a different
@@ -1192,14 +1199,14 @@ mod tests {
     #[test]
     fn deletion_refuses_a_replaced_transcript_file() {
         let (_root, claude_home, project, session) = dead_transcript_fixture();
-        let report = discover(&claude_home, false).unwrap();
+        let mut report = discover(&claude_home, false).unwrap();
         assert_eq!(report.dead_count(), 1);
 
         let replacement = project.join("replacement");
         std::fs::write(&replacement, std::fs::read(&session).unwrap()).unwrap();
         std::fs::rename(&replacement, &session).unwrap();
 
-        let error = delete_dead(report).unwrap_err().to_string();
+        let error = delete_dead(&mut report).unwrap_err().to_string();
         assert!(error.contains("changed after discovery"), "{error}");
         assert!(session.exists(), "the replacement must not be deleted");
     }
@@ -1208,7 +1215,7 @@ mod tests {
     #[test]
     fn deletion_refuses_a_replaced_transcript_directory() {
         let (root, claude_home, project, session) = dead_transcript_fixture();
-        let report = discover(&claude_home, false).unwrap();
+        let mut report = discover(&claude_home, false).unwrap();
         assert_eq!(report.dead_count(), 1);
 
         let original = root.path().join("original-project-slug");
@@ -1220,7 +1227,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = delete_dead(report).unwrap_err().to_string();
+        let error = delete_dead(&mut report).unwrap_err().to_string();
         assert!(error.contains("changed after discovery"), "{error}");
         assert!(
             session.exists(),
@@ -1230,13 +1237,48 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_failed_directory_keeps_the_progress_already_made() {
+        let root = tempfile::tempdir().unwrap();
+        let claude_home = root.path().join("claude");
+        let missing = root.path().join("missing-project");
+        let mut sessions = Vec::new();
+        for slug in ["a-dead", "b-dead"] {
+            let project = claude_home.join("projects").join(slug);
+            std::fs::create_dir_all(&project).unwrap();
+            let session = project.join("session.jsonl");
+            std::fs::write(
+                &session,
+                format!("{{\"cwd\":{:?}}}\n", missing.display().to_string()),
+            )
+            .unwrap();
+            sessions.push(session);
+        }
+        let mut report = discover(&claude_home, false).unwrap();
+        assert_eq!(report.dead_count(), 2);
+        let replacement = sessions[1].with_file_name("replacement");
+        std::fs::write(&replacement, std::fs::read(&sessions[1]).unwrap()).unwrap();
+        std::fs::rename(&replacement, &sessions[1]).unwrap();
+
+        assert!(delete_dead(&mut report).is_err());
+
+        assert!(report.applied);
+        assert_eq!(report.dirs[0].deleted.len(), 1);
+        assert_eq!(report.dirs[0].cleanup, Cleanup::RemovedDir);
+        assert!(!sessions[0].exists());
+        assert!(report.dirs[1].deleted.is_empty());
+        assert_eq!(report.dirs[1].cleanup, Cleanup::Failed);
+        assert!(sessions[1].exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn deletion_rechecks_that_the_project_is_still_absent() {
         let (root, claude_home, _project, session) = dead_transcript_fixture();
-        let report = discover(&claude_home, false).unwrap();
+        let mut report = discover(&claude_home, false).unwrap();
         assert_eq!(report.dead_count(), 1);
         std::fs::create_dir(root.path().join("missing-project")).unwrap();
 
-        let error = delete_dead(report).unwrap_err().to_string();
+        let error = delete_dead(&mut report).unwrap_err().to_string();
         assert!(error.contains("became live"), "{error}");
         assert!(
             session.exists(),
@@ -1262,11 +1304,11 @@ mod tests {
         .unwrap();
         std::os::unix::fs::symlink(&real_projects, claude_home.join("projects")).unwrap();
 
-        let report = discover(&claude_home, false).unwrap();
+        let mut report = discover(&claude_home, false).unwrap();
         assert_eq!(report.projects_dir, real_projects.canonicalize().unwrap());
-        let applied = delete_dead(report).unwrap();
+        delete_dead(&mut report).unwrap();
 
-        assert!(applied.applied);
+        assert!(report.applied);
         assert!(!session.exists());
         assert!(claude_home.join("projects").is_symlink());
     }
