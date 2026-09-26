@@ -67,7 +67,9 @@ jobs:
           # request's copy and then trust the outputs it chooses to emit.
           ROUTER="${RUNNER_TEMP}/ci-path-routing.py"
           if git show "${BASE_SHA}:scripts/ci-path-routing.py" > "${ROUTER}"; then
-            git diff --name-only "${BASE_SHA}...HEAD" \
+            # Rename detection would list only a moved file's destination, so
+            # renaming a Rust source out of a routed path would schedule nothing.
+            git diff --no-renames --name-only "${BASE_SHA}...HEAD" \
               | python3 "${ROUTER}" >> "${GITHUB_OUTPUT}"
           else
             # The first change that introduces the trusted-base router cannot
