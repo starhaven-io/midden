@@ -34,7 +34,7 @@ Global flags: `--json` (machine output; disables color), `--color auto|always|ne
 
 ### Dependency automation
 
-Dependency automation is split. `.github/dependabot.yml` is fleet-rendered and owns Cargo manifests and GitHub Actions. `renovate.json` extends the shared preset at a pinned `local>starhaven-io/.github:renovate-config#<fleet-release>` reference and owns what no Dependabot ecosystem covers: the `rust-toolchain.toml` channel and the `cargo install <tool> --locked --version <version>` pins in `ci.yml` and `cargo-deny.yml`.
+Dependency automation is split. `.github/dependabot.yml` is fleet-rendered and owns Cargo manifests and GitHub Actions. `renovate.json` extends the shared preset at a pinned `local>starhaven-io/.github:renovate-config#<fleet-release>` reference and owns what no Dependabot ecosystem covers: the `rust-toolchain.toml` channel and the prebuilt tool release URLs and SHA-256 pins in `ci.yml` and `cargo-deny.yml`.
 
 Keep the `cargo-deny` pins in `ci.yml` and `cargo-deny.yml` aligned; script tests enforce equality and Renovate groups their updates. Confirm hosted dependency automation liveness in Mend's run log when investigating missing updates; the pull request list alone cannot distinguish inactivity from failure.
 
