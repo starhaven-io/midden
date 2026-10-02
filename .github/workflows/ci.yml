@@ -88,14 +88,14 @@ jobs:
     permissions:
       contents: read
       pull-requests: read # required to read PR titles
-    uses: starhaven-io/.github/.github/workflows/reusable-conventional-commits.yml@2b1c73acde5579431808a6222724d5e81a62e3fb # v2026.09.30.2
+    uses: starhaven-io/.github/.github/workflows/reusable-conventional-commits.yml@d4d091998efd14cbd248589dea26ecffd9020d25 # v2026.10.02.1
 
   fleet:
     name: Fleet guard
     if: github.event_name == 'pull_request'
     permissions:
       contents: read
-    uses: starhaven-io/.github/.github/workflows/reusable-fleet-guard.yml@2b1c73acde5579431808a6222724d5e81a62e3fb # v2026.09.30.2
+    uses: starhaven-io/.github/.github/workflows/reusable-fleet-guard.yml@d4d091998efd14cbd248589dea26ecffd9020d25 # v2026.10.02.1
     with:
       repo-name: ${{ github.event.repository.name }}
 
@@ -299,7 +299,7 @@ jobs:
     if: needs.generate-matrix.outputs.links == 'true'
     permissions:
       contents: read
-    uses: starhaven-io/.github/.github/workflows/reusable-link-check.yml@2b1c73acde5579431808a6222724d5e81a62e3fb # v2026.09.30.2
+    uses: starhaven-io/.github/.github/workflows/reusable-link-check.yml@d4d091998efd14cbd248589dea26ecffd9020d25 # v2026.10.02.1
     with:
       args: "--config lychee.toml README.md SECURITY.md"
       build-site: false
@@ -313,7 +313,7 @@ jobs:
     permissions:
       contents: read
       security-events: write # required for zizmor SARIF upload
-    uses: starhaven-io/.github/.github/workflows/reusable-zizmor.yml@2b1c73acde5579431808a6222724d5e81a62e3fb # v2026.09.30.2
+    uses: starhaven-io/.github/.github/workflows/reusable-zizmor.yml@d4d091998efd14cbd248589dea26ecffd9020d25 # v2026.10.02.1
 
   pinprick:
     name: pinprick audit
@@ -322,7 +322,7 @@ jobs:
     permissions:
       contents: read
       security-events: write # required for SARIF upload on same-repository changes
-    uses: starhaven-io/.github/.github/workflows/reusable-pinprick-audit.yml@2b1c73acde5579431808a6222724d5e81a62e3fb # v2026.09.30.2
+    uses: starhaven-io/.github/.github/workflows/reusable-pinprick-audit.yml@d4d091998efd14cbd248589dea26ecffd9020d25 # v2026.10.02.1
     with:
       advanced-security: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
       fail-on-findings: true
