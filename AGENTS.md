@@ -1,6 +1,6 @@
 # Agent Instructions for midden
 
-midden is a Rust CLI for resolving, auditing, visualizing, and cleaning the context and state Codex and Claude Code accumulate. Its provider-neutral memory inventory makes generated memories, repository instructions, and session evidence legible with provenance while preserving each provider's native behavior. Its existing Claude-specific commands resolve layered configuration, audit hygiene, and garbage-collect `~/.claude.json` project entries and orphaned transcript artifacts. It is deliberately *not* another MCP-server-list editor.
+midden is a Rust CLI for resolving, auditing, visualizing, and cleaning the context and state Codex and Claude Code accumulate. Its provider-neutral memory inventory makes generated memories, repository instructions, and session evidence legible with provenance while preserving each provider's native behavior. Its Claude-specific commands resolve layered configuration, audit hygiene, and garbage-collect `~/.claude.json` project entries and orphaned transcript artifacts. It is deliberately *not* another MCP-server-list editor.
 
 ## Project overview
 
@@ -30,15 +30,15 @@ Global flags: `--json` (machine output; disables color), `--color auto|always|ne
 
 ### CI workflows (`.github/workflows/`)
 
-`ci.yml` (dynamic matrix: conventional-commit check, lint, test on Linux/Linux-ARM/macOS, coverage to Codecov, zizmor on workflow changes); `release.yml` (manual dispatch: cross-platform signed + notarized binaries, build-provenance attestation, crates.io publish via OIDC, Homebrew cask bump); `codeql.yml`, `zizmor.yml`, `pinprick-audit.yml` (dogfood), `link-check.yml`; `cargo-deny.yml` (Monday scheduled/dispatch advisory drift scan that opens or updates a tracking issue when the result flips). Third-party actions are SHA-pinned and workflows are least-privilege (`permissions: {}` at the top, granted per-job). `release.yml` deliberately omits shell `-x` so secrets don't leak into public logs.
+`ci.yml` (conventional-commit check, fleet guard, a path-routed matrix of lint, test on Linux/Linux-ARM/macOS, MSRV, and coverage to Codecov, plus link check, zizmor, and pinprick when their paths change; every job feeds the always-run `conclusion` aggregate); `release.yml` (manual dispatch: cross-platform signed + notarized binaries, build-provenance attestation, crates.io publish via OIDC, Homebrew cask bump); `codeql.yml`, `zizmor.yml`, `pinprick-audit.yml` (dogfood), `link-check.yml`, `fleet-guard.yml`; `cargo-deny.yml` (Monday scheduled/dispatch advisory drift scan that opens or updates a tracking issue when the result flips). Third-party actions are SHA-pinned and workflows are least-privilege (`permissions: {}` at the top, granted per-job). `release.yml` deliberately omits shell `-x` so secrets don't leak into public logs.
 
 ### Dependency automation
 
-Dependency automation is split. `.github/dependabot.yml` is fleet-rendered and owns Cargo manifests and GitHub Actions. `renovate.json` extends the shared preset at a pinned `local>starhaven-io/.github:renovate-config#<fleet-release>` reference and owns what no Dependabot ecosystem covers: the `rust-toolchain.toml` channel and the prebuilt tool release URLs and SHA-256 pins in `ci.yml` and `cargo-deny.yml`.
+Dependency automation is split between two fleet-rendered configs. `.github/dependabot.yml` owns Cargo manifests and GitHub Actions. `renovate.json` extends the shared preset at a pinned `local>starhaven-io/.github:renovate-config#<fleet-release>` reference and owns what no Dependabot ecosystem covers: the `rust-toolchain.toml` channel and the prebuilt tool release URLs and SHA-256 pins in `ci.yml` and `cargo-deny.yml`.
 
 Keep the `cargo-deny` pins in `ci.yml` and `cargo-deny.yml` aligned; script tests enforce equality and Renovate groups their updates. Confirm hosted dependency automation liveness in Mend's run log when investigating missing updates; the pull request list alone cannot distinguish inactivity from failure.
 
-Never drop the `#<fleet-release>` tag or point the reference at a branch: an unpinned preset lets hub `main` change dependency behavior here with no review. Moving the pin is a pull request in this repository, and validation does not resolve the reference, so a green `renovate-config-validator` run says nothing about whether the tag exists or contains the preset.
+Never drop the `#<fleet-release>` tag or point the reference at a branch: an unpinned preset lets hub `main` change dependency behavior here with no review. Each fleet release moves the pin in a fleet-sync pull request, and validation does not resolve the reference, so a green `renovate-config-validator` run says nothing about whether the tag exists or contains the preset.
 
 ## Repository structure
 
@@ -97,7 +97,7 @@ Script contract tests execute local shell/JSON payload builders and require Pyth
 - `just fmt` / `just fmt-check` — rustfmt, 2024 style edition (`rustfmt.toml`)
 - `just typos`, `just deny` (`cargo deny check`), `just lychee`, `just audit` (zizmor)
 - `just check` — run all local checks, including script tests; missing tools make the gate fail.
-- Errors: anyhow throughout (`Result`, `.with_context`, `bail!`). Flat modules.
+- Errors: anyhow throughout (`Result`, `.with_context`, `bail!`). Flat modules, except the per-provider `memory/` tree.
   Comments explain *why*, not *what*.
 
 ### Exit codes
