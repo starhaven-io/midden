@@ -78,7 +78,7 @@ CLAUDE.md does **not** follow settings precedence. Applicable files within the p
 - **Atomic writes.** `claude_json::write_atomic` streams to a temp sibling, fsyncs, then renames over the target — never an in-place truncating write of `~/.claude.json`. The temp mirrors the target's file mode (owner-only `0600` for new files) so a rewrite never broadens permissions on a credential-bearing file; backups are clamped to `0600` likewise.
 - **Running-`claude` gate.** Refuses to write while a `claude` process runs (Claude Code rewrites the file live). `--force` overrides.
 - **Mass-deletion gate.** Refuses to prune when ≥90% of a non-trivial `projects` map resolves missing — that usually means the wrong host or an unmounted volume, not real orphans. `--force` overrides.
-- **Conservative deletion.** Removes only entries whose directory is provably absent; never guesses from value contents. Apply re-reads and re-derives immediately before writing, so concurrent edits to unrelated keys survive.
+- **Conservative deletion.** Removes only entries whose directory is provably absent; never guesses from value contents. Apply re-reads and re-derives immediately before writing, narrowing the race with concurrent writers. An edit made after that read can still be overwritten.
 - **Mask secrets by default.** Sensitive-named keys (`token`, `secret`, `password`, `apikey`, `auth`, `credential`, …) have their string values masked — including strings nested in arrays/objects under such a key. `--show-secrets` opts out.
 - `doctor`'s `Error`-severity secret findings (`secret-in-committed-settings`, `secret-in-committed-mcp`, `secret-in-malformed-config`) are suppressed for git-ignored files.
 - **`--json` on every command** for CI/scripting.
