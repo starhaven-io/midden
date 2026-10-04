@@ -11,6 +11,16 @@ SPEC.loader.exec_module(FORMATTER)
 
 
 class ReleaseNotesTests(unittest.TestCase):
+    def test_bot_authors_and_new_contributor_section(self) -> None:
+        sections, _ = FORMATTER.parse_notes(
+            "## What's Changed\n"
+            "* fix: repair parsing by @renovate[bot] in https://example.test/1\n"
+            "## New Contributors\n"
+            "* @person made their first contribution in https://example.test/2\n"
+            "**Full Changelog**: https://example.test/compare/v1...v2\n"
+        )
+        self.assertEqual(sections, {"Fixes": ["repair parsing"]})
+
     def test_categorizes_scoped_and_breaking_titles(self) -> None:
         sections, changelog = FORMATTER.parse_notes(
             "\n".join(

@@ -29,7 +29,7 @@ PR_RE = re.compile(
     r"^\*\s+"
     r"(?:(?P<type>[a-z]+)(?:\((?P<scope>[^)]*)\))?(?P<breaking>!)?:\s*)?"
     r"(?P<desc>.+?)"
-    r"(?:\s+by\s+@[\w-]+)?"
+    r"(?:\s+by\s+@[\w-]+(?:\[bot\])?)?"
     r"(?:\s+in\s+https?://\S+)?"
     r"\s*$"
 )
@@ -41,13 +41,20 @@ def parse_notes(raw: str) -> tuple[dict[str, list[str]], str | None]:
     """Parse raw release notes into categorized entries and changelog URL."""
     sections: dict[str, list[str]] = {}
     changelog_url = None
+    contributors = False
 
     for line in raw.splitlines():
         line = line.strip()
 
+        if line.startswith("## "):
+            contributors = line == "## New Contributors"
+
         changelog_match = CHANGELOG_RE.match(line)
         if changelog_match:
             changelog_url = changelog_match.group("url")
+            continue
+
+        if contributors:
             continue
 
         pr_match = PR_RE.match(line)
