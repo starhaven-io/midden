@@ -91,7 +91,7 @@ jobs:
           EXISTING=$(gh issue list --state open --limit 50 \
             --search "in:title cargo deny check is failing" \
             --json number,title,author \
-            --jq ".[] | select(.title == \"${TITLE}\" and .author.login == \"github-actions[bot]\") | .number" | head -1)
+            --jq "first(.[] | select(.title == \"${TITLE}\" and .author.login == \"app/github-actions\")) | .number // empty")
           if [[ -n "${EXISTING}" ]]; then
             gh issue comment "${EXISTING}" --body-file issue-body.md
           else
@@ -106,10 +106,11 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           TITLE="cargo deny check is failing on main"
-          for N in $(gh issue list --state open --limit 50 \
+          EXISTING=$(gh issue list --state open --limit 50 \
             --search "in:title cargo deny check is failing" \
             --json number,title,author \
-            --jq ".[] | select(.title == \"${TITLE}\" and .author.login == \"github-actions[bot]\") | .number"); do
+            --jq ".[] | select(.title == \"${TITLE}\" and .author.login == \"app/github-actions\") | .number")
+          for N in ${EXISTING}; do
             gh issue comment "${N}" --body "\`cargo deny check\` is passing again as of ${RUN_URL}. Closing."
             gh issue close "${N}"
           done
