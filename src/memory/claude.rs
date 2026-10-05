@@ -765,22 +765,26 @@ fn import_may_be_external(context: InstructionContext<'_>, path: &Path) -> bool 
 
 fn imports_from_text(raw: &str) -> Vec<String> {
     let mut imports = Vec::new();
-    let mut fence: Option<&str> = None;
+    let mut fence: Option<(char, usize)> = None;
     for line in raw.lines() {
-        let trimmed = line.trim_start();
-        if let Some(marker) = fence {
-            if trimmed.starts_with(marker) {
+        let trimmed = line.trim_start_matches(' ');
+        let fence_indent = line.len() - trimmed.len() <= 3;
+        if let Some((marker, length)) = fence {
+            let count = trimmed.chars().take_while(|&c| c == marker).count();
+            // Claude's bundled marked parser permits either fence character after
+            // the complete opening delimiter, then ASCII spaces only.
+            let suffix = trimmed[count..].trim_start_matches(['`', '~']);
+            if fence_indent && count >= length && suffix.bytes().all(|byte| byte == b' ') {
                 fence = None;
             }
             continue;
         }
-        if trimmed.starts_with("```") {
-            fence = Some("```");
-            continue;
-        }
-        if trimmed.starts_with("~~~") {
-            fence = Some("~~~");
-            continue;
+        if fence_indent && let Some(marker @ ('`' | '~')) = trimmed.chars().next() {
+            let count = trimmed.chars().take_while(|&c| c == marker).count();
+            if count >= 3 && (marker != '`' || !trimmed[count..].contains('`')) {
+                fence = Some((marker, count));
+                continue;
+            }
         }
 
         let visible = line
@@ -1411,6 +1415,42 @@ mod tests {
     fn imports_ignore_code() {
         let raw = "@README.md\n`@inline.md`\n```md\n@fenced.md\n```\nSee @docs/rules.md, now.\n";
         assert_eq!(imports_from_text(raw), vec!["README.md", "docs/rules.md"]);
+    }
+
+    #[test]
+    fn imports_require_a_matching_complete_closing_fence() {
+        for marker in ['`', '~'] {
+            let fence: String = std::iter::repeat_n(marker, 4).collect();
+            let short: String = std::iter::repeat_n(marker, 3).collect();
+            let raw = format!(
+                "{fence}md\n{short}\n@still-fenced.md\n{fence}trailing\n@also-fenced.md\n{fence}{marker}  \n@visible.md\n"
+            );
+            assert_eq!(imports_from_text(&raw), vec!["visible.md"]);
+        }
+        assert_eq!(
+            imports_from_text("```\n~~~\n@hidden.md\n```\n@visible.md\n"),
+            vec!["visible.md"]
+        );
+    }
+
+    #[test]
+    fn imports_match_claude_marked_fence_closures() {
+        for (closing, closes) in [
+            ("```~", true),
+            ("  ```~`  ", true),
+            ("```\u{a0}", false),
+            ("```\u{c}", false),
+            ("    ```", false),
+            ("\t```", false),
+            ("```\t", false),
+        ] {
+            let text = format!("```\n@x.md\n{closing}\n@a.md\n```\n@v.md\n");
+            assert_eq!(
+                imports_from_text(&text),
+                vec![if closes { "a.md" } else { "v.md" }],
+                "closing fence: {closing:?}"
+            );
+        }
     }
 
     #[test]
