@@ -84,7 +84,7 @@ enum Command {
         #[arg(long = "worktrees-only")]
         worktrees_only: bool,
 
-        /// Write even if a `claude` process appears to be running
+        /// Override the running-Claude and mass-deletion write gates
         #[arg(long)]
         force: bool,
     },
@@ -98,7 +98,7 @@ enum Command {
         #[arg(long)]
         fix: bool,
 
-        /// Write even if a `claude` process appears to be running
+        /// Override the running-Claude and mass-deletion write gates
         #[arg(long)]
         force: bool,
 

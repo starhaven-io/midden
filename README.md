@@ -262,9 +262,9 @@ midden does not have a config file — all behavior is controlled by CLI flags. 
 
 | Flag | Purpose |
 |------|---------|
-| `--config <PATH>` | Override the path to `~/.claude.json` (for testing) |
-| `--claude-home <PATH>` | Override the path to `~/.claude/` (for testing) |
-| `--codex-home <PATH>` | Override `$CODEX_HOME` / `~/.codex/` (for testing) |
+| `--config <PATH>` | Override the path to `~/.claude.json` |
+| `--claude-home <PATH>` | Override the path to `~/.claude/` |
+| `--codex-home <PATH>` | Override `$CODEX_HOME` / `~/.codex/` |
 | `--json` | Emit machine-readable JSON instead of styled text |
 | `--color auto\|always\|never` | Control color output |
 | `--show-secrets` | Unmask secret-looking values in `show` / `doctor` output |
@@ -276,7 +276,7 @@ midden does not have a config file — all behavior is controlled by CLI flags. 
 |------|---------|
 | 0 | Successful read, dry-run, or apply; doctor has no error-severity findings |
 | 1 | Findings present (doctor with errors) |
-| 2 | Error — bad input, missing file, write blocked by running claude |
+| 2 | Error — bad input, missing file, or a running-Claude or mass-deletion write gate |
 
 When output is piped and the reader exits early (`midden show | head`), midden
 dies of SIGPIPE like any other Unix filter — shells report that as 141, never
@@ -304,7 +304,7 @@ just install-hooks  # Install git hooks: pre-push check + DCO sign-off (once per
 
 Commits must follow [Conventional Commits](https://www.conventionalcommits.org/) format and include a DCO sign-off (`git commit -s`). Run `just install-hooks` once per clone to enable the git hooks (the full local `just check` gate and DCO sign-off enforcement). Hosted CI additionally runs platform, coverage-upload, link, and workflow checks selected for the changed paths.
 
-The manual release workflow accepts only `main`. Unprivileged jobs validate the crate, build binaries, and format generated notes; separate no-checkout jobs sign or attest those exact artifacts. The publication job validates all five archives before minting its narrowly scoped GitHub App token. A retry accepts an existing tag only when it resolves to the same commit, byte-compares every existing release asset, uploads only missing assets, and refuses any non-identical or unexpected asset instead of overwriting published bytes. Because a newly timestamped macOS signature changes the archive bytes, do not rerun a successful macOS build/sign job after assets are published; rerun only failed downstream jobs while the original artifacts are retained. Crates.io publication skips an already published version. Homebrew reconciliation fetches its public inputs in a token-isolated step, then renders and validates a credential-free cask plan even when the version already matches. A no-checkout job uses the Git data API to write only that pre-hashed candidate, an unprivileged job reads the exact remote head back, and the merge job waits for checks before minting its token, revalidating the PR, and directly merging the same head SHA.
+The manual release workflow accepts only `main`. Unprivileged jobs validate the crate, build binaries, and format generated notes; separate no-checkout jobs sign or attest those exact artifacts. The publication job validates all five archives before minting its narrowly scoped GitHub App token. A retry accepts an existing tag only when it resolves to the same commit, byte-compares every existing release asset, can upload missing assets only while the release is still mutable, and refuses any non-identical or unexpected asset. A published immutable release cannot be repaired by uploading or replacing assets. Because a newly timestamped macOS signature changes the archive bytes, do not rerun a successful macOS build/sign job after assets are published; rerun only failed downstream jobs while the original artifacts are retained. Crates.io publication skips an already published version. Homebrew reconciliation fetches its public inputs in a token-isolated step, then renders and validates a credential-free cask plan even when the version already matches. A no-checkout job uses the Git data API to write only that pre-hashed candidate, an unprivileged job reads the exact remote head back, and the merge job waits for checks before minting its token, revalidating the PR, and directly merging the same head SHA.
 
 <!-- fleet:block license-section -->
 
