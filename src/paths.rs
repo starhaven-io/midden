@@ -211,6 +211,7 @@ fn expand_managed(candidates: Vec<PathBuf>) -> PathDiscovery {
                                 let path = entry.path();
                                 if path.extension().and_then(|extension| extension.to_str())
                                     == Some("json")
+                                    && !entry.file_name().as_encoded_bytes().starts_with(b".")
                                 {
                                     files.push(path);
                                 }
@@ -267,6 +268,8 @@ mod tests {
         std::fs::write(dropin.join("b.json"), "{}").unwrap();
         std::fs::write(dropin.join("a.json"), "{}").unwrap();
         std::fs::write(dropin.join("ignore.txt"), "").unwrap();
+        std::fs::write(dropin.join(".hidden.json"), "not JSON").unwrap();
+        std::fs::write(dropin.join("._a.json"), "AppleDouble metadata").unwrap();
         let missing = dir.path().join("nope.json");
 
         let files = expand_managed(vec![plain.clone(), dropin.clone(), missing]);
