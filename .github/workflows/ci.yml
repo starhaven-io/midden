@@ -25,7 +25,7 @@ permissions: {}
 jobs:
   generate-matrix:
     name: Generate matrix
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -39,6 +39,33 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Select trusted router Ruby
+        id: trusted-ruby
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [[ ! "${BASE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Pull request base SHA is invalid."
+            exit 1
+          fi
+          if git cat-file -e "${BASE_SHA}:scripts/ci-path-routing.rb"; then
+            RUBY_VERSION=$(git show "${BASE_SHA}:.ruby-version")
+            if [[ ! "${RUBY_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Trusted router Ruby version is invalid."
+              exit 1
+            fi
+            echo "version=${RUBY_VERSION}" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Set up router Ruby
+        if: steps.trusted-ruby.outputs.version != ''
+        uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
+        with:
+          ruby-version: ${{ steps.trusted-ruby.outputs.version }}
+          bundler: none
+          bundler-cache: false
 
       - name: Generate CI matrix
         id: matrix
@@ -58,6 +85,11 @@ jobs:
             exit 0
           fi
 
+          if [[ ! "${BASE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Pull request base SHA is invalid."
+            exit 1
+          fi
+
           # `edited` (title/body/base) also runs the full path-derived matrix. The
           # aggregate "conclusion" job is the only required status check, so it must
           # certify every relevant leg for the current commit. Collapsing to a
@@ -65,12 +97,12 @@ jobs:
           # one on the same SHA, bypassing tests, coverage, links, and the rest.
           # Routing is itself a security boundary: never execute the pull
           # request's copy and then trust the outputs it chooses to emit.
-          ROUTER="${RUNNER_TEMP}/ci-path-routing.py"
-          if git show "${BASE_SHA}:scripts/ci-path-routing.py" > "${ROUTER}"; then
+          ROUTER="${RUNNER_TEMP}/ci-path-routing.rb"
+          if git show "${BASE_SHA}:scripts/ci-path-routing.rb" > "${ROUTER}"; then
             # Rename detection would list only a moved file's destination, so
             # renaming a Rust source out of a routed path would schedule nothing.
-            git diff --no-renames --name-only "${BASE_SHA}...HEAD" \
-              | python3 "${ROUTER}" >> "${GITHUB_OUTPUT}"
+            git diff --no-renames --name-only -z "${BASE_SHA}...HEAD" \
+              | ruby "${ROUTER}" >> "${GITHUB_OUTPUT}"
           else
             # The first change that introduces the trusted-base router cannot
             # load it from base, so fail closed to the complete matrix.
@@ -174,9 +206,15 @@ jobs:
         if: matrix.check == 'lint'
         run: typos
 
-      - name: Release note formatter tests
+      - name: Set up Ruby
         if: matrix.check == 'lint'
-        run: python3 -B -m unittest discover --start-directory scripts/tests
+        uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
+        with:
+          bundler-cache: true
+
+      - name: Script contract tests
+        if: matrix.check == 'lint'
+        run: bundle exec ruby scripts/test.rb
 
       - name: Cargo deny
         if: matrix.check == 'lint'

@@ -89,7 +89,7 @@ CLAUDE.md does **not** follow settings precedence. Applicable files within the p
 stable toolchain. Homebrew's standalone Rust does not honor that file, so verify
 `rustc --version` matches its `channel` before running the required checks.
 
-Script contract tests execute local shell/JSON payload builders and require Python 3, Bash, Git, and `jq`. They mock API calls and do not publish.
+Script contract tests execute local shell/JSON payload builders and require the Ruby version in `.ruby-version`, Bundler, Bash, Git, and `jq`. Run `bundle install` once, then `bundle exec ruby scripts/test.rb`. They mock API calls and do not publish. The fleet-managed Codecov uploader requires Python 3.
 
 `just` recipes (raw command in parens):
 - `just build` / `just test` (`cargo build --locked` / `cargo test --locked`)
