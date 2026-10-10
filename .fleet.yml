@@ -9,6 +9,9 @@ params:
     pinprick-jobs: ["pinprick"]
   renovate: true
   dependabot:
+    - package-ecosystem: "bundler"
+      group: "bundler-dependencies"
+      directory: "/"
     - package-ecosystem: "cargo"
       group: "cargo-dependencies"
       directory: "/"
@@ -24,8 +27,12 @@ params:
     schedule: "0 14 * * 1"
     concurrency-group: "link-check"
   codeql:
-    languages: ["actions", "rust"]
+    languages: ["actions", "rust", "ruby"]
     paths:
+      - "scripts/**/*.rb"
+      - "Gemfile"
+      - "Gemfile.lock"
+      - ".ruby-version"
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
