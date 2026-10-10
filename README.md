@@ -284,19 +284,22 @@ as a panic.
 
 ## Building
 
-A [justfile](https://github.com/casey/just) provides common tasks:
+A [justfile](https://github.com/casey/just) provides common tasks. Development
+checks also use the Ruby version in `.ruby-version`; run `bundle install` to
+install the locked script-test dependencies before running the full gate.
 
 ```bash
 just build          # Build the project
 just build-release  # Build in release mode
 just test           # Run tests
+just script-tests   # Run Ruby script and workflow contract tests
 just clippy         # Run clippy
 just fmt            # Format code
 just typos          # Check for typos
 just deny           # cargo-deny: license + advisory + source checks
 just lychee         # Check public documentation links
 just audit          # Audit GitHub Actions workflows (zizmor)
-just check          # Run the full local gate, including release-note tests
+just check          # Run the full local gate, including script contract tests
 just install-hooks  # Install git hooks: pre-push check + DCO sign-off (once per clone)
 ```
 

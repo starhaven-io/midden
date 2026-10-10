@@ -51,8 +51,13 @@ jobs:
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "tag=v${VERSION}" >> "${GITHUB_OUTPUT}"
 
-      - name: Test release note formatter
-        run: python3 -B -m unittest discover --start-directory scripts/tests
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
+        with:
+          bundler-cache: true
+
+      - name: Test script contracts
+        run: bundle exec ruby scripts/test.rb
 
       - name: Verify crate package
         run: cargo publish --locked --dry-run
@@ -363,12 +368,17 @@ jobs:
           name: raw-release-notes
           path: raw-release-notes
 
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
+        with:
+          bundler-cache: true
+
       - name: Format notes
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          python3 -B -m unittest discover --start-directory scripts/tests
-          python3 scripts/format-release-notes.py raw-release-notes/raw-notes.md "${TAG}" > formatted-notes.md
+          bundle exec ruby scripts/test.rb
+          ruby scripts/format-release-notes.rb raw-release-notes/raw-notes.md "${TAG}" > formatted-notes.md
           test -s formatted-notes.md
 
       - name: Upload formatted notes
@@ -628,6 +638,12 @@ jobs:
             test -f "cask-assets/midden-${VERSION}-${target}.tar.gz"
           done
 
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
+        with:
+          bundler: none
+          bundler-cache: false
+
       - name: Render and validate exact cask candidate
         id: cask
         env:
@@ -638,10 +654,10 @@ jobs:
           MACOS_SHA=$(sha256sum "cask-assets/midden-${VERSION}-aarch64-apple-darwin.tar.gz" | awk '{print $1}')
           LINUX_ARM_SHA=$(sha256sum "cask-assets/midden-${VERSION}-aarch64-unknown-linux-gnu.tar.gz" | awk '{print $1}')
           LINUX_X86_SHA=$(sha256sum "cask-assets/midden-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" | awk '{print $1}')
-          python3 scripts/validate-cask-bump.py --render \
+          ruby scripts/validate-cask-bump.rb --render \
             base-cask.rb candidate-cask.rb "${VERSION}" \
             "${MACOS_SHA}" "${LINUX_ARM_SHA}" "${LINUX_X86_SHA}"
-          python3 scripts/validate-cask-bump.py \
+          ruby scripts/validate-cask-bump.rb \
             base-cask.rb candidate-cask.rb "${VERSION}" \
             "${MACOS_SHA}" "${LINUX_ARM_SHA}" "${LINUX_X86_SHA}"
 

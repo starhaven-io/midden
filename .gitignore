@@ -6,5 +6,8 @@
 .vscode/
 # fleet:end
 __pycache__/
+# Ruby tooling
+/.bundle/
+/vendor/bundle/
 # Build outputs
 /target
