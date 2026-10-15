@@ -43,6 +43,9 @@ jobs:
           test "${REF}" = "refs/heads/main"
           test "$(git rev-parse HEAD)" = "${COMMIT_SHA}"
 
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+
       - name: Resolve version
         id: version
         run: |
@@ -557,6 +560,9 @@ jobs:
         run: |
           test ! -e .cargo/config && test ! -L .cargo/config
           test ! -e .cargo/config.toml && test ! -L .cargo/config.toml
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install
 
       - name: Check publication state
         id: crate
