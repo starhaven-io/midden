@@ -41,7 +41,7 @@ walkdir = "2"
 colored = "3"
 anyhow = "1"
 time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
-sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 
 [lints.rust]
 # Unsafe operations require an explicit, documented lint exception.
