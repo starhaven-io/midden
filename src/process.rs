@@ -4,7 +4,11 @@ use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 /// Whether a `claude` process is currently running.
 pub fn claude_is_running() -> bool {
-    let mut sys = System::new();
+    // Without a process list Claude Code can't be ruled out, so the gate
+    // stays closed and --force remains the override.
+    let Ok(mut sys) = System::new() else {
+        return true;
+    };
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
