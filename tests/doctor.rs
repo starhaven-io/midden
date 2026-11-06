@@ -1470,3 +1470,134 @@ fn entries_on_unmounted_volumes_are_not_orphaned_projects() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(!stdout.contains("orphaned-project"), "stdout:\n{stdout}");
 }
+
+#[test]
+fn flags_credential_headers_in_committed_mcp_args_and_hook_commands() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    write_json(
+        &fx.root.path().join(".mcp.json"),
+        &json!({
+            "mcpServers": {
+                "ctx": {
+                    "command": "npx",
+                    "args": [
+                        "-y",
+                        "mcp-remote",
+                        "https://mcp.example.com/mcp",
+                        "--header",
+                        "X-Api-Key: zq8r7Lk2mN9pQ4sT6vW1xY3zAb5c"
+                    ]
+                },
+                "legacy": {
+                    "command": "curl",
+                    "args": ["-HAuthorization: Basic dXNlcjpwYXNzd29yZA==", "https://legacy.example.com"]
+                },
+                "nested": {
+                    "command": "srv",
+                    "args": ["--header", "Authorization: Bearer ${MCP_AUTH:-${BACKUP:-zq8r7Lk2mN9pQ4sT6vW1xY3zAb5c}}"]
+                }
+            }
+        }),
+    );
+    write_json(
+        &fx.root.path().join(".claude/settings.json"),
+        &json!({
+            "hooks": {
+                "Stop": [{ "hooks": [
+                    {
+                        "type": "command",
+                        "command": "curl -H 'X-Api-Key: zq8r7Lk2mN9pQ4sT6vW1xY3zAb5c' https://api.example.com/done"
+                    },
+                    {
+                        "type": "command",
+                        "command": "curl -H 'Cookie: sid=abcdef123456; csrf=zq8r7Lk2mN9pQ4sT6vW1xY3zAb5c' https://api.example.com/done"
+                    },
+                    {
+                        "type": "command",
+                        "command": "curl -H 'Cookie: sid=\"abcdef123456\"; csrf=\"zq8r7Lk2mN9pQ4sT6vW1xY3zAb5c\"' https://api.example.com/done"
+                    }
+                ] }]
+            }
+        }),
+    );
+    track(&fx, ".mcp.json");
+    track(&fx, ".claude/settings.json");
+
+    let out = fx.cmd().arg("doctor").arg(fx.root.path()).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("secret-in-committed-mcp"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("mcpServers.ctx.args[4]"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("mcpServers.legacy.args[0]"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("mcpServers.nested.args[1]"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("secret-in-committed-settings"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("X-Api-Key: zq8r***"), "stdout:\n{stdout}");
+    assert!(stdout.contains("Basic dXNl***"), "stdout:\n{stdout}");
+    assert!(stdout.contains("Cookie: sid=***"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("${MCP_AUTH:-${BACKUP:-zq8r***}}"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("zq8r7Lk2mN9pQ4sT6vW1xY3zAb5c"),
+        "leak:\n{stdout}"
+    );
+    assert!(!stdout.contains("dXNlcjpwYXNzd29yZA"), "leak:\n{stdout}");
+    assert!(!stdout.contains("abcdef123456"), "leak:\n{stdout}");
+}
+
+#[test]
+fn opaque_url_paths_and_shell_references_are_not_committed_secrets() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    write_json(
+        &fx.root.path().join(".mcp.json"),
+        &json!({
+            "mcpServers": {
+                "zap": {
+                    "type": "http",
+                    "url": "https://mcp.zapier.com/api/mcp/s/NjI3ZjQ5YzgtMzA4Zi00ZTQwLWE0NmYtMGM5ZjNiOWIyZTI1OjE2YjQ2ZTRmLTQ3/mcp"
+                },
+                "ref": {
+                    "command": "npx",
+                    "args": ["srv", "--header", "Authorization: Bearer $SERVICE_TOKEN"]
+                },
+                "sub": {
+                    "command": "npx",
+                    "args": ["srv", "--header", "X-Api-Key: $(cat ~/.api-key)"]
+                },
+                "chained": {
+                    "command": "npx",
+                    "args": ["srv", "--header", "X-Api-Key: ${API_KEY:-$(cat ~/.api-key)}"]
+                },
+                "internal": {
+                    "type": "http",
+                    "url": "https://token-service:8080/mcp"
+                }
+            }
+        }),
+    );
+    track(&fx, ".mcp.json");
+
+    let out = fx.cmd().arg("doctor").arg(fx.root.path()).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("secret-in-committed-mcp"),
+        "stdout:\n{stdout}"
+    );
+}

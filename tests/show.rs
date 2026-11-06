@@ -1206,3 +1206,59 @@ fn show_masks_password_names_and_command_arguments() {
         }
     }
 }
+
+#[test]
+fn show_masks_credential_headers_and_opaque_url_paths() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let token = "zq8r7Lk2mN9pQ4sT6vW1xY3zAb5c";
+    let url = "https://mcp.zapier.com/api/mcp/s/NjI3ZjQ5YzgtMzA4Zi00ZTQwLWE0NmYtMGM5ZjNiOWIyZTI1OjE2YjQ2ZTRmLTQ3/mcp";
+    let masked_url = "https://mcp.zapier.com/api/mcp/s/NjI3***/mcp";
+    write_json(
+        &fx.root.path().join(".mcp.json"),
+        &json!({
+            "mcpServers": {
+                "ctx": {
+                    "command": "npx",
+                    "args": ["mcp-remote", "https://mcp.example.com/mcp", "--header", format!("X-Api-Key: {token}")]
+                },
+                "zap": { "type": "http", "url": url }
+            }
+        }),
+    );
+
+    let out = fx.cmd().arg("show").arg(fx.root.path()).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(masked_url), "stdout:\n{stdout}");
+    assert!(!stdout.contains("NjI3ZjQ5"), "url token leaked:\n{stdout}");
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("show")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let servers = v["mcp_servers"].as_array().unwrap();
+    let ctx = servers.iter().find(|s| s["name"] == "ctx").unwrap();
+    assert_eq!(ctx["definition"]["args"][3], "X-Api-Key: zq8r***");
+    let zap = servers.iter().find(|s| s["name"] == "zap").unwrap();
+    assert_eq!(zap["url"], masked_url);
+    assert_eq!(zap["definition"]["url"], masked_url);
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("show")
+        .arg(fx.root.path())
+        .arg("--show-secrets")
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let servers = v["mcp_servers"].as_array().unwrap();
+    let ctx = servers.iter().find(|s| s["name"] == "ctx").unwrap();
+    assert_eq!(ctx["definition"]["args"][3], format!("X-Api-Key: {token}"));
+    let zap = servers.iter().find(|s| s["name"] == "zap").unwrap();
+    assert_eq!(zap["url"], url);
+}
