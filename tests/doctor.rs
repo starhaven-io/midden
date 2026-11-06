@@ -1459,3 +1459,14 @@ fn flags_secrets_in_committed_settings_with_invalid_utf8() {
         "stdout:\n{stdout}"
     );
 }
+
+#[test]
+fn entries_on_unmounted_volumes_are_not_orphaned_projects() {
+    let fx = Fixture::new();
+    let on_volume = format!("/Volumes/midden-missing-{}/project", std::process::id());
+    fx.write_config(json!({ on_volume.as_str(): {} }), json!({}));
+
+    let out = fx.cmd().arg("doctor").arg(fx.root.path()).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("orphaned-project"), "stdout:\n{stdout}");
+}

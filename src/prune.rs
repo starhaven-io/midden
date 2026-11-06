@@ -68,12 +68,19 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     };
     let total = projects.len();
     let orphans = orphans::find(projects, opts.worktrees_only);
+    let unmounted = orphans::on_unmounted_volumes(projects, opts.worktrees_only);
 
     if orphans.is_empty() {
         if opts.json {
-            emit_json(json!({"total": total, "orphans": [], "removed": false}));
+            emit_json(json!({
+                "total": total,
+                "orphans": [],
+                "unmounted": unmounted_json(&unmounted),
+                "removed": false,
+            }));
         } else {
             println!("clean. {total} project entries, none orphaned.");
+            print_unmounted(&unmounted);
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -94,6 +101,7 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
                 "path": o.path,
                 "is_worktree": o.is_worktree,
             })).collect::<Vec<_>>(),
+            "unmounted": unmounted_json(&unmounted),
             "bytes_before": config.raw.len(),
             "bytes_after": applied.as_ref().map(|(_, _, b)| *b).unwrap_or(new_raw.len()),
             "removed": applied.is_some(),
@@ -117,6 +125,7 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
         };
         println!("  - {}{tag}", display_text(&o.path));
     }
+    print_unmounted(&unmounted);
     println!();
     println!(
         "would shrink {} by ~{} ({} -> {}).",
@@ -162,6 +171,10 @@ fn run_with_transcripts(env: &Env, opts: Options) -> Result<ExitCode> {
         .projects()
         .map(|projects| orphans::find(projects, opts.worktrees_only))
         .unwrap_or_default();
+    let unmounted = config
+        .projects()
+        .map(|projects| orphans::on_unmounted_volumes(projects, opts.worktrees_only))
+        .unwrap_or_default();
     let transcript_report = transcripts::discover(&env.claude_home, opts.worktrees_only)?;
 
     let new_raw = if orphans.is_empty() {
@@ -188,6 +201,7 @@ fn run_with_transcripts(env: &Env, opts: Options) -> Result<ExitCode> {
                 "path": o.path,
                 "is_worktree": o.is_worktree,
             })).collect::<Vec<_>>(),
+            "unmounted": unmounted_json(&unmounted),
             "bytes_before": config.raw.len(),
             "bytes_after": applied_prune
                 .as_ref()
@@ -204,7 +218,14 @@ fn run_with_transcripts(env: &Env, opts: Options) -> Result<ExitCode> {
         };
     }
 
-    print_project_preview(path, &config, total, &orphans, new_raw.as_deref())?;
+    print_project_preview(
+        path,
+        &config,
+        total,
+        &orphans,
+        &unmounted,
+        new_raw.as_deref(),
+    )?;
     print_transcript_preview(&transcript_report);
 
     if !opts.apply {
@@ -237,6 +258,7 @@ fn print_project_preview(
     config: &ClaudeJson,
     total: usize,
     orphans: &[orphans::Orphan],
+    unmounted: &[orphans::Unmounted],
     new_raw: Option<&str>,
 ) -> Result<()> {
     let Some(_projects) = config.projects() else {
@@ -246,6 +268,7 @@ fn print_project_preview(
 
     if orphans.is_empty() {
         println!("clean. {total} project entries, none orphaned.");
+        print_unmounted(unmounted);
         return Ok(());
     }
 
@@ -267,6 +290,7 @@ fn print_project_preview(
         };
         println!("  - {}{tag}", display_text(&o.path));
     }
+    print_unmounted(unmounted);
     println!();
     println!(
         "would shrink {} by ~{} ({} -> {}).",
@@ -276,6 +300,36 @@ fn print_project_preview(
         output::kb(new_raw.len()),
     );
     Ok(())
+}
+
+fn unmounted_json(entries: &[orphans::Unmounted]) -> Value {
+    entries
+        .iter()
+        .map(|entry| {
+            json!({
+                "path": entry.path,
+                "volume": entry.volume.display().to_string(),
+            })
+        })
+        .collect()
+}
+
+fn print_unmounted(entries: &[orphans::Unmounted]) {
+    if entries.is_empty() {
+        return;
+    }
+    println!();
+    println!(
+        "kept {} entries whose volume is not mounted; mount it to re-check:",
+        entries.len().to_string().yellow()
+    );
+    for entry in entries {
+        println!(
+            "  ~ {}   [{} not mounted]",
+            display_text(&entry.path),
+            display_path(&entry.volume)
+        );
+    }
 }
 
 fn print_project_apply(env: &Env, applied: ProjectApplyResult) {
@@ -331,8 +385,13 @@ fn print_transcript_preview(report: &transcripts::Report) {
                 print_cleanup_note(dir);
             }
             transcripts::DirStatus::Skipped => {
+                let cwd = dir
+                    .derived_cwd
+                    .as_deref()
+                    .map(|cwd| format!(" -> {}", display_text(cwd)))
+                    .unwrap_or_default();
                 println!(
-                    "  - {} [skipped: {}]",
+                    "  - {}{cwd} [skipped: {}]",
                     display_path(&dir.path),
                     display_text(dir.reason.unwrap_or("cannot-tell"))
                 );
@@ -425,9 +484,10 @@ fn apply_prune_and_transcripts(env: &Env, opts: &Options) -> Result<CombinedAppl
             .collect(),
         None => BTreeSet::new(),
     };
+    let unmounted = unmounted_count(&config, opts);
     let mut transcript_report = transcripts::discover(&env.claude_home, opts.worktrees_only)?;
 
-    ensure_apply_gates(env, opts, drop.len(), total, &transcript_report)?;
+    ensure_apply_gates(env, opts, drop.len(), unmounted, total, &transcript_report)?;
 
     let prune = apply_project_drop(env, &mut config, &drop)?;
     if transcript_report.dead_count() == 0 {
@@ -445,14 +505,27 @@ fn apply_prune_and_transcripts(env: &Env, opts: &Options) -> Result<CombinedAppl
     })
 }
 
+fn unmounted_count(config: &ClaudeJson, opts: &Options) -> usize {
+    config
+        .projects()
+        .map(|projects| orphans::on_unmounted_volumes(projects, opts.worktrees_only).len())
+        .unwrap_or(0)
+}
+
 fn ensure_apply_gates(
     env: &Env,
     opts: &Options,
     project_removing: usize,
+    project_unmounted: usize,
     project_total: usize,
     transcript_report: &transcripts::Report,
 ) -> Result<()> {
-    ensure_project_wrong_host_gate(opts, project_removing, project_total)?;
+    orphans::ensure_not_wrong_host(
+        opts.force,
+        project_removing,
+        project_unmounted,
+        project_total,
+    )?;
     ensure_transcript_wrong_host_gate(opts, transcript_report)?;
     if project_removing == 0 && transcript_report.dead_count() == 0 {
         return Ok(());
@@ -486,34 +559,20 @@ fn running_claude_live_state(
     }
 }
 
-fn ensure_project_wrong_host_gate(opts: &Options, removing: usize, total: usize) -> Result<()> {
-    if !opts.force && orphans::looks_like_wrong_host(removing, total) {
-        bail!(
-            "{} of {} project entries resolve missing — this usually means you are on a \
-             different machine or an unmounted volume, not that they are all dead. \
-             Re-run with --force to prune them anyway.",
-            removing,
-            total
-        );
-    }
-    Ok(())
-}
-
 fn ensure_transcript_wrong_host_gate(opts: &Options, report: &transcripts::Report) -> Result<()> {
+    let unmounted = report.unmounted_count();
+    let missing = report.dead_count() + unmounted;
+    let resolvable = report.resolvable_count() + unmounted;
     if !opts.force
-        && orphans::looks_like_wrong_host_with_scope(
-            report.dead_count(),
-            report.resolvable_count(),
-            report.total(),
-        )
+        && report.dead_count() > 0
+        && orphans::looks_like_wrong_host_with_scope(missing, resolvable, report.total())
     {
         bail!(
-            "{} of {} resolvable transcript dirs point at missing projects — this usually means \
-             you are on a different machine or an unmounted volume, not that they are all dead \
-             ({} total transcript dirs discovered). \
+            "{missing} of {resolvable} resolvable transcript dirs point at missing projects{} — \
+             this usually means you are on a different machine or an unmounted volume, not that \
+             they are all dead ({} total transcript dirs discovered). \
              Re-run with --force to prune them anyway.",
-            report.dead_count(),
-            report.resolvable_count(),
+            orphans::unmounted_note(unmounted),
             report.total()
         );
     }
@@ -587,7 +646,12 @@ fn apply_prune(env: &Env, opts: &Options) -> Result<ProjectApplyResult> {
         None => BTreeSet::new(),
     };
 
-    ensure_project_wrong_host_gate(opts, drop.len(), total)?;
+    orphans::ensure_not_wrong_host(
+        opts.force,
+        drop.len(),
+        unmounted_count(&config, opts),
+        total,
+    )?;
     ensure_claude_not_running(
         env,
         opts,

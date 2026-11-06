@@ -226,6 +226,15 @@ fn display_path(path: &Path, show_secrets: bool) -> String {
 /// Apply the auto-fixable findings. Returns whether the config was actually
 /// mutated (false when nothing is auto-fixable or the targets no longer exist).
 fn apply_fixes(env: &Env, findings: &[Finding], opts: &Options) -> Result<bool> {
+    apply_fixes_with(env, findings, opts, process::claude_is_running)
+}
+
+fn apply_fixes_with(
+    env: &Env,
+    findings: &[Finding],
+    opts: &Options,
+    running: impl FnOnce() -> bool,
+) -> Result<bool> {
     let auto: Vec<&Finding> = findings.iter().filter(|f| f.auto_fixable).collect();
     if auto.is_empty() {
         if !opts.json {
@@ -233,7 +242,7 @@ fn apply_fixes(env: &Env, findings: &[Finding], opts: &Options) -> Result<bool> 
         }
         return Ok(false);
     }
-    ensure_claude_not_running(opts.force, process::claude_is_running, &env.claude_json)?;
+    ensure_claude_not_running(opts.force, running, &env.claude_json)?;
 
     let prune_targets: HashSet<&str> = auto
         .iter()
@@ -267,15 +276,11 @@ fn apply_fixes(env: &Env, findings: &[Finding], opts: &Options) -> Result<bool> 
     if targets.is_empty() {
         return Ok(false);
     }
-    if !opts.force && orphans::looks_like_wrong_host(targets.len(), total) {
-        bail!(
-            "{} of {} project entries resolve missing — this usually means you are on a \
-             different machine or an unmounted volume, not that they are all dead. \
-             Re-run with --force to prune them anyway.",
-            targets.len(),
-            total
-        );
-    }
+    let unmounted = config
+        .projects()
+        .map(|projects| orphans::on_unmounted_volumes(projects, false).len())
+        .unwrap_or(0);
+    orphans::ensure_not_wrong_host(opts.force, targets.len(), unmounted, total)?;
     let Some(map) = config.projects_mut() else {
         return Ok(false);
     };
@@ -1565,6 +1570,68 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".bak-"))
             .count();
         assert_eq!(backups, 0, "no backup when nothing is fixed");
+    }
+
+    fn orphaned_project_finding(config_path: &Path, key: &str) -> Finding {
+        Finding {
+            id: "orphaned-project",
+            severity: Severity::Warn,
+            location: Location {
+                file: config_path.to_path_buf(),
+                key_path: Some(format!("projects.{key}")),
+            },
+            message: String::new(),
+            suggested_fix: None,
+            auto_fixable: true,
+        }
+    }
+
+    #[test]
+    fn apply_fixes_counts_unmounted_entries_toward_the_mass_deletion_gate() {
+        let home = tempfile::tempdir().unwrap();
+        let config_path = home.path().join(".claude.json");
+        let volume = format!("/Volumes/midden-missing-{}", std::process::id());
+        let mut projects = serde_json::Map::new();
+        for i in 0..9 {
+            projects.insert(format!("{volume}/p{i}"), serde_json::json!({}));
+        }
+        projects.insert("/no/such/dir".to_string(), serde_json::json!({}));
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&serde_json::json!({ "projects": projects })).unwrap(),
+        )
+        .unwrap();
+        let env = Env::new(Some(config_path.clone()), Some(home.path().join(".claude")));
+        let findings = vec![orphaned_project_finding(&config_path, "/no/such/dir")];
+        let mut opts = Options {
+            path: PathBuf::from("."),
+            fix: true,
+            force: false,
+            show_secrets: false,
+            json: true,
+        };
+        let before = std::fs::read_to_string(&config_path).unwrap();
+
+        // Only 1 of 10 entries is removable, but all 10 resolve missing on
+        // this host, which is the signal the gate exists for.
+        let error = apply_fixes_with(&env, &findings, &opts, || false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with(
+                "10 of 10 project entries resolve missing (9 on volumes that are not mounted)"
+            ),
+            "{error}"
+        );
+        assert_eq!(before, std::fs::read_to_string(&config_path).unwrap());
+
+        opts.force = true;
+        assert!(apply_fixes_with(&env, &findings, &opts, || false).unwrap());
+        let after: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        let after = after["projects"].as_object().unwrap();
+        assert_eq!(after.len(), 9, "only the dead entry goes");
+        assert!(!after.contains_key("/no/such/dir"));
     }
 
     #[test]
