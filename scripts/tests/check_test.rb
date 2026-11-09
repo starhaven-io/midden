@@ -17,9 +17,14 @@ class CheckTest < Minitest::Test
         SH
       end
       calls = File.join(root, "calls")
-      stdout, stderr, status = capture(RbConfig.ruby, File.join(ROOT, "scripts/check.rb"), env: {
-        "PATH" => root, "CALLS" => calls, "FAILING_TOOL" => failing
-      })
+      # BUNDLER_SETUP makes the child load Bundler, which prepends its bin
+      # directory to PATH; a vendored `bundle` binstub there would shadow the
+      # stub and look for a ruby the stub-only PATH does not have.
+      stdout, stderr, status = Bundler.with_unbundled_env do
+        capture(RbConfig.ruby, File.join(ROOT, "scripts/check.rb"), env: {
+          "PATH" => root, "CALLS" => calls, "FAILING_TOOL" => failing
+        })
+      end
       [status, stdout, stderr, File.read(calls)]
     end
   end
