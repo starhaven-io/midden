@@ -286,37 +286,267 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn authorization_value_ranges(s: &str) -> Vec<(usize, usize)> {
-    let lower = s.to_ascii_lowercase();
-    let marker = "authorization:";
+/// Prose such as `secret: none` must not become a committed-secret finding;
+/// real header credentials are long.
+const MIN_HEADER_SECRET_LEN: usize = 8;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CredentialHeader {
+    /// `Authorization` and its variants (`Proxy-Authorization`,
+    /// `X-Authorization`, curl's attached `-HAuthorization`): a scheme word
+    /// may precede the credential, and the credential can be short.
+    Scheme,
+    /// A credential-named header such as `X-Api-Key`: the whole value is the
+    /// credential.
+    Plain,
+    /// `Cookie` and `Set-Cookie`: `name=value` pairs separated by `;`, every
+    /// one of which is a credential, with values that may be quoted.
+    Cookie,
+}
+
+fn credential_header(name: &str) -> Option<CredentialHeader> {
+    if name.to_ascii_lowercase().ends_with("authorization") {
+        return Some(CredentialHeader::Scheme);
+    }
+    if split_words(name).iter().any(|word| word == "cookie") {
+        return Some(CredentialHeader::Cookie);
+    }
+    key_expects_secret_value(name).then_some(CredentialHeader::Plain)
+}
+
+fn is_header_name_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+}
+
+/// What may sit before a header name: whitespace, a quote, `=` as in
+/// `--header=Name: value`, or an opening bracket. A `/`, `.` or `@` before the
+/// name means a URL authority such as `//token-service:8080`, not a header.
+fn precedes_header_name(character: char) -> bool {
+    character.is_whitespace() || matches!(character, '\'' | '"' | '`' | '=' | '(' | '[' | '{')
+}
+
+/// `8080` or `8080/path`: what follows `host:` in a scheme-less URL.
+fn looks_like_port(value: &str) -> bool {
+    let digits = value.len()
+        - value
+            .trim_start_matches(|character: char| character.is_ascii_digit())
+            .len();
+    (1..=5).contains(&digits) && (value.len() == digits || value[digits..].starts_with('/'))
+}
+
+/// Byte ranges of `value` that ship as written: everything outside a shell
+/// reference, plus the word of `${VAR:-word}` and its `=` and `+` siblings,
+/// which ships whatever it holds, nested references included. `$VAR`,
+/// `${VAR}`, `$(command)` and the other `${...}` forms ship nothing. A
+/// reference the value ends inside, as `$(cat` does once the value stops at
+/// a space, is read as if it closed there.
+fn committed_ranges(value: &str) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
-    let mut cursor = 0;
-    while let Some(relative) = lower[cursor..].find(marker) {
-        let marker_start = cursor + relative;
-        let mut start = marker_start + marker.len();
-        while s.as_bytes().get(start).is_some_and(u8::is_ascii_whitespace) {
-            start += 1;
+    collect_committed(value, 0, &mut ranges);
+    ranges
+}
+
+fn collect_committed(value: &str, base: usize, ranges: &mut Vec<(usize, usize)>) {
+    let bytes = value.as_bytes();
+    let mut literal_start = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'$' {
+            index += 1;
+            continue;
         }
-        for scheme in ["bearer", "basic"] {
-            if lower[start..].starts_with(scheme) {
-                start += scheme.len();
-                while s.as_bytes().get(start).is_some_and(u8::is_ascii_whitespace) {
-                    start += 1;
+        let (reference_end, word) = match bytes.get(index + 1) {
+            Some(b'(') => (
+                balanced_close(value, index + 1, b'(', b')').map_or(value.len(), |close| close + 1),
+                None,
+            ),
+            Some(b'{') => braced_reference(value, index),
+            _ => {
+                let name_len = identifier_len(&value[index + 1..]);
+                if name_len == 0 {
+                    // A lone `$` is text.
+                    index += 1;
+                    continue;
                 }
-                break;
+                (index + 1 + name_len, None)
+            }
+        };
+        if literal_start < index {
+            ranges.push((base + literal_start, base + index));
+        }
+        if let Some((word_start, word_end)) = word {
+            collect_committed(&value[word_start..word_end], base + word_start, ranges);
+        }
+        index = reference_end;
+        literal_start = index;
+    }
+    if literal_start < bytes.len() {
+        ranges.push((base + literal_start, base + bytes.len()));
+    }
+}
+
+fn identifier_len(s: &str) -> usize {
+    s.len()
+        - s.trim_start_matches(|character: char| {
+            character.is_ascii_alphanumeric() || character == '_'
+        })
+        .len()
+}
+
+/// Where the reference that `${` opens at `open` ends, and the byte range of
+/// its word when the form has one.
+fn braced_reference(value: &str, open: usize) -> (usize, Option<(usize, usize)>) {
+    let body_start = open + 2;
+    let (body_end, end) = match balanced_close(value, open + 1, b'{', b'}') {
+        Some(close) => (close, close + 1),
+        None => (value.len(), value.len()),
+    };
+    let body = &value[body_start..body_end];
+    let name_len = identifier_len(body);
+    let operator = &body[name_len..];
+    let operator_len =
+        if operator.starts_with(":-") || operator.starts_with(":=") || operator.starts_with(":+") {
+            2
+        } else if operator.starts_with(['-', '=', '+']) {
+            1
+        } else {
+            // `${VAR}`, or a length, pattern, offset or error-message form.
+            return (end, None);
+        };
+    (end, Some((body_start + name_len + operator_len, body_end)))
+}
+
+/// The index of the bracket that closes the one at `open`, or `None` when the
+/// value ends first.
+fn balanced_close(value: &str, open: usize, opener: u8, closer: u8) -> Option<usize> {
+    let mut depth = 0usize;
+    for (offset, &byte) in value.as_bytes()[open..].iter().enumerate() {
+        if byte == opener {
+            depth += 1;
+        } else if byte == closer {
+            depth -= 1;
+            if depth == 0 {
+                return Some(open + offset);
             }
         }
-        let end = s[start..]
-            .char_indices()
-            .find_map(|(offset, character)| {
-                (character.is_whitespace() || matches!(character, '\'' | '"' | ';' | ','))
-                    .then_some(start + offset)
-            })
-            .unwrap_or(s.len());
-        if end > start && !is_env_expansion(&s[start..end]) {
-            ranges.push((start, end));
+    }
+    None
+}
+
+/// Where a cookie header's value ends. Pairs are `name=value` separated by
+/// `;` and optional whitespace, and a value may be quoted (`sid="..."`), so
+/// a quote right after `=` belongs to the pair while a quote anywhere else is
+/// the command's own and ends the header, as any other whitespace does.
+fn cookie_value_end(s: &str, start: usize) -> usize {
+    let bytes = s.as_bytes();
+    let mut index = start;
+    while index < s.len() {
+        match bytes[index] {
+            b'=' if matches!(bytes.get(index + 1), Some(b'\'' | b'"')) => {
+                let quote = bytes[index + 1] as char;
+                match s[index + 2..].find(quote) {
+                    Some(close) => index += 2 + close + 1,
+                    None => return index + 1,
+                }
+            }
+            b'\'' | b'"' => return index,
+            b';' => {
+                let mut next = index + 1;
+                while bytes
+                    .get(next)
+                    .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+                {
+                    next += 1;
+                }
+                let pair = s[next..]
+                    .split(|character: char| {
+                        character.is_whitespace() || matches!(character, '\'' | '"' | ';')
+                    })
+                    .next()
+                    .unwrap_or("");
+                if !pair.contains('=') {
+                    return index;
+                }
+                index = next;
+            }
+            byte if byte.is_ascii_whitespace() => return index,
+            _ => index += 1,
         }
-        cursor = (marker_start + marker.len()).max(end);
+    }
+    s.len()
+}
+
+/// Byte ranges of credential values written in `Header-Name: value` form, the
+/// way hook commands and `--header` arguments carry them. Only the committed
+/// text of the value counts, and the range runs from its first committed
+/// byte to its last, so a reference between two literals is hidden with them.
+fn header_value_ranges(s: &str) -> Vec<(usize, usize)> {
+    let bytes = s.as_bytes();
+    let mut ranges = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative) = s[cursor..].find(':') {
+        let colon = cursor + relative;
+        cursor = colon + 1;
+        let name_start = s[..colon]
+            .char_indices()
+            .rev()
+            .find(|(_, character)| !is_header_name_char(*character))
+            .map_or(0, |(index, character)| index + character.len_utf8());
+        if !s[..name_start]
+            .chars()
+            .next_back()
+            .is_none_or(precedes_header_name)
+        {
+            continue;
+        }
+        let Some(kind) = credential_header(&s[name_start..colon]) else {
+            continue;
+        };
+        let mut start = colon + 1;
+        while bytes.get(start).is_some_and(u8::is_ascii_whitespace) {
+            start += 1;
+        }
+        // `secret-store:8200/v1/health` is a scheme-less URL: the name runs
+        // straight into the port. An explicit scheme word or any space after
+        // the colon is a header, however short the credential.
+        let host_port = kind == CredentialHeader::Plain && start == colon + 1;
+        if kind == CredentialHeader::Scheme {
+            for scheme in ["bearer", "basic"] {
+                if s.get(start..start + scheme.len())
+                    .is_some_and(|word| word.eq_ignore_ascii_case(scheme))
+                {
+                    start += scheme.len();
+                    while bytes.get(start).is_some_and(u8::is_ascii_whitespace) {
+                        start += 1;
+                    }
+                    break;
+                }
+            }
+        }
+        let end = match kind {
+            CredentialHeader::Cookie => cookie_value_end(s, start),
+            _ => s[start..]
+                .char_indices()
+                .find_map(|(offset, character)| {
+                    (character.is_whitespace() || matches!(character, '\'' | '"' | ';' | ','))
+                        .then_some(start + offset)
+                })
+                .unwrap_or(s.len()),
+        };
+        let committed = committed_ranges(&s[start..end]);
+        let (Some(&(first, _)), Some(&(_, last))) = (committed.first(), committed.last()) else {
+            continue;
+        };
+        let committed_len: usize = committed.iter().map(|(from, to)| to - from).sum();
+        if kind != CredentialHeader::Scheme && committed_len < MIN_HEADER_SECRET_LEN {
+            continue;
+        }
+        let (start, end) = (start + first, start + last);
+        if host_port && looks_like_port(&s[start..end]) {
+            continue;
+        }
+        ranges.push((start, end));
+        cursor = end;
     }
     ranges
 }
@@ -453,7 +683,7 @@ pub fn value_looks_sensitive(s: &str) -> bool {
         || url_ranges(s).iter().any(|(start, end)| {
             url_has_password(&s[*start..*end]) || url_has_sensitive_query(&s[*start..*end])
         })
-        || !authorization_value_ranges(s).is_empty()
+        || !header_value_ranges(s).is_empty()
         || sensitive_argument_value(s).is_some()
         || !token_runs(s).is_empty()
 }
@@ -496,6 +726,7 @@ fn mask_single_url(url: &str) -> String {
                 out.replace_range(auth_start..at, "***");
             }
         }
+        mask_opaque_path_segments(&mut out, auth_start);
     }
     if let Some(q) = out.find('?') {
         let (head, tail) = out.split_at(q + 1);
@@ -523,6 +754,64 @@ fn mask_single_url(url: &str) -> String {
         out = rebuilt;
     }
     out
+}
+
+const MIN_OPAQUE_SEGMENT_LEN: usize = 32;
+
+/// A path segment long and mixed enough to be a token rather than a name:
+/// some hosted MCP endpoints carry the credential this way. Lowercase hex
+/// (commit SHAs, UUIDs) and dotted file names are excluded, so only
+/// base64-like runs qualify.
+fn opaque_segment(segment: &str) -> bool {
+    segment.len() >= MIN_OPAQUE_SEGMENT_LEN
+        && segment.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '=')
+        })
+        && segment
+            .chars()
+            .any(|character| character.is_ascii_uppercase())
+        && segment
+            .chars()
+            .any(|character| character.is_ascii_lowercase())
+}
+
+/// Byte ranges of opaque segments in the path of `url`, whose authority
+/// starts at `auth_start`.
+fn opaque_path_segment_ranges(url: &str, auth_start: usize) -> Vec<(usize, usize)> {
+    let Some(path_start) = url[auth_start..]
+        .find(['/', '?', '#'])
+        .map(|index| auth_start + index)
+        .filter(|index| url.as_bytes()[*index] == b'/')
+    else {
+        return Vec::new();
+    };
+    let path_end = url[path_start..]
+        .find(['?', '#'])
+        .map_or(url.len(), |index| path_start + index);
+    let mut ranges = Vec::new();
+    let mut offset = path_start;
+    for segment in url[path_start..path_end].split('/') {
+        if opaque_segment(segment) {
+            ranges.push((offset, offset + segment.len()));
+        }
+        offset += segment.len() + 1;
+    }
+    ranges
+}
+
+fn mask_opaque_path_segments(url: &mut String, auth_start: usize) {
+    for (start, end) in opaque_path_segment_ranges(url, auth_start)
+        .into_iter()
+        .rev()
+    {
+        let masked = mask(&url[start..end]);
+        url.replace_range(start..end, &masked);
+    }
+}
+
+fn url_has_opaque_path_segment(url: &str) -> bool {
+    url.find("://")
+        .is_some_and(|scheme_end| !opaque_path_segment_ranges(url, scheme_end + 3).is_empty())
 }
 
 fn url_ranges(value: &str) -> Vec<(usize, usize)> {
@@ -567,7 +856,7 @@ fn mask_urls(value: &str) -> String {
 pub fn mask_embedded(s: &str) -> String {
     let mut masked = mask_urls(s);
     let mut ranges = argument_value_ranges(&masked);
-    ranges.extend(authorization_value_ranges(&masked));
+    ranges.extend(header_value_ranges(&masked));
     for (start, end) in merged_ranges(ranges).into_iter().rev() {
         let replacement = mask(&masked[start..end]);
         masked.replace_range(start..end, &replacement);
@@ -582,7 +871,7 @@ pub fn mask_embedded(s: &str) -> String {
 pub fn mask_free_text(s: &str) -> String {
     let mut masked = mask_urls(s);
     let mut ranges = inline_argument_value_ranges(&masked);
-    ranges.extend(authorization_value_ranges(&masked));
+    ranges.extend(header_value_ranges(&masked));
     for (start, end) in merged_ranges(ranges).into_iter().rev() {
         let replacement = mask(&masked[start..end]);
         masked.replace_range(start..end, &replacement);
@@ -683,13 +972,23 @@ pub fn masked_for_display(s: &str) -> String {
     if embedded == s { mask(s) } else { embedded }
 }
 
+/// Display masking is broader than doctor's judgement: an opaque URL path
+/// segment is hidden on screen but is not evidence of a committed secret,
+/// because a document id and a path-embedded token share that shape.
+fn display_looks_sensitive(s: &str) -> bool {
+    value_looks_sensitive(s)
+        || url_ranges(s)
+            .into_iter()
+            .any(|(start, end)| url_has_opaque_path_segment(&s[start..end]))
+}
+
 /// Mask any string anywhere inside `value` whose *content* looks like a
 /// credential. Complements `mask_value`, which masks by key name: this pass
 /// catches tokens under innocent keys (`args`, `env.DATABASE_URL`, URLs).
 pub fn mask_sensitive_values(value: &mut Value) {
     match value {
         Value::String(s) => {
-            if value_looks_sensitive(s) {
+            if display_looks_sensitive(s) {
                 *s = masked_for_display(s);
             }
         }
@@ -744,7 +1043,7 @@ pub fn mask_tree(value: &mut Value) {
             }
         }
         Value::String(s) => {
-            if value_looks_sensitive(s) {
+            if display_looks_sensitive(s) {
                 *s = mask_free_text(s);
             }
         }
@@ -1106,6 +1405,154 @@ mod tests {
             "cmd --token ${SERVICE_TOKEN} --auth oauth --credentials-file=/tmp/key.json"
         );
     }
+    #[test]
+    fn credential_headers_beyond_authorization_are_detected() {
+        let header = "X-Api-Key: zq8r7Lk2mN9pQ4sT6vW1xY3zAb5c";
+        assert!(value_looks_sensitive(header));
+        assert_eq!(mask_embedded(header), "X-Api-Key: zq8r***");
+        assert_eq!(
+            mask_embedded("curl -H 'X-Api-Key: zq8r7Lk2mN9pQ4sT6vW1xY3zAb5c' https://x.example"),
+            "curl -H 'X-Api-Key: zq8r***' https://x.example"
+        );
+        assert!(value_looks_sensitive("Cookie: session=abcdef123456"));
+        assert!(value_looks_sensitive("x-auth-token:opaque-value-1"));
+        assert!(!value_looks_sensitive("Content-Type: application/json"));
+        assert!(!value_looks_sensitive("X-Request-Id: 1234567890abcdef"));
+        // A shell reference or an env expansion commits nothing.
+        assert!(!value_looks_sensitive("X-Api-Key: $API_KEY"));
+        assert!(!value_looks_sensitive("X-Api-Key: ${API_KEY}"));
+        assert!(!value_looks_sensitive("Authorization: Bearer $TOKEN"));
+        // Prose with a short value is not a committed credential.
+        assert!(!value_looks_sensitive("secret: none"));
+        assert_eq!(mask_free_text("secret: none"), "secret: none");
+    }
+
+    #[test]
+    fn header_values_commit_every_literal_part_and_quoted_cookie_pairs() {
+        let token = "zq8r7Lk2mN9pQ4sT6vW1xY3zAb5c";
+        // Nested defaults and text around a reference ship as written.
+        let nested = format!("Authorization: Bearer ${{MCP_AUTH:-${{BACKUP:-{token}}}}}");
+        assert!(value_looks_sensitive(&nested));
+        assert_eq!(
+            mask_embedded(&nested),
+            "Authorization: Bearer ${MCP_AUTH:-${BACKUP:-zq8r***}}"
+        );
+        let suffixed = format!("Authorization: Bearer ${{MCP_AUTH}}{token}");
+        assert!(value_looks_sensitive(&suffixed));
+        assert_eq!(
+            mask_embedded(&suffixed),
+            "Authorization: Bearer ${MCP_AUTH}zq8r***"
+        );
+        let wrapped = format!("X-Api-Key: {token}${{SUFFIX}}{token}");
+        assert_eq!(mask_embedded(&wrapped), "X-Api-Key: zq8r***");
+        assert!(!value_looks_sensitive(
+            "X-Api-Key: ${API_KEY:-$(cat ~/.api-key)}"
+        ));
+        assert!(!value_looks_sensitive("X-Api-Key: ${#API_KEY}"));
+        assert!(
+            !value_looks_sensitive("X-Api-Key: ${API_KEY:-short}"),
+            "the length floor counts committed text only"
+        );
+        assert!(!value_looks_sensitive("X-Api-Key: $"));
+        // An explicit header is never a host:port, however short its value.
+        assert!(value_looks_sensitive("Authorization: Bearer 12345"));
+        assert_eq!(
+            mask_embedded("Authorization: Bearer 12345"),
+            "Authorization: Bearer 1234***"
+        );
+        let slashed = "X-Api-Key: 12345/opaque-default-12345";
+        assert!(value_looks_sensitive(slashed));
+        assert_eq!(mask_embedded(slashed), "X-Api-Key: 1234***");
+        assert!(!value_looks_sensitive("curl secret-store:8200/v1/health"));
+        // Quoted cookie values and tabs between pairs stay inside the header.
+        let quoted =
+            format!("curl -H 'Cookie: sid=\"abcdef123456\"; csrf=\"{token}\"' https://x.example");
+        assert!(value_looks_sensitive(&quoted));
+        assert_eq!(
+            mask_embedded(&quoted),
+            "curl -H 'Cookie: sid=***' https://x.example"
+        );
+        let tabbed = format!("Cookie: sid=abcdef123456;\tcsrf={token}");
+        assert_eq!(mask_embedded(&tabbed), "Cookie: sid=***");
+        assert_eq!(
+            mask_embedded("curl -H \"Cookie: sid=abcdef123456\" https://x.example"),
+            "curl -H \"Cookie: sid=***\" https://x.example"
+        );
+        assert_eq!(
+            mask_embedded("curl -H \"Cookie: sid=\" https://x.example"),
+            "curl -H \"Cookie: sid=\" https://x.example",
+            "an empty pair is not a credential"
+        );
+    }
+
+    #[test]
+    fn header_values_follow_shell_references_and_cookie_pairs() {
+        let token = "zq8r7Lk2mN9pQ4sT6vW1xY3zAb5c";
+        // A `${VAR:-default}` ships its default; a bare reference ships nothing.
+        let fallback = format!("Authorization: Bearer ${{MCP_AUTH:-{token}}}");
+        assert!(value_looks_sensitive(&fallback));
+        assert_eq!(
+            mask_embedded(&fallback),
+            "Authorization: Bearer ${MCP_AUTH:-zq8r***}"
+        );
+        for reference in [
+            "Authorization: Bearer ${MCP_AUTH:-$FALLBACK}",
+            "Authorization: Bearer $(cat ~/.token)",
+            "X-Api-Key: ${API_KEY:?unset}",
+        ] {
+            assert!(!value_looks_sensitive(reference), "{reference}");
+        }
+        // Authorization variants, including curl's attached form.
+        let attached = "-HAuthorization: Basic dXNlcjpwYXNzd29yZA==";
+        assert!(value_looks_sensitive(attached));
+        assert_eq!(mask_embedded(attached), "-HAuthorization: Basic dXNl***");
+        assert!(value_looks_sensitive(&format!("X-Authorization: {token}")));
+        assert!(value_looks_sensitive(&format!(
+            "Proxy-Authorization: Basic {token}"
+        )));
+        // Every cookie pair is a credential; the value ends with the header.
+        let cookie = format!("curl -H 'Cookie: sid=abcdef123456; csrf={token}' https://x.example");
+        assert_eq!(
+            mask_embedded(&cookie),
+            "curl -H 'Cookie: sid=***' https://x.example"
+        );
+        assert_eq!(
+            mask_embedded("curl -H Cookie:sid=abcdef123456 https://x.example"),
+            "curl -H Cookie:sid=*** https://x.example"
+        );
+        // A URL authority is not a header.
+        for url in [
+            "https://token-service:8080/mcp",
+            "curl secret-store:8200/v1/health",
+            "redis://cookie-cache:6379/0",
+        ] {
+            assert!(!value_looks_sensitive(url), "{url}");
+            assert_eq!(mask_embedded(url), url);
+        }
+    }
+
+    #[test]
+    fn opaque_url_path_segments_are_masked_for_display_only() {
+        let url = "https://mcp.zapier.com/api/mcp/s/NjI3ZjQ5YzgtMzA4Zi00ZTQwLWE0NmYtMGM5ZjNiOWIyZTI1OjE2YjQ2ZTRmLTQ3/mcp";
+        let masked = "https://mcp.zapier.com/api/mcp/s/NjI3***/mcp";
+        assert!(!value_looks_sensitive(url), "doctor stays prefix-based");
+        assert_eq!(mask_embedded(url), masked);
+        let mut value = json!({ "url": url, "note": "left-alone" });
+        mask_tree(&mut value);
+        assert_eq!(value["url"], masked);
+        assert_eq!(value["note"], "left-alone");
+        let mut value = json!({ "url": url });
+        mask_sensitive_values(&mut value);
+        assert_eq!(value["url"], masked);
+        for plain in [
+            "https://github.com/o/r/commit/0123456789abcdef0123456789abcdef01234567",
+            "https://mcp.example.com/servers/550e8400-e29b-41d4-a716-446655440000/sse",
+            "https://cdn.example.com/assets/app.3f9c2a1b7d4e5f60a1b2c3d4e5f60718Ab.js",
+        ] {
+            assert_eq!(mask_embedded(plain), plain, "{plain}");
+        }
+    }
+
     #[test]
     fn empty_quoted_secret_arguments_preserve_command_text() {
         for input in [
