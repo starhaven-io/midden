@@ -20,6 +20,7 @@ const MAX_JSONL_LINE_BYTES: usize = 1024 * 1024;
 const MAX_PROJECT_TRANSCRIPT_ENTRIES: usize = 4096;
 #[cfg(unix)]
 const QUARANTINE_ATTEMPTS: usize = 32;
+const VOLUME_NOT_MOUNTED: &str = "volume-not-mounted";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirStatus {
@@ -134,6 +135,15 @@ impl Report {
 
     pub fn resolvable_count(&self) -> usize {
         self.dead_count() + self.kept_count()
+    }
+
+    /// Dirs skipped because their project's volume is not mounted. They are
+    /// not resolvable, but they still resolve missing on this host.
+    pub fn unmounted_count(&self) -> usize {
+        self.dirs
+            .iter()
+            .filter(|d| d.reason == Some(VOLUME_NOT_MOUNTED))
+            .count()
     }
 
     pub fn bytes(&self) -> u64 {
@@ -341,6 +351,11 @@ fn inspect_dir(path: &Path) -> Result<DirReport> {
         ));
     }
 
+    if orphans::unmounted_volume(Path::new(&cwd)).is_some() {
+        let mut report = skipped_with_storage(path, VOLUME_NOT_MOUNTED, storage_bytes);
+        report.derived_cwd = Some(cwd);
+        return Ok(report);
+    }
     let status = if orphans::provably_absent(Path::new(&cwd)) {
         DirStatus::Dead
     } else {
@@ -881,7 +896,9 @@ fn revalidate_transcript_evidence(
         .as_deref()
         .context("dead transcript directory has no cwd evidence")?;
     if !orphans::provably_absent(Path::new(expected_cwd)) {
-        anyhow::bail!("project became live after transcript discovery: {expected_cwd}");
+        anyhow::bail!(
+            "project is no longer provably absent after transcript discovery: {expected_cwd}"
+        );
     }
     for artifact in report
         .delete_artifacts
@@ -1279,7 +1296,7 @@ mod tests {
         std::fs::create_dir(root.path().join("missing-project")).unwrap();
 
         let error = delete_dead(&mut report).unwrap_err().to_string();
-        assert!(error.contains("became live"), "{error}");
+        assert!(error.contains("no longer provably absent"), "{error}");
         assert!(
             session.exists(),
             "live-project evidence must prevent deletion"
@@ -1311,6 +1328,27 @@ mod tests {
         assert!(report.applied);
         assert!(!session.exists());
         assert!(claude_home.join("projects").is_symlink());
+    }
+
+    #[test]
+    fn transcripts_on_an_unmounted_volume_are_skipped() {
+        let root = tempfile::tempdir().unwrap();
+        let claude_home = root.path().join("claude");
+        let project = claude_home.join("projects/volume-slug");
+        std::fs::create_dir_all(&project).unwrap();
+        let cwd = format!("/Volumes/midden-missing-{}/project", std::process::id());
+        std::fs::write(
+            project.join("session.jsonl"),
+            format!("{{\"cwd\":{cwd:?}}}\n"),
+        )
+        .unwrap();
+
+        let report = discover(&claude_home, false).unwrap();
+
+        assert_eq!(report.dead_count(), 0);
+        assert_eq!(report.skipped_count(), 1);
+        assert_eq!(report.dirs[0].reason, Some("volume-not-mounted"));
+        assert_eq!(report.dirs[0].derived_cwd.as_deref(), Some(cwd.as_str()));
     }
 
     #[cfg(unix)]

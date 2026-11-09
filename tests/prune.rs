@@ -1074,3 +1074,205 @@ fn transcript_failure_still_reports_the_config_backup_and_progress() {
     assert_eq!(cleanup("a-dead"), "removed-dir");
     assert_eq!(cleanup("b-dead"), "failed");
 }
+
+#[test]
+fn entries_on_unmounted_volumes_are_kept() {
+    let fx = Fixture::new();
+    let live = fx.touch_dir("live-project");
+    let volume = format!("/Volumes/midden-missing-{}", std::process::id());
+    let on_volume = format!("{volume}/project");
+    fx.write_config(
+        json!({
+            live.as_str(): {},
+            on_volume.as_str(): { "allowedTools": ["Bash"] },
+            "/no/such/dir": {},
+        }),
+        standard_extras(),
+    );
+    let volume_jsonl = fx.write_transcript("volume-project", &on_volume);
+
+    fx.cmd()
+        .arg("prune")
+        .arg("--transcripts")
+        .assert()
+        .success()
+        .stdout(contains("/no/such/dir"))
+        .stdout(contains(format!("~ {on_volume}")))
+        .stdout(contains(format!("[{volume} not mounted]")))
+        .stdout(contains("[skipped: volume-not-mounted]"));
+
+    fx.cmd()
+        .arg("prune")
+        .arg("--transcripts")
+        .arg("--apply")
+        .arg("--force")
+        .assert()
+        .success();
+
+    let after = fx.read_config();
+    let projects = after["projects"].as_object().unwrap();
+    assert!(
+        projects.contains_key(&on_volume),
+        "an entry on an unmounted volume survives apply"
+    );
+    assert!(!projects.contains_key("/no/such/dir"));
+    assert!(
+        volume_jsonl.exists(),
+        "a transcript on an unmounted volume survives apply"
+    );
+}
+
+#[test]
+fn json_output_lists_unmounted_entries() {
+    let fx = Fixture::new();
+    let live = fx.touch_dir("live-project");
+    let volume = format!("/Volumes/midden-missing-{}", std::process::id());
+    let on_volume = format!("{volume}/project");
+    fx.write_config(
+        json!({ live.as_str(): {}, on_volume.as_str(): {} }),
+        standard_extras(),
+    );
+
+    let out = fx.cmd().arg("--json").arg("prune").output().unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["orphans"], json!([]));
+    assert_eq!(
+        v["unmounted"],
+        json!([{ "path": on_volume, "volume": volume }])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn aliases_of_unmounted_volumes_are_kept() {
+    let fx = Fixture::new();
+    let live = fx.touch_dir("live-project");
+    let volume = format!("/Volumes/midden-missing-{}", std::process::id());
+    let alias = fx.root.path().join("disk");
+    std::os::unix::fs::symlink(&volume, &alias).unwrap();
+    let via_alias = alias.join("project").to_string_lossy().into_owned();
+    // Lexically the live project, but the kernel stops at the missing volume.
+    let via_dotdot = format!("{volume}/../..{live}");
+    fx.write_config(
+        json!({
+            live.as_str(): {},
+            via_alias.as_str(): {},
+            via_dotdot.as_str(): {},
+            "/no/such/dir": {},
+        }),
+        standard_extras(),
+    );
+    let alias_jsonl = fx.write_transcript("alias-project", &via_alias);
+    let dotdot_jsonl = fx.write_transcript("dotdot-project", &via_dotdot);
+
+    fx.cmd()
+        .arg("prune")
+        .arg("--transcripts")
+        .assert()
+        .success()
+        .stdout(contains(format!("~ {via_alias}")))
+        .stdout(contains(format!("~ {via_dotdot}")))
+        .stdout(contains(format!("[{volume} not mounted]")))
+        .stdout(contains("[skipped: volume-not-mounted]"));
+
+    fx.cmd()
+        .arg("prune")
+        .arg("--transcripts")
+        .arg("--apply")
+        .arg("--force")
+        .assert()
+        .success();
+
+    let after = fx.read_config();
+    let projects = after["projects"].as_object().unwrap();
+    assert!(
+        projects.contains_key(&via_alias),
+        "an alias of a project on an unmounted volume survives apply"
+    );
+    assert!(projects.contains_key(&via_dotdot));
+    assert!(!projects.contains_key("/no/such/dir"));
+    assert!(alias_jsonl.exists(), "its transcript survives apply");
+    assert!(dotdot_jsonl.exists());
+}
+
+#[test]
+fn unmounted_entries_count_toward_the_mass_deletion_gate() {
+    let fx = Fixture::new();
+    let volume = format!("/Volumes/midden-missing-{}", std::process::id());
+    let mut projects = serde_json::Map::new();
+    for i in 0..9 {
+        projects.insert(format!("{volume}/p{i}"), json!({}));
+    }
+    projects.insert("/no/such/dir".to_string(), json!({}));
+    fx.write_config(Value::Object(projects), standard_extras());
+    let before = std::fs::read_to_string(&fx.config).unwrap();
+
+    // Only 1 of 10 entries is removable, but all 10 resolve missing on this
+    // host, which is the signal the gate exists for.
+    fx.cmd()
+        .arg("prune")
+        .arg("--apply")
+        .assert()
+        .code(2)
+        .stderr(contains(
+            "10 of 10 project entries resolve missing (9 on volumes that are not mounted)",
+        ));
+    assert_eq!(before, std::fs::read_to_string(&fx.config).unwrap());
+    assert!(fx.backup_paths().is_empty());
+
+    fx.cmd()
+        .arg("prune")
+        .arg("--apply")
+        .arg("--force")
+        .assert()
+        .success();
+    let after = fx.read_config();
+    let projects = after["projects"].as_object().unwrap();
+    assert_eq!(projects.len(), 9, "--force removes only the dead entry");
+    assert!(!projects.contains_key("/no/such/dir"));
+}
+
+#[test]
+fn unmounted_transcripts_count_toward_the_transcript_gate() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), standard_extras());
+    let volume = format!("/Volumes/midden-missing-{}", std::process::id());
+    let live = fx.touch_dir("live-project");
+    fx.write_transcript("live-project", &live);
+    let dead = fx
+        .root
+        .path()
+        .join("missing")
+        .to_string_lossy()
+        .into_owned();
+    let dead_jsonl = fx.write_transcript("dead-project", &dead);
+    for i in 0..8 {
+        fx.write_transcript(&format!("volume-{i}"), &format!("{volume}/p{i}"));
+    }
+
+    // 1 dead of 2 resolvable dirs would pass on its own; the 8 unmounted dirs
+    // also resolve missing on this host.
+    fx.cmd()
+        .arg("prune")
+        .arg("--transcripts")
+        .arg("--apply")
+        .assert()
+        .code(2)
+        .stderr(contains(
+            "9 of 10 resolvable transcript dirs point at missing projects (8 on volumes that are not mounted)",
+        ));
+    assert!(dead_jsonl.exists(), "gate must refuse before deleting");
+
+    fx.cmd()
+        .arg("prune")
+        .arg("--transcripts")
+        .arg("--apply")
+        .arg("--force")
+        .assert()
+        .success();
+    assert!(!dead_jsonl.exists(), "--force removes the dead transcript");
+    assert!(
+        fx.claude_home.join("projects/volume-0").exists(),
+        "unmounted transcripts survive --force"
+    );
+}
