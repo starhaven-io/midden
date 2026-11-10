@@ -795,6 +795,65 @@ fn claude_exclusions_and_external_imports_preserve_unknown_state() {
 }
 
 #[test]
+fn checkout_git_config_cannot_widen_the_claude_import_trust_root() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let base = fx.root.path().canonicalize().unwrap();
+    let repo = base.join("repo");
+    let private = base.join("outside/private.md");
+    write(&private, "private\n");
+    write(repo.join("CLAUDE.md"), "@../outside/private.md\n");
+    write(
+        base.join(".claude/rules/outside.md"),
+        "outside the checkout\n",
+    );
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap()
+            .status;
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "--quiet"]);
+    git(&["config", "core.worktree", "../.."]);
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("memory")
+        .arg("show")
+        .arg(&repo)
+        .arg("--provider")
+        .arg("claude")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let inventory: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let claude = provider(&inventory, "claude");
+    let import = source(claude, &private);
+    assert_eq!(import["load_state"], "unknown");
+    assert!(import["bytes"].is_null(), "the import was opened: {import}");
+    assert!(
+        import["detail"]
+            .as_str()
+            .unwrap()
+            .contains("approval is unresolved")
+    );
+    let outside_rule = base.join(".claude/rules/outside.md").display().to_string();
+    assert!(
+        claude["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|source| source["path"] != outside_rule.as_str()),
+        "rules were read from outside the checkout"
+    );
+}
+
+#[test]
 fn claude_external_import_approval_is_resolved_from_project_state() {
     let fx = Fixture::new();
     let root = fx.root.path().canonicalize().unwrap();
