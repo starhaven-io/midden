@@ -134,7 +134,7 @@ pub(super) enum LoadState {
 }
 
 impl LoadState {
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             Self::Loaded => "loaded",
             Self::Truncated => "truncated",
@@ -430,6 +430,13 @@ struct Inventory {
     target: PathBuf,
     include_unassociated: bool,
     providers: Vec<ProviderInventory>,
+}
+
+/// Claude's instruction sources for a canonical `target`, in load order, with
+/// the warnings raised while discovering them.
+pub(crate) fn claude_instructions(env: &Env, target: &Path) -> (Vec<Source>, Vec<Warning>) {
+    let inventory = claude::ClaudeAdapter::new(env).instructions(target);
+    (inventory.sources, inventory.warnings)
 }
 
 pub fn run_show(env: &Env, opts: ShowOptions) -> Result<ExitCode> {

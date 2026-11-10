@@ -481,6 +481,225 @@ fn claude_md_size_limit_matches_provider_boundary() {
     );
 }
 
+fn claude_md_entry<'a>(report: &'a Value, file: &Path) -> &'a Value {
+    let file = file.display().to_string();
+    report["claude_md"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["file"] == file.as_str())
+        .unwrap_or_else(|| panic!("{file} missing from {}", report["claude_md"]))
+}
+
+#[test]
+fn show_lists_every_instruction_source_the_memory_inventory_reports() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let root = fx.root.path().canonicalize().unwrap();
+    write(&root.join(".claude/CLAUDE.md"), "@../docs/style.md\n");
+    write(&root.join("docs/style.md"), "- Prefer short functions.\n");
+    write(&root.join(".claude/rules/always.md"), "- Run the linter.\n");
+    write(
+        &root.join(".claude/rules/scoped.md"),
+        "---\npaths: [\"src/**\"]\n---\n- Document public items.\n",
+    );
+    write(&fx.claude_home.join("rules/personal.md"), "- Be brief.\n");
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("show")
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+
+    let dot_claude = claude_md_entry(&report, &root.join(".claude/CLAUDE.md"));
+    assert_eq!(dot_claude["kind"], "instruction");
+    assert_eq!(dot_claude["scope"], "project");
+    assert_eq!(dot_claude["load_state"], "loaded");
+    let import = claude_md_entry(&report, &root.join("docs/style.md"));
+    assert_eq!(import["kind"], "imported-instruction");
+    assert_eq!(import["scope"], "project");
+    let always = claude_md_entry(&report, &root.join(".claude/rules/always.md"));
+    assert_eq!(always["kind"], "rule");
+    assert_eq!(always["load_state"], "loaded");
+    let scoped = claude_md_entry(&report, &root.join(".claude/rules/scoped.md"));
+    assert_eq!(scoped["load_state"], "on-demand");
+    let personal = claude_md_entry(&report, &fx.claude_home.join("rules/personal.md"));
+    assert_eq!(personal["kind"], "rule");
+    assert_eq!(personal["scope"], "user");
+
+    let memory = fx
+        .cmd()
+        .arg("--json")
+        .arg("memory")
+        .arg("show")
+        .arg(&root)
+        .arg("--provider")
+        .arg("claude")
+        .output()
+        .unwrap();
+    let inventory: Value = serde_json::from_slice(&memory.stdout).unwrap();
+    let from_memory: Vec<&Value> = inventory["providers"][0]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|source| source["role"] == "authority")
+        .map(|source| &source["path"])
+        .collect();
+    let from_show: Vec<&Value> = report["claude_md"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|source| &source["file"])
+        .collect();
+    assert_eq!(from_show, from_memory);
+
+    let human = fx.cmd().arg("show").arg(&root).output().unwrap();
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "[project rule; on demand] {}",
+            root.join(".claude/rules/scoped.md").display()
+        )),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "[project import; loaded] {}",
+            root.join("docs/style.md").display()
+        )),
+        "stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn contradictions_cover_dot_claude_md_rules_and_imports() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let root = fx.root.path().canonicalize().unwrap();
+    write(
+        &fx.claude_home.join("CLAUDE.md"),
+        "- Always commit signed.\n- Always use tabs.\n- Always squash merges.\n",
+    );
+    write(
+        &root.join(".claude/CLAUDE.md"),
+        "- Never commit signed.\n@../docs/style.md\n",
+    );
+    write(&root.join("docs/style.md"), "- Never use tabs.\n");
+    write(
+        &root.join(".claude/rules/merge.md"),
+        "- Never squash merges.\n",
+    );
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("show")
+        .arg(&root)
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let mut files: Vec<&str> = report["contradictions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|contradiction| contradiction["b_file"].as_str().unwrap())
+        .collect();
+    files.sort_unstable();
+    let mut expected = vec![
+        root.join(".claude/CLAUDE.md").display().to_string(),
+        root.join(".claude/rules/merge.md").display().to_string(),
+        root.join("docs/style.md").display().to_string(),
+    ];
+    expected.sort_unstable();
+    assert_eq!(files, expected, "report:\n{}", report["contradictions"]);
+}
+
+#[test]
+fn sources_claude_does_not_load_stay_out_of_contradictions() {
+    let fx = Fixture::new();
+    let root = fx.root.path().canonicalize().unwrap();
+    fx.write_config(json!({}), json!({}));
+    let external = fx.codex_home.join("shared.md");
+    write(&external, "- Never commit signed.\n");
+    write(
+        &fx.claude_home.join("CLAUDE.md"),
+        "- Always commit signed.\n",
+    );
+    write(
+        &root.join("CLAUDE.md"),
+        &format!("@{}\n", external.display()),
+    );
+    write(&root.join("CLAUDE.local.md"), "- Never commit signed.\n");
+    write_json(
+        &fx.claude_home.join("settings.json"),
+        &json!({ "claudeMdExcludes": ["**/CLAUDE.local.md"] }),
+    );
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("show")
+        .arg(&root)
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+
+    let import = claude_md_entry(&report, &external);
+    assert_eq!(import["load_state"], "unknown");
+    assert!(import["bytes"].is_null());
+    let local = claude_md_entry(&report, &root.join("CLAUDE.local.md"));
+    assert_eq!(local["scope"], "local");
+    assert_eq!(local["load_state"], "disabled");
+    assert_eq!(report["contradictions"], json!([]));
+}
+
+#[test]
+fn checkout_git_config_cannot_widen_the_import_trust_root() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let base = fx.root.path().canonicalize().unwrap();
+    let repo = base.join("repo");
+    let private = base.join("outside/private.md");
+    write(&private, "- Never commit signed.\n");
+    write(
+        &repo.join("CLAUDE.md"),
+        "- Always commit signed.\n@../outside/private.md\n",
+    );
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap()
+            .status;
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "--quiet"]);
+    git(&["config", "core.worktree", "../.."]);
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("show")
+        .arg(&repo)
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let import = claude_md_entry(&report, &private);
+    assert_eq!(import["load_state"], "unknown");
+    assert!(import["bytes"].is_null(), "the import was opened: {import}");
+    assert_eq!(report["contradictions"], json!([]));
+}
+
 #[test]
 fn show_lists_mcp_servers_with_scope_and_target() {
     let fx = Fixture::new();

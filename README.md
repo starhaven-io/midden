@@ -156,6 +156,7 @@ settings
 CLAUDE.md
   [user; loaded] /Users/me/.claude/CLAUDE.md (8421 bytes)
   [project; loaded] /Users/me/myproject/CLAUDE.md (10442 bytes)
+  [project rule; on demand] /Users/me/myproject/.claude/rules/api.md (412 bytes)
 
 hooks
   PreToolUse
@@ -169,7 +170,7 @@ mcp servers
     /Users/me/myproject/.mcp.json
 ```
 
-Settings precedence is **Managed → Local → Project → User**. Scalars from a higher scope override; arrays concat and deduplicate across scopes. `show` tags every value with its source and marks contributions shadowed by a higher scope. `CLAUDE.md` files do not follow precedence — all applicable files load simultaneously, so midden lists every contributor and runs a heuristic contradiction-detection pass instead of picking a winner. Claude loads files through 4 MiB and skips larger files; midden reports those larger sources as disabled and leaves an inaccessible file unknown without aborting the rest of `show`. Duplicate directives are collapsed, and the optional contradiction report is limited to 128 entries; JSON exposes `contradictions_truncated` when additional matches are omitted. See [Claude memory loading](https://code.claude.com/docs/en/memory#claudemd-files) for the provider contract.
+Settings precedence is **Managed → Local → Project → User**. Scalars from a higher scope override; arrays concat and deduplicate across scopes. `show` tags every value with its source and marks contributions shadowed by a higher scope. `CLAUDE.md` files do not follow precedence — all applicable files load simultaneously, so midden lists every contributor and runs a heuristic contradiction-detection pass instead of picking a winner. The list comes from the same discovery as `memory show`: managed, user, ancestor, project and local `CLAUDE.md` files, `.claude/CLAUDE.md`, rule files and imports. A source Claude does not load (excluded by `claudeMdExcludes`, oversized, or an external import without recorded approval) is listed but left out of the contradiction pass. Claude loads files through 4 MiB and skips larger files; midden reports those larger sources as disabled and leaves an inaccessible file unknown without aborting the rest of `show`. Duplicate directives are collapsed, and the optional contradiction report is limited to 128 entries; JSON exposes `contradictions_truncated` when additional matches are omitted. See [Claude memory loading](https://code.claude.com/docs/en/memory#claudemd-files) for the provider contract.
 
 Present but malformed or unreadable settings and MCP files make `show` fail with exit code 2 and name the affected path. They are never treated as an absent configuration layer. Unreadable managed settings directories follow the same rule. Inaccessible optional instruction, skill, command, agent, and worktree inventories emit masked, terminal-safe warnings on stderr while keeping the readable parts of the report; missing optional directories are normal.
 
