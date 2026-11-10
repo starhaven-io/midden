@@ -496,6 +496,118 @@ fn project_root_relative_credential_deny_rules_pass() {
 }
 
 #[test]
+fn user_scope_slash_anchored_credential_deny_rules_do_not_cover_the_project() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    write_json(
+        &fx.claude_home.join("settings.json"),
+        &json!({
+            "permissions": {
+                "deny": ["Read(/.env)", "Read(/.env.*)", "Read(/secrets/**)"]
+            }
+        }),
+    );
+
+    fx.cmd()
+        .arg("doctor")
+        .arg(fx.root.path())
+        .assert()
+        .success()
+        .stdout(contains(
+            "no deny rule covers .env, .env variants, secrets/**",
+        ));
+}
+
+#[test]
+fn user_scope_absolute_credential_deny_rules_pass() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let root = fx.root.path().canonicalize().unwrap();
+    write_json(
+        &fx.claude_home.join("settings.json"),
+        &json!({
+            "permissions": {
+                "deny": [
+                    format!("Read(/{}/.env)", root.display()),
+                    "Read(//**/.env.*)",
+                    format!("Read(/{}/secrets/**)", root.display()),
+                ]
+            }
+        }),
+    );
+
+    let out = fx.cmd().arg("doctor").arg(fx.root.path()).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("missing-credential-deny"),
+        "stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn single_star_home_credential_deny_rules_do_not_reach_a_deeper_project() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let project = fx.claude_home.parent().unwrap().join("a/b/proj");
+    std::fs::create_dir_all(&project).unwrap();
+    write_json(
+        &fx.claude_home.join("settings.json"),
+        &json!({
+            "permissions": {
+                "deny": ["Read(~/*/.env)", "Read(~/*/.env.*)", "Read(~/*/secrets/**)"]
+            }
+        }),
+    );
+
+    fx.cmd()
+        .arg("doctor")
+        .arg(&project)
+        .assert()
+        .success()
+        .stdout(contains(
+            "no deny rule covers .env, .env variants, secrets/**",
+        ));
+
+    write_json(
+        &fx.claude_home.join("settings.json"),
+        &json!({
+            "permissions": {
+                "deny": ["Read(~/**/.env)", "Read(~/*/*/*/.env.*)", "Read(~/a/**/secrets/**)"]
+            }
+        }),
+    );
+    let out = fx.cmd().arg("doctor").arg(&project).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("missing-credential-deny"),
+        "stdout:\n{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn credential_deny_rules_cover_a_project_path_containing_a_backslash() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    let project = fx.root.path().join(r"p\1");
+    write_json(
+        &project.join(".claude/settings.json"),
+        &json!({
+            "permissions": {
+                "deny": ["Read(./.env)", "Read(/.env.*)", "Read(secrets/**)"]
+            }
+        }),
+    );
+
+    let out = fx.cmd().arg("doctor").arg(&project).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("missing-credential-deny"),
+        "stdout:\n{stdout}"
+    );
+}
+
+#[test]
 fn flags_unreachable_mcp_server() {
     let fx = Fixture::new();
     fx.write_config(

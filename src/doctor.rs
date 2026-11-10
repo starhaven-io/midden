@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
-use globset::Glob;
+use globset::GlobBuilder;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -19,6 +19,7 @@ use crate::paths::{Env, ProjectPaths, managed_mcp_path, managed_settings_files, 
 use crate::process;
 use crate::safe_io;
 use crate::secrets;
+use crate::show::Scope;
 use crate::terminal;
 use crate::transcripts;
 
@@ -912,11 +913,12 @@ fn check_credential_deny_rules(
     out: &mut Vec<Finding>,
 ) -> Result<()> {
     let merged_deny = merged_deny_rules(project, env, out);
+    let home = std::env::home_dir();
     let mut missing = Vec::new();
     for (label, representative) in CREDENTIAL_TARGETS {
         if !merged_deny
             .iter()
-            .any(|rule| read_deny_covers(rule, representative))
+            .any(|rule| read_deny_covers(rule, &project.root, home.as_deref(), representative))
         {
             missing.push(*label);
         }
@@ -945,27 +947,75 @@ fn check_credential_deny_rules(
     Ok(())
 }
 
-fn read_deny_covers(rule: &str, representative: &str) -> bool {
+struct DenyRule {
+    scope: Scope,
+    file: PathBuf,
+    rule: String,
+}
+
+impl DenyRule {
+    /// Claude Code anchors a `/path` rule at a directory tied to the settings
+    /// source: the Claude config directory for user settings, the working
+    /// directory for project, local and managed settings. The permissions
+    /// documentation omits the managed case; it follows Claude Code's own
+    /// resolution of the `policySettings` source.
+    fn settings_anchor(&self, root: &Path) -> Option<PathBuf> {
+        match self.scope {
+            Scope::User => self.file.parent().map(Path::to_path_buf),
+            Scope::Project | Scope::Local | Scope::Managed => Some(root.to_path_buf()),
+        }
+    }
+}
+
+/// Whether a deny rule, anchored the way Claude Code anchors it for the
+/// settings file that contributed it, blocks reading `representative` under
+/// the canonical project `root`.
+fn read_deny_covers(
+    rule: &DenyRule,
+    root: &Path,
+    home: Option<&Path>,
+    representative: &str,
+) -> bool {
     let Some(pattern) = rule
+        .rule
         .strip_prefix("Read(")
         .and_then(|value| value.strip_suffix(')'))
     else {
         return false;
     };
-    // Claude interprets one leading slash relative to the project root and
-    // two leading slashes relative to the filesystem root. Representatives
-    // here are project-relative, so only the former can cover them.
-    if pattern.starts_with("//") || pattern.starts_with("~/") {
+    let (anchor, pattern) = if let Some(absolute) = pattern.strip_prefix("//") {
+        (Some(PathBuf::from("/")), absolute)
+    } else if let Some(from_home) = pattern.strip_prefix("~/") {
+        (home.map(Path::to_path_buf), from_home)
+    } else if let Some(from_source) = pattern.strip_prefix('/') {
+        (rule.settings_anchor(root), from_source)
+    } else {
+        (
+            Some(root.to_path_buf()),
+            pattern.strip_prefix("./").unwrap_or(pattern),
+        )
+    };
+    let Some(anchor) = anchor else {
         return false;
-    }
-    let pattern = pattern
-        .strip_prefix("./")
-        .or_else(|| pattern.strip_prefix('/'))
-        .unwrap_or(pattern);
-    Glob::new(pattern)
-        .ok()
-        .map(|glob| glob.compile_matcher().is_match(representative))
-        .unwrap_or(false)
+    };
+    let target = root.join(representative);
+    // `root` is canonical, so an anchor reached through a symlink (a macOS
+    // home under /var, say) has to be compared in its resolved form too.
+    let resolved = anchor.canonicalize().ok();
+    std::iter::once(&anchor)
+        .chain(resolved.as_ref())
+        .filter_map(|anchor| anchor.to_str())
+        .any(|anchor| {
+            // `globset::escape` leaves a backslash alone, and an unescaped one
+            // would swallow the path separator that follows it.
+            let anchor = globset::escape(anchor.trim_end_matches('/')).replace('\\', r"\\");
+            // Claude Code matches gitignore-style: `*` and `?` stay inside one
+            // path segment and only `**` crosses directories.
+            GlobBuilder::new(&format!("{anchor}/{pattern}"))
+                .literal_separator(true)
+                .build()
+                .is_ok_and(|glob| glob.compile_matcher().is_match(&target))
+        })
 }
 
 fn recommend_deny_location(project: &ProjectPaths, env: &Env) -> (PathBuf, String) {
@@ -998,14 +1048,14 @@ fn merged_deny_rules(
     project: &ProjectPaths,
     env: &Env,
     findings: &mut Vec<Finding>,
-) -> Vec<String> {
+) -> Vec<DenyRule> {
     let mut out = Vec::new();
     // Managed scope can carry the org-wide deny rules; ignoring it produced
     // false missing-credential-deny findings on MDM-managed machines.
     let mut paths = vec![
-        env.user_settings(),
-        project.settings(),
-        project.local_settings(),
+        (Scope::User, env.user_settings()),
+        (Scope::Project, project.settings()),
+        (Scope::Local, project.local_settings()),
     ];
     let managed = managed_settings_files();
     for (path, error) in managed.errors {
@@ -1015,14 +1065,18 @@ fn merged_deny_rules(
             format!("could not inspect managed settings: {error}"),
         );
     }
-    paths.extend(managed.paths);
-    for path in paths {
+    paths.extend(managed.paths.into_iter().map(|path| (Scope::Managed, path)));
+    for (scope, path) in paths {
         if let Some(v) = read_optional_json_for_audit(&path, findings)
             && let Some(deny) = v.pointer("/permissions/deny").and_then(Value::as_array)
         {
             for d in deny {
                 if let Value::String(s) = d {
-                    out.push(s.clone());
+                    out.push(DenyRule {
+                        scope,
+                        file: path.clone(),
+                        rule: s.clone(),
+                    });
                 }
             }
         }
@@ -1715,6 +1769,145 @@ mod tests {
 
         let (file, _) = recommend_deny_location(&project, &env);
         assert_eq!(file, project.settings());
+    }
+
+    fn deny(scope: Scope, file: &Path, rule: &str) -> DenyRule {
+        DenyRule {
+            scope,
+            file: file.to_path_buf(),
+            rule: rule.into(),
+        }
+    }
+
+    #[test]
+    fn slash_anchored_deny_rules_resolve_against_their_settings_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let root = base.join("project");
+        let claude_home = base.join("home").join(".claude");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&claude_home).unwrap();
+        let user = claude_home.join("settings.json");
+        let project = root.join(".claude").join("settings.json");
+
+        for scope in [Scope::Project, Scope::Local, Scope::Managed] {
+            assert!(
+                read_deny_covers(&deny(scope, &project, "Read(/.env)"), &root, None, ".env"),
+                "{scope:?}"
+            );
+        }
+        for rule in ["Read(/.env)", "Read(/**/.env)", "Read(/**)"] {
+            assert!(
+                !read_deny_covers(&deny(Scope::User, &user, rule), &root, None, ".env"),
+                "{rule} is anchored at the Claude config directory"
+            );
+        }
+        for rule in ["Read(.env)", "Read(./.env)", "Read(**/.env)"] {
+            assert!(
+                read_deny_covers(&deny(Scope::User, &user, rule), &root, None, ".env"),
+                "{rule} is relative to the working directory"
+            );
+        }
+
+        let nested = claude_home.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(read_deny_covers(
+            &deny(Scope::User, &user, "Read(/nested/.env)"),
+            &nested,
+            None,
+            ".env"
+        ));
+    }
+
+    #[test]
+    fn absolute_and_home_deny_rules_count_only_when_they_reach_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let root = home.join("work").join("project [1]");
+        std::fs::create_dir_all(&root).unwrap();
+        let user = home.join(".claude").join("settings.json");
+        let covers = |rule: &str, home: Option<&Path>, representative: &str| {
+            read_deny_covers(&deny(Scope::User, &user, rule), &root, home, representative)
+        };
+        let absolute = format!("Read(/{}/secrets/**)", base.join("home/work").display());
+
+        assert!(covers("Read(//**/.env)", None, ".env"));
+        assert!(covers("Read(//**/.env.*)", None, ".env.local"));
+        assert!(!covers("Read(//**/.env)", None, ".env.local"));
+        assert!(!covers(&absolute, None, "secrets/credential"));
+        assert!(covers(
+            &absolute.replace("/secrets/", "/*/secrets/"),
+            None,
+            "secrets/credential"
+        ));
+        assert!(!covers("Read(//srv/elsewhere/**)", None, ".env"));
+
+        assert!(covers("Read(~/work/**/.env)", Some(&home), ".env"));
+        assert!(covers(
+            "Read(~/**/secrets/**)",
+            Some(&home),
+            "secrets/credential"
+        ));
+        assert!(!covers("Read(~/other/**/.env)", Some(&home), ".env"));
+        assert!(!covers(
+            "Read(~/work/**/.env)",
+            Some(&base.join("nobody")),
+            ".env"
+        ));
+        assert!(!covers("Read(~/work/**/.env)", None, ".env"));
+
+        // `*` stays inside one path segment, so these stop one level short
+        // of a project two directories below the home.
+        for (rule, representative) in [
+            ("Read(~/*/.env)", ".env"),
+            ("Read(~/*/.env.*)", ".env.local"),
+            ("Read(~/*/secrets/**)", "secrets/credential"),
+            ("Read(~/work/project ?1?/.e?v)", ".env.local"),
+        ] {
+            assert!(!covers(rule, Some(&home), representative), "{rule}");
+        }
+        assert!(covers("Read(~/*/*/.env)", Some(&home), ".env"));
+        assert!(covers("Read(~/work/project ?1?/.e?v)", Some(&home), ".env"));
+        assert!(!covers("Read(./*)", None, "secrets/credential"));
+        assert!(covers("Read(./**)", None, "secrets/credential"));
+
+        // A project-anchored rule must not treat the root's own brackets as a
+        // character class.
+        let project = root.join(".claude").join("settings.json");
+        assert!(read_deny_covers(
+            &deny(Scope::Project, &project, "Read(/.env)"),
+            &root,
+            None,
+            ".env"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deny_rules_match_under_a_root_containing_glob_syntax() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        for name in [r"p\1", r"p\*", "p{a,b}", "p[!x]?"] {
+            let root = base.join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            let project = root.join(".claude").join("settings.json");
+            for rule in ["Read(/.env)", "Read(./.env)", "Read(.env)"] {
+                assert!(
+                    read_deny_covers(&deny(Scope::Project, &project, rule), &root, None, ".env"),
+                    "{rule} under {name}"
+                );
+            }
+            assert!(
+                read_deny_covers(
+                    &deny(Scope::User, &project, "Read(~/**/.env)"),
+                    &root,
+                    Some(&base),
+                    ".env"
+                ),
+                "home-anchored rule under {name}"
+            );
+        }
     }
 
     #[test]
