@@ -262,7 +262,7 @@ fn show_masks_sensitive_object_keys_nested_in_arrays() {
         !stdout.contains("hunter2"),
         "nested secret leaked:\n{stdout}"
     );
-    assert!(stdout.contains("hunt***"), "stdout:\n{stdout}");
+    assert!(stdout.contains("\"***(7)\""), "stdout:\n{stdout}");
     assert!(
         stdout.contains("safe"),
         "innocent sibling missing:\n{stdout}"
@@ -330,7 +330,7 @@ fn show_masks_hook_commands_and_mcp_urls() {
         !stdout.contains("verysecret1234"),
         "url query secret leaked:\n{stdout}"
     );
-    assert!(stdout.contains("api_key=very***"), "stdout:\n{stdout}");
+    assert!(stdout.contains("api_key=***(14)&v=2"), "stdout:\n{stdout}");
     assert!(stdout.contains("v=2"), "innocent param survives:\n{stdout}");
 
     // --show-secrets restores the raw values.
@@ -404,6 +404,40 @@ fn show_secrets_flag_unmasks() {
     assert!(
         stdout.contains("sk-real-secret-aaaa"),
         "--show-secrets should unmask:\n{stdout}"
+    );
+}
+
+#[test]
+fn repeated_masking_passes_keep_the_length_of_the_secret() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), json!({}));
+    write_json(
+        &fx.root.path().join(".mcp.json"),
+        &json!({
+            "mcpServers": {
+                "srv": {
+                    "command": "srv",
+                    "args": ["--token=hunter2", "--token", "hunter2"],
+                    "url": "https://mcp.example.com/sse?api_key=verysecret1234&v=2"
+                }
+            }
+        }),
+    );
+
+    let out = fx
+        .cmd()
+        .arg("--json")
+        .arg("show")
+        .arg(fx.root.path())
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let definition = &report["mcp_servers"][0]["definition"];
+    assert_eq!(definition["args"][0], "--token=***(7)");
+    assert_eq!(definition["args"][2], "***(7)");
+    assert_eq!(
+        definition["url"],
+        "https://mcp.example.com/sse?api_key=***(14)&v=2"
     );
 }
 

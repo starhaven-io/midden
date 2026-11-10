@@ -104,14 +104,56 @@ fn split_words(name: &str) -> Vec<String> {
     words
 }
 
-/// Mask a string for display: keep up to four leading chars, replace the rest
-/// with `***`. Empty/short strings collapse to `***`.
+const VISIBLE_PREFIX_CHARS: usize = 4;
+const MIN_CHARS_FOR_VISIBLE_PREFIX: usize = 16;
+const MIN_HIDDEN_CHARS_AFTER_PREFIX: usize = 8;
+
+/// Mask a string for display. A value of at least
+/// `MIN_CHARS_FOR_VISIBLE_PREFIX` characters keeps its first four. A shorter
+/// one keeps a recognized token prefix (`ghp_***`) when at least
+/// `MIN_HIDDEN_CHARS_AFTER_PREFIX` characters follow it. Anything else
+/// becomes `***(N)`, N being its length in characters, because a visible
+/// prefix is most of a short secret. An empty string is `***`.
 pub fn mask(s: &str) -> String {
-    let visible = s.chars().take(4).collect::<String>();
-    if visible.is_empty() || visible.len() == s.len() {
-        "***".into()
-    } else {
-        format!("{visible}***")
+    if s.is_empty() {
+        return "***".into();
+    }
+    if is_masked(s) {
+        return s.into();
+    }
+    let chars = s.chars().count();
+    if chars >= MIN_CHARS_FOR_VISIBLE_PREFIX {
+        let visible = s.chars().take(VISIBLE_PREFIX_CHARS).collect::<String>();
+        return format!("{visible}***");
+    }
+    match VALUE_PREFIXES.iter().find(|prefix| {
+        s.strip_prefix(**prefix)
+            .is_some_and(|rest| rest.chars().count() >= MIN_HIDDEN_CHARS_AFTER_PREFIX)
+    }) {
+        Some(prefix) => format!("{prefix}***"),
+        None => format!("***({chars})"),
+    }
+}
+
+/// Display paths mask the same text more than once (by key, then by content,
+/// then as a final pass over the serialized report), so `mask` must leave its
+/// own output alone: masking `***(7)` again would report the length of the
+/// mask instead of the secret. Only forms `mask` can emit qualify. The cost
+/// is that a real value already shaped exactly like one is shown as written.
+fn is_masked(s: &str) -> bool {
+    match s.strip_suffix("***") {
+        Some(visible) => {
+            visible.is_empty()
+                || visible.chars().count() == VISIBLE_PREFIX_CHARS
+                || VALUE_PREFIXES.contains(&visible)
+        }
+        None => s
+            .strip_prefix("***(")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .and_then(|digits| Some((digits, digits.parse::<usize>().ok()?)))
+            .is_some_and(|(digits, chars)| {
+                (1..MIN_CHARS_FOR_VISIBLE_PREFIX).contains(&chars) && digits == chars.to_string()
+            }),
     }
 }
 
@@ -969,7 +1011,26 @@ fn argument_value_ranges(s: &str) -> Vec<(usize, usize)> {
 /// nothing matches by shape (e.g. flagged by key name alone).
 pub fn masked_for_display(s: &str) -> String {
     let embedded = mask_embedded(s);
-    if embedded == s { mask(s) } else { embedded }
+    if embedded == s && !masks_stand_in_for_secrets(s) {
+        mask(s)
+    } else {
+        embedded
+    }
+}
+
+const MASK_PROBE: &str = "Zq9Zq9Zq9Zq9Zq9Zq9Zq";
+
+/// Text that an earlier pass already masked comes back from `mask_embedded`
+/// unchanged, exactly like text with nothing to mask, and masking the whole
+/// of it would replace `--token=***(7)` with the length of that string. The
+/// two cases differ in whether a secret put where each `***` sits would be
+/// masked, so that is what is probed.
+fn masks_stand_in_for_secrets(s: &str) -> bool {
+    if !s.contains("***") {
+        return false;
+    }
+    let probe = s.replace("***", MASK_PROBE);
+    mask_embedded(&probe) != probe
 }
 
 /// Display masking is broader than doctor's judgement: an opaque URL path
@@ -1059,10 +1120,83 @@ mod tests {
     #[test]
     fn mask_short_strings() {
         assert_eq!(mask(""), "***");
-        assert_eq!(mask("abc"), "***");
-        assert_eq!(mask("abcd"), "***");
-        assert_eq!(mask("abcde"), "abcd***");
+        assert_eq!(mask("abc"), "***(3)");
+        assert_eq!(mask("abcde"), "***(5)");
+        assert_eq!(mask("hunter2"), "***(7)");
+        assert_eq!(mask("pässwörd"), "***(8)");
+        assert_eq!(mask("fifteen-chars-x"), "***(15)");
+    }
+
+    #[test]
+    fn mask_keeps_a_prefix_only_for_long_or_recognized_values() {
+        assert_eq!(mask("sixteen-chars-xx"), "sixt***");
         assert_eq!(mask("sk-very-long-token-here"), "sk-v***");
+        assert_eq!(mask("ghp_12345678"), "ghp_***");
+        assert_eq!(mask("sk-12345678"), "sk-***");
+        // A prefix is kept only while at least eight characters stay hidden.
+        assert_eq!(mask("ghp_1234567"), "***(11)");
+        assert_eq!(mask("sk-1234567"), "***(10)");
+        assert_eq!(mask("github_pat_1"), "***(12)");
+        assert_eq!(mask("glpat-Zq"), "***(8)");
+        assert_eq!(mask("xoxb-1"), "***(6)");
+        assert_eq!(mask("ghp_"), "***(4)");
+    }
+
+    #[test]
+    fn mask_leaves_its_own_output_alone() {
+        for value in [
+            "",
+            "abc",
+            "hunter2",
+            "fifteen-chars-x",
+            "ghp_12345678",
+            "sk-very-long-token-here",
+        ] {
+            let once = mask(value);
+            assert_eq!(mask(&once), once, "{value:?}");
+        }
+        let mut argv = json!(["cmd", "--token", "hunter2"]);
+        mask_tree(&mut argv);
+        mask_sensitive_values(&mut argv);
+        assert_eq!(argv[2], "***(7)");
+        let command = mask_embedded("cmd --token hunter2 ok");
+        assert_eq!(mask_embedded(&command), command);
+
+        for (raw, masked) in [
+            ("--token=hunter2", "--token=***(7)"),
+            (
+                "https://x.example/sse?token=abcd1234&v=2",
+                "https://x.example/sse?token=***(8)&v=2",
+            ),
+            (
+                "Authorization: Bearer 12345",
+                "Authorization: Bearer ***(5)",
+            ),
+            (
+                "X-Api-Key: zq8r7Lk2mN9pQ4sT6vW1xY3zAb5c",
+                "X-Api-Key: zq8r***",
+            ),
+        ] {
+            assert_eq!(masked_for_display(raw), masked);
+            assert_eq!(masked_for_display(masked), masked);
+            let mut value = json!([raw]);
+            mask_tree(&mut value);
+            mask_sensitive_values(&mut value);
+            assert_eq!(value[0], masked);
+        }
+    }
+
+    #[test]
+    fn only_text_mask_can_emit_counts_as_already_masked() {
+        // The hint is a length below the visible-prefix threshold, written
+        // the way `mask` writes it.
+        assert_eq!(mask("***(15)"), "***(15)");
+        assert_eq!(mask("***(16)"), "***(7)");
+        assert_eq!(mask("***(0)"), "***(6)");
+        assert_eq!(mask("***(07)"), "***(7)");
+        assert_eq!(mask("***(4111111111111111)"), "***(***");
+        // Stars that do not sit where a secret would be are not a mask.
+        assert_eq!(masked_for_display("my***pass"), "***(9)");
     }
 
     #[test]
@@ -1104,11 +1238,11 @@ mod tests {
     fn curl_user_credentials_are_masked_only_for_curl() {
         assert_eq!(
             mask_embedded("curl -u user:S3cretPass https://x.example"),
-            "curl -u user*** https://x.example"
+            "curl -u ***(15) https://x.example"
         );
         assert_eq!(
             mask_embedded("bash -c 'curl --user=user:S3cretPass https://x.example'"),
-            "bash -c 'curl --user=user*** https://x.example'"
+            "bash -c 'curl --user=***(15) https://x.example'"
         );
         assert_eq!(
             mask_embedded("docker run -u www-data:www-data image"),
@@ -1231,19 +1365,16 @@ mod tests {
     fn mask_embedded_masks_argument_and_authorization_context() {
         assert_eq!(
             mask_embedded("cmd --token hunter2 ok"),
-            "cmd --token hunt*** ok"
+            "cmd --token ***(7) ok"
         );
-        assert_eq!(
-            mask_embedded("cmd --api-key=short"),
-            "cmd --api-key=shor***"
-        );
+        assert_eq!(mask_embedded("cmd --api-key=short"), "cmd --api-key=***(5)");
         assert_eq!(
             mask_embedded("Authorization: bearer opaquevalue"),
-            "Authorization: bearer opaq***"
+            "Authorization: bearer ***(11)"
         );
         assert_eq!(
             mask_embedded("Authorization: bearer first-secret, Authorization: Basic second-secret"),
-            "Authorization: bearer firs***, Authorization: Basic seco***"
+            "Authorization: bearer ***(12), Authorization: Basic ***(13)"
         );
         assert_eq!(
             mask_embedded("Authorization: Bearer --token=overlapping-secret"),
@@ -1261,7 +1392,7 @@ mod tests {
         );
         assert_eq!(
             mask_free_text("use --token=plain-secret"),
-            "use --token=plai***"
+            "use --token=***(12)"
         );
         assert_eq!(
             mask_free_text("Authorization: Bearer --token=overlapping-secret"),
@@ -1275,7 +1406,7 @@ mod tests {
         let masked = mask_embedded(url);
         assert!(!masked.contains("s3cretpass"), "{masked}");
         assert!(!masked.contains("abcd1234"), "{masked}");
-        assert!(masked.contains("token=abcd***"), "{masked}");
+        assert!(masked.contains("token=***(8)"), "{masked}");
         assert!(
             masked.contains("page=2"),
             "innocent params survive: {masked}"
@@ -1296,7 +1427,7 @@ mod tests {
     #[test]
     fn masked_for_display_falls_back_to_whole_value() {
         // Flagged by key name, no recognizable shape: mask everything.
-        assert_eq!(masked_for_display("hunter2"), "hunt***");
+        assert_eq!(masked_for_display("hunter2"), "***(7)");
         // Shaped: keep the recognizable prefix only.
         assert_eq!(
             masked_for_display(&fake("ghp_", "AAAAbbbb1111cccc2222dddd3333eeee")),
@@ -1329,7 +1460,7 @@ mod tests {
 
         mask_tree(&mut value);
 
-        assert_eq!(value["items"][0]["password"], "hunt***");
+        assert_eq!(value["items"][0]["password"], "***(7)");
         assert_eq!(value["items"][0]["nested"][0]["api_key"], "***");
         assert_eq!(value["items"][1], "ordinary");
     }
@@ -1345,10 +1476,10 @@ mod tests {
             "count": 7
         });
         mask_value(&mut v);
-        assert_eq!(v["scalar"], "sk-s***");
+        assert_eq!(v["scalar"], "sk-***");
         assert_eq!(v["nested"]["GITHUB_TOKEN"], "ghp_***");
-        assert_eq!(v["list"][0], "sk-o***");
-        assert_eq!(v["list"][1], "sk-t***");
+        assert_eq!(v["list"][0], "sk-***");
+        assert_eq!(v["list"][1], "sk-***");
         // A non-string leaf under a sensitive key is hidden as well.
         assert_eq!(v["count"], "***");
     }
@@ -1357,8 +1488,8 @@ mod tests {
     fn mask_value_masks_a_bare_string_array() {
         let mut v = json!(["sk-real-aaaa", "sk-real-bbbb"]);
         mask_value(&mut v);
-        assert_eq!(v[0], "sk-r***");
-        assert_eq!(v[1], "sk-r***");
+        assert_eq!(v[0], "sk-***");
+        assert_eq!(v[1], "sk-***");
     }
 
     #[test]
@@ -1374,7 +1505,7 @@ mod tests {
     fn mask_sensitive_values_understands_split_argv() {
         let mut value = json!(["cmd", "--token", "hunter2", "--mode", "safe"]);
         mask_sensitive_values(&mut value);
-        assert_eq!(value[2], "hunt***");
+        assert_eq!(value[2], "***(7)");
         assert_eq!(value[4], "safe");
     }
 
@@ -1458,7 +1589,7 @@ mod tests {
         assert!(value_looks_sensitive("Authorization: Bearer 12345"));
         assert_eq!(
             mask_embedded("Authorization: Bearer 12345"),
-            "Authorization: Bearer 1234***"
+            "Authorization: Bearer ***(5)"
         );
         let slashed = "X-Api-Key: 12345/opaque-default-12345";
         assert!(value_looks_sensitive(slashed));
