@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use walkdir::WalkDir;
 
 use crate::claude_json;
+use crate::memory::{self, LoadState, SourceKind};
 use crate::paths::{Env, ProjectPaths, managed_mcp_path, managed_settings_files, serialize_path};
 use crate::safe_io;
 use crate::secrets;
@@ -362,24 +363,18 @@ fn path_looks_sensitive(dotted: &str) -> bool {
 struct ClaudeMd {
     #[serde(serialize_with = "serialize_path")]
     file: PathBuf,
+    kind: SourceKind,
     scope: ClaudeMdScope,
-    bytes: u64,
-    load_state: ClaudeMdLoadState,
+    bytes: Option<u64>,
+    load_state: LoadState,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-enum ClaudeMdLoadState {
-    Loaded,
-    Disabled,
-    Unknown,
-}
-
-#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum ClaudeMdScope {
+    Managed,
     User,
     Project,
     Local,
@@ -387,68 +382,49 @@ enum ClaudeMdScope {
 }
 
 fn collect_claude_md(project: &ProjectPaths, env: &Env, show_secrets: bool) -> Vec<ClaudeMd> {
-    let mut out = Vec::new();
-    let user = env.user_claude_md();
-    if let Some(m) = source_metadata(&user, show_secrets)
-        && m.is_file()
-    {
-        let (load_state, detail) = claude_md_initial_state(m.len());
-        out.push(ClaudeMd {
-            file: user,
-            scope: ClaudeMdScope::User,
-            bytes: m.len(),
-            load_state,
-            detail,
-        });
-    }
-    // Walk from project root up to filesystem root for ancestor CLAUDE.md.
-    let mut current = project.root.clone();
-    let original_root = current.clone();
-    loop {
-        for (name, scope) in [
-            (
-                "CLAUDE.md",
-                if current == original_root {
-                    ClaudeMdScope::Project
-                } else {
-                    ClaudeMdScope::Ancestor
-                },
-            ),
-            ("CLAUDE.local.md", ClaudeMdScope::Local),
-        ] {
-            let p = current.join(name);
-            if let Some(m) = source_metadata(&p, show_secrets)
-                && m.is_file()
-            {
-                let (load_state, detail) = claude_md_initial_state(m.len());
-                out.push(ClaudeMd {
-                    file: p,
-                    scope,
-                    bytes: m.len(),
-                    load_state,
-                    detail,
-                });
-            }
-        }
-        match current.parent() {
-            Some(parent) if parent != current => current = parent.to_path_buf(),
-            _ => break,
+    let (sources, warnings) = memory::claude_instructions(env, &project.root);
+    for warning in &warnings {
+        let message = display_text(&warning.message, show_secrets);
+        match &warning.path {
+            Some(path) => eprintln!("warning: {}: {message}", display_path(path, show_secrets)),
+            None => eprintln!("warning: {message}"),
         }
     }
-    out
+    sources
+        .into_iter()
+        .map(|source| ClaudeMd {
+            scope: claude_md_scope(&source, &project.root),
+            file: source.path,
+            kind: source.kind,
+            bytes: source.bytes,
+            load_state: source.load_state,
+            detail: source.detail,
+        })
+        .collect()
 }
 
-fn claude_md_initial_state(bytes: u64) -> (ClaudeMdLoadState, Option<String>) {
-    if bytes > safe_io::MAX_INSTRUCTION_BYTES as u64 {
-        (
-            ClaudeMdLoadState::Disabled,
-            Some(format!(
-                "skipped by Claude because the file exceeds the {} byte CLAUDE.md limit",
-                safe_io::MAX_INSTRUCTION_BYTES
-            )),
-        )
-    } else {
-        (ClaudeMdLoadState::Loaded, None)
+/// `show` names scopes relative to the target directory, while the adapter
+/// names them relative to the Git repository, so a nested target's own
+/// `CLAUDE.md` is `project` here and the repository root's is `ancestor`.
+fn claude_md_scope(source: &memory::Source, root: &Path) -> ClaudeMdScope {
+    match source.scope {
+        memory::Scope::Managed => ClaudeMdScope::Managed,
+        memory::Scope::Global => ClaudeMdScope::User,
+        _ if source.kind == SourceKind::Instruction
+            && source
+                .path
+                .file_name()
+                .is_some_and(|name| name == "CLAUDE.local.md") =>
+        {
+            ClaudeMdScope::Local
+        }
+        _ if source.kind == SourceKind::Rule || source.path.starts_with(root) => {
+            ClaudeMdScope::Project
+        }
+        memory::Scope::Repository if source.kind == SourceKind::ImportedInstruction => {
+            ClaudeMdScope::Project
+        }
+        _ => ClaudeMdScope::Ancestor,
     }
 }
 
@@ -495,10 +471,15 @@ const MAX_CONTRADICTIONS: usize = 128;
 fn detect_contradictions(files: &mut [ClaudeMd]) -> (Vec<Contradiction>, bool) {
     let mut lines_by_file: Vec<(PathBuf, DirectivesByKeyword)> = Vec::new();
     for f in files {
+        // A disabled or unresolved source is one Claude does not load, and an
+        // unapproved external import must not be opened at all.
+        if !matches!(f.load_state, LoadState::Loaded | LoadState::OnDemand) {
+            continue;
+        }
         let text = match safe_io::read_to_string(&f.file, safe_io::MAX_INSTRUCTION_BYTES) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::FileTooLarge => {
-                f.load_state = ClaudeMdLoadState::Disabled;
+                f.load_state = LoadState::Disabled;
                 f.detail = Some(format!(
                     "skipped by Claude because the file exceeds the {} byte CLAUDE.md limit; midden did not scan it: {error}",
                     safe_io::MAX_INSTRUCTION_BYTES
@@ -506,7 +487,7 @@ fn detect_contradictions(files: &mut [ClaudeMd]) -> (Vec<Contradiction>, bool) {
                 continue;
             }
             Err(error) => {
-                f.load_state = ClaudeMdLoadState::Unknown;
+                f.load_state = LoadState::Unknown;
                 f.detail = Some(format!("could not inspect for contradictions: {error}"));
                 continue;
             }
@@ -1049,20 +1030,25 @@ fn emit_human(report: &Report, show_secrets: bool) {
     } else {
         for c in claude_mds {
             let scope = match c.scope {
+                ClaudeMdScope::Managed => "managed",
                 ClaudeMdScope::User => "user",
                 ClaudeMdScope::Project => "project",
                 ClaudeMdScope::Local => "local",
                 ClaudeMdScope::Ancestor => "ancestor",
             };
+            let kind = match c.kind {
+                SourceKind::Rule => " rule",
+                SourceKind::ImportedInstruction => " import",
+                _ => "",
+            };
+            let bytes = c
+                .bytes
+                .map(|bytes| format!(" ({bytes} bytes)"))
+                .unwrap_or_default();
             println!(
-                "  [{scope}; {}] {} ({} bytes)",
-                match c.load_state {
-                    ClaudeMdLoadState::Loaded => "loaded",
-                    ClaudeMdLoadState::Disabled => "disabled",
-                    ClaudeMdLoadState::Unknown => "load unknown",
-                },
+                "  [{scope}{kind}; {}] {}{bytes}",
+                c.load_state.label(),
                 display_path(&c.file, show_secrets),
-                c.bytes
             );
             if let Some(detail) = &c.detail {
                 println!("    {}", display_text(detail, show_secrets).dimmed());
@@ -1403,15 +1389,17 @@ mod tests {
             ClaudeMd {
                 file: a,
                 scope: ClaudeMdScope::User,
-                bytes: 0,
-                load_state: ClaudeMdLoadState::Loaded,
+                kind: SourceKind::Instruction,
+                bytes: Some(0),
+                load_state: LoadState::Loaded,
                 detail: None,
             },
             ClaudeMd {
                 file: b,
                 scope: ClaudeMdScope::Project,
-                bytes: 0,
-                load_state: ClaudeMdLoadState::Loaded,
+                kind: SourceKind::Instruction,
+                bytes: Some(0),
+                load_state: LoadState::Loaded,
                 detail: None,
             },
         ];
@@ -1432,15 +1420,17 @@ mod tests {
             ClaudeMd {
                 file: a.clone(),
                 scope: ClaudeMdScope::User,
-                bytes: 0,
-                load_state: ClaudeMdLoadState::Loaded,
+                kind: SourceKind::Instruction,
+                bytes: Some(0),
+                load_state: LoadState::Loaded,
                 detail: None,
             },
             ClaudeMd {
                 file: b.clone(),
                 scope: ClaudeMdScope::Project,
-                bytes: 0,
-                load_state: ClaudeMdLoadState::Loaded,
+                kind: SourceKind::Instruction,
+                bytes: Some(0),
+                load_state: LoadState::Loaded,
                 detail: None,
             },
         ];

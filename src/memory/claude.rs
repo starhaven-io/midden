@@ -50,6 +50,31 @@ impl<'a> ClaudeAdapter<'a> {
     pub(super) fn new(env: &'a Env) -> Self {
         Self { env }
     }
+
+    pub(super) fn instructions(&self, target: &Path) -> ProviderInventory {
+        let repository_root = git::repository_root(target).unwrap_or_else(|| target.to_path_buf());
+        let (settings, settings_errors) =
+            show::settings_sources(self.env, &ProjectPaths::new(&repository_root));
+        let mut inventory = ProviderInventory::new(Provider::Claude, true, MemoryState::Unknown);
+        for error in settings_errors {
+            inventory.warnings.push(Warning::at(
+                "invalid-claude-settings",
+                format!(
+                    "could not read or parse Claude settings; claudeMdExcludes is unknown: {}",
+                    error.message
+                ),
+                error.path,
+            ));
+        }
+        collect_instructions(
+            &mut inventory,
+            self.env,
+            target,
+            &repository_root,
+            &settings,
+        );
+        inventory
+    }
 }
 
 impl Adapter for ClaudeAdapter<'_> {
@@ -122,102 +147,12 @@ impl Adapter for ClaudeAdapter<'_> {
             ),
         ));
         collect_operational_sources(&mut inventory, &settings);
-        let exclusions = build_exclusions(&mut inventory, &settings);
-        let project_import_approval =
-            external_import_approval(&mut inventory, self.env, &repository_root);
-
-        let mut imported = BTreeSet::new();
-        for path in managed_claude_md_paths() {
-            push_instruction_with_imports(
-                &mut inventory,
-                path,
-                InstructionContext {
-                    scope: Scope::Managed,
-                    association: Association::Global,
-                    exclusions: None,
-                    trust_root: None,
-                    external_import_approval: ExternalImportApproval::Approved,
-                },
-                &mut imported,
-            );
-        }
-        push_instruction_with_imports(
+        collect_instructions(
             &mut inventory,
-            self.env.user_claude_md(),
-            InstructionContext {
-                scope: Scope::Global,
-                association: Association::Global,
-                exclusions: Some(&exclusions),
-                trust_root: None,
-                external_import_approval: ExternalImportApproval::Approved,
-            },
-            &mut imported,
-        );
-        collect_rules(
-            &mut inventory,
-            &self.env.claude_home.join("rules"),
-            InstructionContext {
-                scope: Scope::Global,
-                association: Association::Global,
-                exclusions: Some(&exclusions),
-                trust_root: None,
-                external_import_approval: ExternalImportApproval::Approved,
-            },
-            &mut imported,
-        );
-
-        for directory in ancestor_chain(request.target) {
-            let scope = instruction_scope(&directory, &repository_root);
-            push_instruction_with_imports(
-                &mut inventory,
-                directory.join("CLAUDE.md"),
-                InstructionContext {
-                    scope,
-                    association: Association::Target,
-                    exclusions: Some(&exclusions),
-                    trust_root: Some(&repository_root),
-                    external_import_approval: project_import_approval,
-                },
-                &mut imported,
-            );
-            if directory == repository_root {
-                push_instruction_with_imports(
-                    &mut inventory,
-                    directory.join(".claude").join("CLAUDE.md"),
-                    InstructionContext {
-                        scope: Scope::Repository,
-                        association: Association::Target,
-                        exclusions: Some(&exclusions),
-                        trust_root: Some(&repository_root),
-                        external_import_approval: project_import_approval,
-                    },
-                    &mut imported,
-                );
-            }
-            push_instruction_with_imports(
-                &mut inventory,
-                directory.join("CLAUDE.local.md"),
-                InstructionContext {
-                    scope,
-                    association: Association::Target,
-                    exclusions: Some(&exclusions),
-                    trust_root: Some(&repository_root),
-                    external_import_approval: project_import_approval,
-                },
-                &mut imported,
-            );
-        }
-        collect_rules(
-            &mut inventory,
-            &repository_root.join(".claude").join("rules"),
-            InstructionContext {
-                scope: Scope::Repository,
-                association: Association::Target,
-                exclusions: Some(&exclusions),
-                trust_root: Some(&repository_root),
-                external_import_approval: project_import_approval,
-            },
-            &mut imported,
+            self.env,
+            request.target,
+            &repository_root,
+            &settings,
         );
 
         let custom_memory_dir = effective_auto_memory_directory(&settings, true);
@@ -276,6 +211,114 @@ impl Adapter for ClaudeAdapter<'_> {
         inventory.configured = inventory.configured || !inventory.sources.is_empty();
         inventory
     }
+}
+
+/// Every instruction source Claude loads for `target`, in load order. Shared
+/// by `memory show` and `show` so the two commands cannot disagree about
+/// which files contribute.
+fn collect_instructions(
+    inventory: &mut ProviderInventory,
+    env: &Env,
+    target: &Path,
+    repository_root: &Path,
+    settings: &[(show::Scope, PathBuf, Value)],
+) {
+    let exclusions = build_exclusions(inventory, settings);
+    let project_import_approval = external_import_approval(inventory, env, repository_root);
+
+    let mut imported = BTreeSet::new();
+    for path in managed_claude_md_paths() {
+        push_instruction_with_imports(
+            inventory,
+            path,
+            InstructionContext {
+                scope: Scope::Managed,
+                association: Association::Global,
+                exclusions: None,
+                trust_root: None,
+                external_import_approval: ExternalImportApproval::Approved,
+            },
+            &mut imported,
+        );
+    }
+    push_instruction_with_imports(
+        inventory,
+        env.user_claude_md(),
+        InstructionContext {
+            scope: Scope::Global,
+            association: Association::Global,
+            exclusions: Some(&exclusions),
+            trust_root: None,
+            external_import_approval: ExternalImportApproval::Approved,
+        },
+        &mut imported,
+    );
+    collect_rules(
+        inventory,
+        &env.claude_home.join("rules"),
+        InstructionContext {
+            scope: Scope::Global,
+            association: Association::Global,
+            exclusions: Some(&exclusions),
+            trust_root: None,
+            external_import_approval: ExternalImportApproval::Approved,
+        },
+        &mut imported,
+    );
+
+    for directory in ancestor_chain(target) {
+        let scope = instruction_scope(&directory, repository_root);
+        push_instruction_with_imports(
+            inventory,
+            directory.join("CLAUDE.md"),
+            InstructionContext {
+                scope,
+                association: Association::Target,
+                exclusions: Some(&exclusions),
+                trust_root: Some(repository_root),
+                external_import_approval: project_import_approval,
+            },
+            &mut imported,
+        );
+        if directory == repository_root {
+            push_instruction_with_imports(
+                inventory,
+                directory.join(".claude").join("CLAUDE.md"),
+                InstructionContext {
+                    scope: Scope::Repository,
+                    association: Association::Target,
+                    exclusions: Some(&exclusions),
+                    trust_root: Some(repository_root),
+                    external_import_approval: project_import_approval,
+                },
+                &mut imported,
+            );
+        }
+        push_instruction_with_imports(
+            inventory,
+            directory.join("CLAUDE.local.md"),
+            InstructionContext {
+                scope,
+                association: Association::Target,
+                exclusions: Some(&exclusions),
+                trust_root: Some(repository_root),
+                external_import_approval: project_import_approval,
+            },
+            &mut imported,
+        );
+    }
+    collect_rules(
+        inventory,
+        &repository_root.join(".claude").join("rules"),
+        InstructionContext {
+            scope: Scope::Repository,
+            association: Association::Target,
+            exclusions: Some(&exclusions),
+            trust_root: Some(repository_root),
+            external_import_approval: project_import_approval,
+        },
+        &mut imported,
+    );
 }
 
 fn collect_operational_sources(
