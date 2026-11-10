@@ -8,6 +8,16 @@ use std::process::Command;
 /// `safe.bareRepository` is honored only from protected config such as this.
 fn git_command(root: &Path) -> Command {
     let mut command = Command::new("git");
+    // These would point every query at a repository other than the one that
+    // holds `root`.
+    for variable in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+    ] {
+        command.env_remove(variable);
+    }
     command
         .args(["-c", "core.fsmonitor=false"])
         .args(["-c", "safe.bareRepository=explicit"])
@@ -76,8 +86,20 @@ fn git_path(root: &Path, args: &[&str]) -> Option<PathBuf> {
     absolute.canonicalize().ok()
 }
 
+/// The worktree root of the repository holding `path`. The result bounds
+/// which instruction imports count as internal, so it must not be movable by
+/// the checkout itself: `core.worktree` in the repository's own config (or in
+/// the config of a gitdir its `.git` file points at) makes Git report any
+/// directory as the top level. Only a top level that holds the nearest `.git`
+/// entry at or above `path` is accepted. That entry stays in the worktree
+/// root for linked worktrees and submodules, so those still resolve.
 pub fn repository_root(path: &Path) -> Option<PathBuf> {
-    git_path(path, &["rev-parse", "--show-toplevel"])
+    let reported = git_path(path, &["rev-parse", "--show-toplevel"])?;
+    let path = path.canonicalize().ok()?;
+    let discovered = path
+        .ancestors()
+        .find(|directory| directory.join(".git").symlink_metadata().is_ok())?;
+    (discovered == reported).then_some(reported)
 }
 
 /// The common Git directory is shared by every worktree, unlike the worktree
@@ -160,6 +182,133 @@ mod tests {
             repository_identity(&root),
             root.join(".git").canonicalize().ok()
         );
+    }
+
+    #[test]
+    fn configured_worktree_cannot_move_the_repository_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("outer").join("repo");
+        std::fs::create_dir_all(repo.join("nested")).unwrap();
+        git(&repo, &["init", "--quiet"]);
+        assert_eq!(
+            repository_root(&repo.join("nested")),
+            repo.canonicalize().ok()
+        );
+
+        // A relative value is resolved against the Git directory.
+        for worktree in ["../..", "../../..", "/", "../nested"] {
+            git(&repo, &["config", "core.worktree", worktree]);
+            assert_eq!(repository_root(&repo), None, "core.worktree = {worktree}");
+            assert_eq!(
+                repository_root(&repo.join("nested")),
+                None,
+                "core.worktree = {worktree}"
+            );
+        }
+    }
+
+    #[test]
+    fn gitdir_file_cannot_borrow_a_worktree_from_another_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("other");
+        let checkout = dir.path().join("checkout");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::create_dir_all(&checkout).unwrap();
+        git(&other, &["init", "--quiet"]);
+        git(
+            &other,
+            &["config", "core.worktree", dir.path().to_str().unwrap()],
+        );
+        std::fs::write(
+            checkout.join(".git"),
+            format!("gitdir: {}\n", other.join(".git").display()),
+        )
+        .unwrap();
+
+        assert_eq!(repository_root(&checkout), None);
+    }
+
+    #[test]
+    fn linked_worktrees_and_submodules_keep_their_own_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "--quiet"]);
+        git(
+            &main,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        let linked = dir.path().join("linked");
+        git(
+            &main,
+            &["worktree", "add", "--quiet", linked.to_str().unwrap()],
+        );
+        std::fs::create_dir_all(linked.join("nested")).unwrap();
+        assert_eq!(
+            repository_root(&linked.join("nested")),
+            linked.canonicalize().ok()
+        );
+
+        // A submodule's gitdir lives under the superproject and names the
+        // submodule directory through core.worktree.
+        let submodule = main.join("sub");
+        let gitdir = main.join(".git").join("modules").join("sub");
+        std::fs::create_dir_all(&submodule).unwrap();
+        std::fs::create_dir_all(gitdir.parent().unwrap()).unwrap();
+        git(
+            &submodule,
+            &[
+                "init",
+                "--quiet",
+                "--separate-git-dir",
+                gitdir.to_str().unwrap(),
+            ],
+        );
+        git(&submodule, &["config", "core.worktree", "../../../sub"]);
+        assert_eq!(repository_root(&submodule), submodule.canonicalize().ok());
+    }
+
+    #[test]
+    fn environment_cannot_redirect_repository_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "--quiet"]);
+        let output = git_command(&repo)
+            .env("GIT_WORK_TREE", "/")
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "/",
+            "fixture: an inherited GIT_WORK_TREE would move the top level"
+        );
+        let scrubbed: Vec<_> = git_command(&repo)
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_owned())
+            .collect();
+        for variable in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+        ] {
+            assert!(scrubbed.iter().any(|name| name == variable), "{variable}");
+        }
     }
 
     #[cfg(unix)]
