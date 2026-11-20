@@ -15,7 +15,9 @@ use crate::claude_json::{self, ClaudeJson};
 use crate::git;
 use crate::orphans;
 use crate::output;
-use crate::paths::{Env, ProjectPaths, managed_mcp_path, managed_settings_files, serialize_path};
+use crate::paths::{
+    Env, LOCAL_SETTINGS, ProjectPaths, managed_mcp_path, managed_settings_files, serialize_path,
+};
 use crate::process;
 use crate::safe_io;
 use crate::secrets;
@@ -95,7 +97,7 @@ pub fn run(env: &Env, opts: Options) -> Result<ExitCode> {
     check_transcript_storage(env, &mut findings);
     check_stale_worktrees(&project, &mut findings)?;
     check_secrets_in_committed_settings(&project, &mut findings, opts.show_secrets)?;
-    check_local_settings_in_git(&project, &mut findings)?;
+    check_local_settings_in_git(&project, &mut findings);
     check_credential_deny_rules(&project, env, &mut findings)?;
     check_dead_skill_command_agent_refs(&project, env, &mut findings)?;
     check_disabled_mcp_servers(&project, env, claude_json.as_ref(), &mut findings)?;
@@ -865,15 +867,19 @@ fn collect_secret_strings(value: &Value, path: &str, out: &mut Vec<(String, Stri
 /// our own secret-in-committed-settings fix, steer credentials into it on the
 /// assumption it stays out of git. Flag it when git tracks it (already exposed)
 /// or merely fails to ignore it (one `git add` away from exposure).
-fn check_local_settings_in_git(project: &ProjectPaths, out: &mut Vec<Finding>) -> Result<()> {
-    let local = project.local_settings();
-    if !local.is_file() {
-        return Ok(());
+fn check_local_settings_in_git(project: &ProjectPaths, out: &mut Vec<Finding>) {
+    for root in project.local_settings_roots() {
+        check_local_settings_file(root, out);
     }
-    // Pass a repo-relative path so git resolves it against the worktree it
-    // discovers, regardless of symlinked roots.
-    let rel = local.strip_prefix(&project.root).unwrap_or(local.as_path());
-    if git::is_tracked(&project.root, rel) == Some(true) {
+}
+
+fn check_local_settings_file(root: &Path, out: &mut Vec<Finding>) {
+    let local = root.join(LOCAL_SETTINGS);
+    if !local.is_file() {
+        return;
+    }
+    let rel = Path::new(LOCAL_SETTINGS);
+    if git::is_tracked(root, rel) == Some(true) {
         out.push(Finding {
             id: "local-settings-tracked",
             severity: Severity::Warn,
@@ -885,11 +891,11 @@ fn check_local_settings_in_git(project: &ProjectPaths, out: &mut Vec<Finding>) -
                       and often holds secrets"
                 .into(),
             suggested_fix: Some(
-                "`git rm --cached .claude/settings.local.json`, then add it to .gitignore".into(),
+                "from the directory containing this .claude folder, run `git rm --cached .claude/settings.local.json` and add the file to .gitignore".into(),
             ),
             auto_fixable: false,
         });
-    } else if git::is_ignored(&project.root, rel) == Some(false) {
+    } else if git::is_ignored(root, rel) == Some(false) {
         out.push(Finding {
             id: "local-settings-not-ignored",
             severity: Severity::Warn,
@@ -904,7 +910,6 @@ fn check_local_settings_in_git(project: &ProjectPaths, out: &mut Vec<Finding>) -
             auto_fixable: false,
         });
     }
-    Ok(())
 }
 
 fn check_credential_deny_rules(
@@ -1021,7 +1026,6 @@ fn read_deny_covers(
 fn recommend_deny_location(project: &ProjectPaths, env: &Env) -> (PathBuf, String) {
     let user = env.user_settings();
     let proj = project.settings();
-    let local = project.local_settings();
     let example =
         r#"add e.g. "Read(./.env)", "Read(./.env.*)", "Read(./secrets/**)" to permissions.deny"#;
     if user.is_file() {
@@ -1031,7 +1035,7 @@ fn recommend_deny_location(project: &ProjectPaths, env: &Env) -> (PathBuf, Strin
         )
     } else if proj.is_file() {
         (proj.clone(), format!("{example} in {}", proj.display()))
-    } else if local.is_file() {
+    } else if let Some(local) = project.local_settings().rev().find(|path| path.is_file()) {
         (local.clone(), format!("{example} in {}", local.display()))
     } else {
         (
@@ -1055,8 +1059,8 @@ fn merged_deny_rules(
     let mut paths = vec![
         (Scope::User, env.user_settings()),
         (Scope::Project, project.settings()),
-        (Scope::Local, project.local_settings()),
     ];
+    paths.extend(project.local_settings().map(|path| (Scope::Local, path)));
     let managed = managed_settings_files();
     for (path, error) in managed.errors {
         push_inaccessible(

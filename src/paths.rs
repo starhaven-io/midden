@@ -94,12 +94,27 @@ pub(crate) fn home_dir() -> PathBuf {
 /// Project-scope paths rooted at a target directory.
 pub struct ProjectPaths {
     pub root: PathBuf,
+    pub repository_root: PathBuf,
+    shared_local_root: Option<PathBuf>,
 }
 
 impl ProjectPaths {
     pub fn new(root: impl AsRef<Path>) -> Self {
+        let root = root.as_ref();
+        let repository_root = crate::git::repository_root(root);
+        #[cfg(unix)]
+        let shared_local_root = repository_root
+            .as_deref()
+            .and_then(|worktree| {
+                shared_local_settings_root(worktree, rustix::process::getuid().as_raw())
+            })
+            .filter(|candidate| root.canonicalize().ok().as_ref() != Some(candidate));
+        #[cfg(not(unix))]
+        let shared_local_root = None;
         Self {
-            root: root.as_ref().to_path_buf(),
+            root: root.to_path_buf(),
+            repository_root: repository_root.unwrap_or_else(|| root.to_path_buf()),
+            shared_local_root,
         }
     }
 
@@ -107,8 +122,13 @@ impl ProjectPaths {
         self.root.join(".claude").join("settings.json")
     }
 
-    pub fn local_settings(&self) -> PathBuf {
-        self.root.join(".claude").join("settings.local.json")
+    pub fn local_settings_roots(&self) -> impl DoubleEndedIterator<Item = &Path> {
+        std::iter::once(self.root.as_path()).chain(self.shared_local_root.as_deref())
+    }
+
+    pub fn local_settings(&self) -> impl DoubleEndedIterator<Item = PathBuf> + '_ {
+        self.local_settings_roots()
+            .map(|root| root.join(LOCAL_SETTINGS))
     }
 
     pub fn mcp_json(&self) -> PathBuf {
@@ -130,6 +150,31 @@ impl ProjectPaths {
     pub fn worktrees_dir(&self) -> PathBuf {
         self.root.join(".claude").join("worktrees")
     }
+}
+
+pub const LOCAL_SETTINGS: &str = ".claude/settings.local.json";
+
+#[cfg(unix)]
+fn shared_local_settings_root(worktree: &Path, uid: u32) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let main = crate::git::main_worktree(worktree)?;
+    if std::env::home_dir()
+        .and_then(|home| home.canonicalize().ok())
+        .as_deref()
+        == Some(&main)
+    {
+        return None;
+    }
+    for path in [&main, &main.join(".git"), &main.join(".claude")] {
+        match path.symlink_metadata() {
+            Ok(metadata) if metadata.uid() == uid => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && path.ends_with(".claude") => {}
+            _ => return None,
+        }
+    }
+    Some(main)
 }
 
 /// Managed (MDM-delivered) settings paths. Returns paths in the order they
@@ -257,6 +302,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_local_settings_require_the_current_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir(root.join(".claude")).unwrap();
+        let uid = rustix::process::getuid().as_raw();
+        assert_eq!(shared_local_settings_root(&root, uid).as_ref(), Some(&root));
+        assert_eq!(shared_local_settings_root(&root, uid.wrapping_add(1)), None);
+    }
 
     #[test]
     fn expand_managed_keeps_files_and_expands_dirs_sorted() {
