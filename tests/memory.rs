@@ -142,6 +142,52 @@ fn json_inventory_has_dual_provider_parity() {
 }
 
 #[test]
+fn inventories_v2_memory_on_its_own_and_alongside_legacy_sources() {
+    let fx = Fixture::new();
+    let v2 = fx.codex_home.join("memories_v2");
+    let legacy = fx.codex_home.join("memories");
+    write(v2.join("memory_summary.md"), "v2 summary");
+    std::fs::create_dir_all(v2.join("rollout_summaries")).unwrap();
+    write(v2.join("notes.md"), "unclassified");
+
+    let inventory = |all| {
+        let mut command = fx.cmd();
+        command.args(["--json", "memory", "show", "--provider", "codex"]);
+        command.arg(fx.root.path());
+        if all {
+            command.arg("--all");
+        }
+        let result = command.assert().success();
+        serde_json::from_slice(&result.get_output().stdout).unwrap()
+    };
+    let v2_only = inventory(false);
+    let codex = provider(&v2_only, "codex");
+    let summary = source(codex, &v2.join("memory_summary.md"));
+    assert_eq!(summary["kind"], "memory-summary");
+    assert_eq!(summary["load_state"], "unknown");
+    assert_eq!(
+        source(codex, &v2.join("rollout_summaries"))["role"],
+        "evidence"
+    );
+
+    write(legacy.join("memory_summary.md"), "legacy summary");
+    let both = inventory(false);
+    let codex = provider(&both, "codex");
+    let other = source(codex, &legacy.join("memory_summary.md"));
+    assert_eq!(other["kind"], "memory-summary");
+    assert_ne!(
+        source(codex, &v2.join("memory_summary.md"))["id"],
+        other["id"]
+    );
+
+    let all = inventory(true);
+    assert_eq!(
+        source(provider(&all, "codex"), &v2.join("notes.md"))["role"],
+        "unknown"
+    );
+}
+
+#[test]
 fn provider_filter_keeps_the_same_schema() {
     let (fx, _, _) = paired_fixture();
     let out = fx
