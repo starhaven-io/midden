@@ -81,8 +81,8 @@ impl Env {
         self.codex_home.join("config.toml")
     }
 
-    pub fn codex_memories_dir(&self) -> PathBuf {
-        self.codex_home.join("memories")
+    pub fn codex_memory_dirs(&self) -> [PathBuf; 2] {
+        ["memories", "memories_v2"].map(|name| self.codex_home.join(name))
     }
 }
 

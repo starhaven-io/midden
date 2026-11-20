@@ -54,9 +54,7 @@ impl Adapter for CodexAdapter<'_> {
         // agree.
         let memory_state = MemoryState::Unknown;
         let configuration_unresolved = true;
-        let configured = self.env.codex_home.is_dir()
-            || !resolved.sources.is_empty()
-            || self.env.codex_memories_dir().is_dir();
+        let configured = self.env.codex_home.is_dir() || !resolved.sources.is_empty();
         let mut inventory = ProviderInventory::new(Provider::Codex, configured, memory_state);
 
         let mut config_paths = std::collections::BTreeSet::new();
@@ -173,7 +171,9 @@ impl Adapter for CodexAdapter<'_> {
             );
         }
 
-        collect_memory_sources(&mut inventory, self.env, request, memory_state);
+        for root in self.env.codex_memory_dirs() {
+            collect_memory_sources(&mut inventory, &root, request, memory_state);
+        }
         inventory.configured = inventory.configured || !inventory.sources.is_empty();
         inventory
     }
@@ -826,11 +826,10 @@ fn memory_load_state(memory_state: MemoryState, on_demand: bool) -> LoadState {
 
 fn collect_memory_sources(
     inventory: &mut ProviderInventory,
-    env: &Env,
+    memories: &Path,
     request: &DiscoveryRequest<'_>,
     memory_state: MemoryState,
 ) {
-    let memories = env.codex_memories_dir();
     for (name, role, kind, on_demand) in [
         (
             "memory_summary.md",
@@ -883,7 +882,7 @@ fn collect_memory_sources(
     if !request.include_unassociated {
         return;
     }
-    let Ok(entries) = fs::read_dir(&memories) else {
+    let Ok(entries) = fs::read_dir(memories) else {
         return;
     };
     let mut paths = entries
