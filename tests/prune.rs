@@ -148,6 +148,36 @@ fn worktrees_only_skips_non_worktree_orphans() {
 }
 
 #[test]
+fn worktrees_only_keeps_the_full_project_wrong_host_check() {
+    let fx = Fixture::new();
+    let worktree = fx.root.path().join(".claude/worktrees/missing");
+    let volume = format!("/Volumes/midden-missing-{}", std::process::id());
+    let mut projects = serde_json::Map::new();
+    for i in 0..7 {
+        let missing = fx.root.path().join(format!("missing-{i}"));
+        projects.insert(missing.display().to_string(), json!({}));
+    }
+    projects.insert(fx.touch_dir("live"), json!({}));
+    projects.insert(format!("{volume}/project"), json!({}));
+    projects.insert(worktree.display().to_string(), json!({}));
+    fx.write_config(Value::Object(projects), standard_extras());
+    let before = fx.read_config();
+
+    for transcripts in [false, true] {
+        let mut command = fx.cmd();
+        command.args(["prune", "--worktrees-only", "--apply"]);
+        if transcripts {
+            command.arg("--transcripts");
+        }
+        command.assert().code(2).stderr(contains(
+            "9 of 10 project entries resolve missing (1 on volumes that are not mounted)",
+        ));
+        assert_eq!(fx.read_config(), before);
+        assert!(fx.backup_paths().is_empty());
+    }
+}
+
+#[test]
 fn refuses_mass_deletion_without_force() {
     let fx = Fixture::new();
     let live = fx.touch_dir("live");
@@ -783,6 +813,119 @@ fn transcripts_worktrees_only_filters_by_derived_cwd() {
         !fx.claude_home.join("projects/worktree-dead").exists(),
         "worktree derived cwd is pruned"
     );
+}
+
+#[test]
+fn worktrees_only_prunes_dead_transcripts_on_a_healthy_host() {
+    let fx = Fixture::new();
+    fx.write_config(json!({}), standard_extras());
+    let live: Vec<_> = (0..10)
+        .map(|i| {
+            let name = format!("live-{i}");
+            fx.write_transcript(&name, &fx.touch_dir(&name))
+        })
+        .collect();
+    let dead: Vec<_> = (0..6)
+        .map(|i| {
+            let name = format!("dead-{i}");
+            let cwd = fx.root.path().join(".claude/worktrees").join(&name);
+            fx.write_transcript(&name, cwd.to_str().unwrap())
+        })
+        .collect();
+
+    fx.cmd()
+        .env("MIDDEN_TEST_ASSUME_NO_CLAUDE_PROCESS", &fx.config)
+        .args(["prune", "--transcripts", "--worktrees-only", "--apply"])
+        .assert()
+        .success();
+    assert!(live.iter().all(|path| path.exists()));
+    assert!(dead.iter().all(|path| !path.exists()));
+    assert!(fx.backup_paths().is_empty());
+}
+
+#[test]
+fn worktrees_only_keeps_the_full_transcript_wrong_host_check() {
+    let fx = Fixture::new();
+    let worktree = fx.root.path().join(".claude/worktrees/missing");
+    let worktree = worktree.to_str().unwrap();
+    fx.write_config(json!({ worktree: {} }), standard_extras());
+    let selected = fx.write_transcript("worktree", worktree);
+    let volume = format!("/Volumes/midden-missing-{}/project", std::process::id());
+    let on_volume = fx.write_transcript("unmounted", &volume);
+    let ordinary: Vec<_> = (0..8)
+        .map(|i| {
+            let name = format!("ordinary-{i}");
+            fx.write_transcript(&name, fx.root.path().join(&name).to_str().unwrap())
+        })
+        .collect();
+    let before = fx.read_config();
+
+    fx.cmd()
+        .args(["prune", "--transcripts", "--worktrees-only", "--apply"])
+        .assert()
+        .code(2)
+        .stderr(contains(
+            "10 of 10 resolvable transcript dirs point at missing projects (1 on volumes that are not mounted)",
+        ));
+    assert_eq!(fx.read_config(), before);
+    assert!(fx.backup_paths().is_empty());
+    assert!(selected.exists());
+
+    fx.cmd()
+        .args([
+            "prune",
+            "--transcripts",
+            "--worktrees-only",
+            "--apply",
+            "--force",
+        ])
+        .assert()
+        .success();
+    assert!(!selected.exists());
+    assert!(on_volume.exists());
+    assert!(ordinary.iter().all(|path| path.exists()));
+    assert_eq!(fx.read_config()["projects"], json!({}));
+
+    fx.cmd()
+        .args(["prune", "--transcripts", "--worktrees-only", "--apply"])
+        .assert()
+        .success();
+    assert!(ordinary.iter().all(|path| path.exists()));
+}
+
+#[test]
+fn worktrees_only_checks_both_stores_before_either_is_modified() {
+    for selected_in_config in [false, true] {
+        let fx = Fixture::new();
+        let worktree = fx.root.path().join(".claude/worktrees/missing");
+        let mut projects = serde_json::Map::new();
+        let mut transcripts = Vec::new();
+        for i in 0..5 {
+            let name = format!("missing-{i}");
+            let missing = fx.root.path().join(&name);
+            if selected_in_config {
+                transcripts.push(fx.write_transcript(&name, missing.to_str().unwrap()));
+            } else {
+                projects.insert(missing.display().to_string(), json!({}));
+            }
+        }
+        if selected_in_config {
+            projects.insert(worktree.display().to_string(), json!({}));
+        } else {
+            transcripts.push(fx.write_transcript("worktree", worktree.to_str().unwrap()));
+        }
+        fx.write_config(Value::Object(projects), standard_extras());
+        let before = fx.read_config();
+
+        fx.cmd()
+            .args(["prune", "--transcripts", "--worktrees-only", "--apply"])
+            .assert()
+            .code(2)
+            .stderr(contains("different machine"));
+        assert_eq!(fx.read_config(), before);
+        assert!(fx.backup_paths().is_empty());
+        assert!(transcripts.iter().all(|path| path.exists()));
+    }
 }
 
 #[test]

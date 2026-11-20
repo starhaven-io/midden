@@ -108,6 +108,10 @@ pub struct Report {
 }
 
 impl Report {
+    pub fn retain_worktrees(&mut self) {
+        self.dirs.retain(matches_worktree_filter);
+    }
+
     pub fn total(&self) -> usize {
         self.dirs.len()
     }
