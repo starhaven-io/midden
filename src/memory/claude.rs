@@ -1056,7 +1056,10 @@ fn collect_default_memory_dirs(
         } else {
             complete_association
         };
-        if association != Association::Target && !request.include_unassociated {
+        if association == Association::Other && !request.include_unassociated {
+            continue;
+        }
+        if association == Association::Unknown && !request.include_unassociated {
             let (code, message) = if incomplete {
                 (
                     "claude-memory-association-incomplete",

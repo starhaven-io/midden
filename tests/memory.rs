@@ -1512,6 +1512,29 @@ fn claude_memory_association_identifies_a_different_repository() {
         .join("memory/MEMORY.md");
     write(&memory, "other repository memory\n");
 
+    let default = fx
+        .cmd()
+        .args(["--json", "memory", "show", "--provider", "claude"])
+        .arg(fx.root.path())
+        .assert()
+        .success();
+    let inventory: Value = serde_json::from_slice(&default.get_output().stdout).unwrap();
+    let claude = provider(&inventory, "claude");
+    assert!(
+        claude["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["path"] != json!(memory))
+    );
+    assert!(
+        claude["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|w| w["code"] != "claude-memory-unassociated")
+    );
+
     let out = fx
         .cmd()
         .arg("--json")
