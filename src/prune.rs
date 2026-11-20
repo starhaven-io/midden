@@ -475,22 +475,27 @@ fn print_cleanup_note(dir: &transcripts::DirReport) {
 }
 
 fn apply_prune_and_transcripts(env: &Env, opts: &Options) -> Result<CombinedApply> {
+    let mut transcript_report = transcripts::discover(&env.claude_home, false)?;
+    // Unselected directories still indicate which machine owns this state,
+    // even when the only selected removal is in the config.
+    let host_check = ensure_transcript_wrong_host_gate(opts, &transcript_report);
+    if opts.worktrees_only {
+        transcript_report.retain_worktrees();
+    }
+    let transcript_removing = transcript_report.dead_count();
     let mut config = ClaudeJson::load(&env.claude_json)?;
-    let total = config.projects().map(|p| p.len()).unwrap_or(0);
-    let drop: BTreeSet<String> = match config.projects() {
-        Some(projects) => orphans::find(projects, opts.worktrees_only)
-            .into_iter()
-            .map(|o| o.path)
-            .collect(),
-        None => BTreeSet::new(),
-    };
-    let unmounted = unmounted_count(&config, opts);
-    let mut transcript_report = transcripts::discover(&env.claude_home, opts.worktrees_only)?;
-
-    ensure_apply_gates(env, opts, drop.len(), unmounted, total, &transcript_report)?;
+    let drop = checked_project_drop(&config, opts, transcript_removing > 0)?;
+    if !drop.is_empty() || transcript_removing > 0 {
+        host_check?;
+        ensure_claude_not_running(
+            env,
+            opts,
+            running_claude_live_state(env, drop.len(), transcript_removing),
+        )?;
+    }
 
     let prune = apply_project_drop(env, &mut config, &drop)?;
-    if transcript_report.dead_count() == 0 {
+    if transcript_removing == 0 {
         return Ok(CombinedApply {
             prune,
             transcripts: None,
@@ -505,37 +510,26 @@ fn apply_prune_and_transcripts(env: &Env, opts: &Options) -> Result<CombinedAppl
     })
 }
 
-fn unmounted_count(config: &ClaudeJson, opts: &Options) -> usize {
-    config
-        .projects()
-        .map(|projects| orphans::on_unmounted_volumes(projects, opts.worktrees_only).len())
-        .unwrap_or(0)
-}
-
-fn ensure_apply_gates(
-    env: &Env,
+fn checked_project_drop(
+    config: &ClaudeJson,
     opts: &Options,
-    project_removing: usize,
-    project_unmounted: usize,
-    project_total: usize,
-    transcript_report: &transcripts::Report,
-) -> Result<()> {
-    orphans::ensure_not_wrong_host(
-        opts.force,
-        project_removing,
-        project_unmounted,
-        project_total,
-    )?;
-    ensure_transcript_wrong_host_gate(opts, transcript_report)?;
-    if project_removing == 0 && transcript_report.dead_count() == 0 {
-        return Ok(());
+    removing_transcripts: bool,
+) -> Result<BTreeSet<String>> {
+    let Some(projects) = config.projects() else {
+        return Ok(BTreeSet::new());
+    };
+    let orphans = orphans::find(projects, false);
+    let orphan_count = orphans.len();
+    let drop: BTreeSet<_> = orphans
+        .into_iter()
+        .filter(|orphan| !opts.worktrees_only || orphan.is_worktree)
+        .map(|orphan| orphan.path)
+        .collect();
+    if !drop.is_empty() || removing_transcripts {
+        let unmounted = orphans::on_unmounted_volumes(projects, false).len();
+        orphans::ensure_not_wrong_host(opts.force, orphan_count, unmounted, projects.len())?;
     }
-
-    ensure_claude_not_running(
-        env,
-        opts,
-        running_claude_live_state(env, project_removing, transcript_report.dead_count()),
-    )
+    Ok(drop)
 }
 
 fn running_claude_live_state(
@@ -637,21 +631,7 @@ fn preview_pruned(config: &ClaudeJson, orphans: &[orphans::Orphan]) -> Result<St
 /// re-check leaves nothing to remove and the file is left untouched.
 fn apply_prune(env: &Env, opts: &Options) -> Result<ProjectApplyResult> {
     let mut config = ClaudeJson::load(&env.claude_json)?;
-    let total = config.projects().map(|p| p.len()).unwrap_or(0);
-    let drop: BTreeSet<String> = match config.projects() {
-        Some(projects) => orphans::find(projects, opts.worktrees_only)
-            .into_iter()
-            .map(|o| o.path)
-            .collect(),
-        None => BTreeSet::new(),
-    };
-
-    orphans::ensure_not_wrong_host(
-        opts.force,
-        drop.len(),
-        unmounted_count(&config, opts),
-        total,
-    )?;
+    let drop = checked_project_drop(&config, opts, false)?;
     ensure_claude_not_running(
         env,
         opts,
