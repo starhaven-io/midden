@@ -20,6 +20,208 @@ fn write(path: &Path, contents: &str) {
 }
 
 #[test]
+fn nested_settings_use_the_session_project_and_both_local_files() {
+    let fx = Fixture::new();
+    fx.git(&["init", "--quiet"]);
+    fx.write_config(json!({}), json!({}));
+    let root = fx.root.path().canonicalize().unwrap();
+    let session = root.join("pkg");
+    let root_shared = root.join(".claude/settings.json");
+    let root_local = root.join(".claude/settings.local.json");
+    let session_shared = session.join(".claude/settings.json");
+    let session_local = session.join(".claude/settings.local.json");
+    write_json(
+        &root_shared,
+        &json!({"autoMemoryEnabled": false, "rootOnly": true}),
+    );
+    write_json(
+        &session_shared,
+        &json!({
+            "autoMemoryEnabled": true, "permissions": {"deny": ["Read(/.env)"]}
+        }),
+    );
+    write_json(
+        &session_local,
+        &json!({
+            "model": "legacy", "autoMemoryEnabled": true, "permissions": {"deny": ["Read(/.env.*)"]}
+        }),
+    );
+    write_json(
+        &root_local,
+        &json!({
+            "model": "root", "autoMemoryEnabled": false, "permissions": {"deny": ["Read(/secrets/**)"]}
+        }),
+    );
+    fx.git(&["add", "-f", ".claude/settings.local.json"]);
+
+    let report = |command: &[&str]| -> Value {
+        let output = fx
+            .cmd()
+            .arg("--json")
+            .args(command)
+            .arg(&session)
+            .assert()
+            .success();
+        serde_json::from_slice(&output.get_output().stdout).unwrap()
+    };
+    let show = report(&["show"]);
+    let settings = show["settings"].as_array().unwrap();
+    assert!(!settings.iter().any(|s| s["key"] == "rootOnly"));
+    let model = settings.iter().find(|s| s["key"] == "model").unwrap();
+    assert_eq!(model["effective"], "root");
+    assert_eq!(model["contributions"][0]["file"], json!(session_local));
+    assert_eq!(model["contributions"][0]["shadowed"], true);
+    assert_eq!(model["contributions"][1]["file"], json!(root_local));
+
+    let doctor = report(&["doctor"]);
+    let findings = doctor["findings"].as_array().unwrap();
+    assert!(
+        !findings
+            .iter()
+            .any(|f| f["id"] == "missing-credential-deny")
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["id"] == "local-settings-tracked"
+                && f["location"]["file"] == json!(root_local))
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["id"] == "local-settings-not-ignored"
+                && f["location"]["file"] == json!(session_local))
+    );
+
+    let memory = report(&["memory", "show", "--provider", "claude"]);
+    let sources = memory["providers"][0]["sources"].as_array().unwrap();
+    for file in [session_shared, session_local, root_local] {
+        assert!(
+            sources.iter().any(|s| s["path"] == json!(file)),
+            "{}",
+            file.display()
+        );
+    }
+    assert!(!sources.iter().any(|s| s["path"] == json!(root_shared)));
+}
+
+#[test]
+fn a_linked_worktree_uses_the_main_checkouts_local_settings() {
+    let fx = Fixture::new();
+    fx.git(&["init", "--quiet"]);
+    fx.git(&[
+        "-c",
+        "user.name=Midden Tests",
+        "-c",
+        "user.email=midden@example.invalid",
+        "commit",
+        "--quiet",
+        "--allow-empty",
+        "-m",
+        "fixture",
+    ]);
+    let parent = tempfile::tempdir().unwrap();
+    let worktree = parent.path().join("linked");
+    fx.git(&[
+        "worktree",
+        "add",
+        "--quiet",
+        "--detach",
+        worktree.to_str().unwrap(),
+    ]);
+    assert!(worktree.join(".git").is_file());
+    let nested = worktree.join("pkg");
+    std::fs::create_dir(&nested).unwrap();
+    let main_local = fx
+        .root
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join(".claude/settings.local.json");
+    write_json(&main_local, &json!({"model": "main-local"}));
+    write_json(
+        &worktree.join(".claude/settings.local.json"),
+        &json!({"model": "worktree-local"}),
+    );
+
+    let result = fx
+        .cmd()
+        .args(["--json", "show"])
+        .arg(&nested)
+        .assert()
+        .success();
+    let show: Value = serde_json::from_slice(&result.get_output().stdout).unwrap();
+    let model = show["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["key"] == "model")
+        .unwrap();
+    assert_eq!(model["effective"], "main-local");
+    assert_eq!(model["contributions"].as_array().unwrap().len(), 1);
+    assert_eq!(model["contributions"][0]["file"], json!(main_local));
+}
+
+#[test]
+fn a_missing_home_keeps_the_repository_local_settings_for_nested_targets() {
+    let fx = Fixture::new();
+    fx.git(&["init", "--quiet"]);
+    let session = fx.touch_dir("pkg");
+    let root = fx.root.path().canonicalize().unwrap();
+    let local = root.join(".claude/settings.local.json");
+    write_json(&local, &json!({"model": "root-local"}));
+
+    let output = fx
+        .cmd()
+        .env("HOME", root.join("absent-home"))
+        .args(["--json", "show", &session])
+        .assert()
+        .success();
+    let show: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert!(
+        show["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|setting| setting["key"] == "model"
+                && setting["effective"] == "root-local"
+                && setting["contributions"][0]["file"] == json!(local))
+    );
+}
+
+#[test]
+fn a_repository_rooted_at_home_keeps_local_settings_in_the_session_directory() {
+    let fx = Fixture::new();
+    fx.git(&["init", "--quiet"]);
+    let root = fx.root.path().canonicalize().unwrap();
+    let session = root.join("pkg");
+    write_json(
+        &root.join(".claude/settings.local.json"),
+        &json!({"model": "home-repo"}),
+    );
+    write_json(
+        &session.join(".claude/settings.local.json"),
+        &json!({"model": "session"}),
+    );
+    let output = fx
+        .cmd()
+        .env("HOME", &root)
+        .args(["--json", "show"])
+        .arg(&session)
+        .assert()
+        .success();
+    let show: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    let model = show["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["key"] == "model")
+        .unwrap();
+    assert_eq!(model["effective"], "session");
+    assert_eq!(model["contributions"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn resolved_settings_show_provenance_and_shadowing() {
     let fx = Fixture::new();
     fx.write_config(json!({}), json!({}));

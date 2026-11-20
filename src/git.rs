@@ -108,6 +108,46 @@ pub fn repository_identity(path: &Path) -> Option<PathBuf> {
     git_path(path, &["rev-parse", "--git-common-dir"])
 }
 
+#[cfg(unix)]
+pub fn main_worktree(root: &Path) -> Option<PathBuf> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    if root.join(".git").is_dir() {
+        return Some(root.to_path_buf());
+    }
+    let common = repository_identity(root)?;
+    if git_path(root, &["rev-parse", "--absolute-git-dir"])? == common {
+        return Some(root.to_path_buf());
+    }
+    let output = git_command(root)
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut roots = output.stdout.split(|byte| *byte == 0).filter_map(|field| {
+        field
+            .strip_prefix(b"worktree ")
+            .map(|path| Path::new(OsStr::from_bytes(path)))
+    });
+    let main = roots.next()?.canonicalize().ok()?;
+    if main == root {
+        return Some(main);
+    }
+    // A .git file can name another checkout's Git directory. Only a worktree
+    // registered by the same main checkout can inherit that checkout's files.
+    if roots.any(|path| path.canonicalize().ok().as_deref() == Some(root))
+        && repository_root(&main).as_deref() == Some(main.as_path())
+        && repository_identity(&main)? == common
+    {
+        Some(main)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +266,47 @@ mod tests {
         .unwrap();
 
         assert_eq!(repository_root(&checkout), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_registered_worktree_resolves_to_its_main_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().canonicalize().unwrap().join("main");
+        let linked = main.with_file_name("linked");
+        let unregistered = main.with_file_name("unregistered");
+        std::fs::create_dir(&main).unwrap();
+        git(&main, &["init", "--quiet"]);
+        git(
+            &main,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "fixture",
+            ],
+        );
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                linked.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(main_worktree(&linked), Some(main));
+        std::fs::create_dir(&unregistered).unwrap();
+        std::fs::copy(linked.join(".git"), unregistered.join(".git")).unwrap();
+        assert_eq!(main_worktree(&unregistered), None);
     }
 
     #[test]

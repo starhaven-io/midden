@@ -51,10 +51,8 @@ impl<'a> ClaudeAdapter<'a> {
         Self { env }
     }
 
-    pub(super) fn instructions(&self, target: &Path) -> ProviderInventory {
-        let repository_root = git::repository_root(target).unwrap_or_else(|| target.to_path_buf());
-        let (settings, settings_errors) =
-            show::settings_sources(self.env, &ProjectPaths::new(&repository_root));
+    pub(super) fn instructions(&self, project: &ProjectPaths) -> ProviderInventory {
+        let (settings, settings_errors) = show::settings_sources(self.env, project);
         let mut inventory = ProviderInventory::new(Provider::Claude, true, MemoryState::Unknown);
         for error in settings_errors {
             inventory.warnings.push(Warning::at(
@@ -69,8 +67,8 @@ impl<'a> ClaudeAdapter<'a> {
         collect_instructions(
             &mut inventory,
             self.env,
-            target,
-            &repository_root,
+            &project.root,
+            &project.repository_root,
             &settings,
         );
         inventory
@@ -79,9 +77,7 @@ impl<'a> ClaudeAdapter<'a> {
 
 impl Adapter for ClaudeAdapter<'_> {
     fn discover(&self, request: &DiscoveryRequest<'_>) -> ProviderInventory {
-        let repository_root =
-            git::repository_root(request.target).unwrap_or_else(|| request.target.to_path_buf());
-        let project = ProjectPaths::new(&repository_root);
+        let project = ProjectPaths::new(request.target);
         let (settings, settings_errors) = show::settings_sources(self.env, &project);
         let malformed_settings = !settings_errors.is_empty();
         let memory_enabled = show::effective_setting(&settings, "autoMemoryEnabled");
@@ -151,7 +147,7 @@ impl Adapter for ClaudeAdapter<'_> {
             &mut inventory,
             self.env,
             request.target,
-            &repository_root,
+            &project.repository_root,
             &settings,
         );
 
@@ -178,7 +174,7 @@ impl Adapter for ClaudeAdapter<'_> {
                 &mut inventory,
                 self.env,
                 request,
-                &repository_root,
+                &project.repository_root,
                 memory_state,
             );
         }
@@ -202,7 +198,7 @@ impl Adapter for ClaudeAdapter<'_> {
                     &mut inventory,
                     self.env,
                     request,
-                    &repository_root,
+                    &project.repository_root,
                     memory_state,
                 ),
             }

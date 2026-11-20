@@ -210,8 +210,8 @@ pub(crate) fn settings_sources(
     let mut candidates = vec![
         (Scope::User, env.user_settings()),
         (Scope::Project, project.settings()),
-        (Scope::Local, project.local_settings()),
     ];
+    candidates.extend(project.local_settings().map(|path| (Scope::Local, path)));
     let managed = managed_settings_files();
     errors.extend(
         managed
@@ -382,7 +382,7 @@ enum ClaudeMdScope {
 }
 
 fn collect_claude_md(project: &ProjectPaths, env: &Env, show_secrets: bool) -> Vec<ClaudeMd> {
-    let (sources, warnings) = memory::claude_instructions(env, &project.root);
+    let (sources, warnings) = memory::claude_instructions(env, project);
     for warning in &warnings {
         let message = display_text(&warning.message, show_secrets);
         match &warning.path {

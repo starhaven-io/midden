@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::output;
-use crate::paths::{Env, serialize_optional_path, serialize_path};
+use crate::paths::{Env, ProjectPaths, serialize_optional_path, serialize_path};
 use crate::secrets;
 use crate::terminal;
 
@@ -434,8 +434,11 @@ struct Inventory {
 
 /// Claude's instruction sources for a canonical `target`, in load order, with
 /// the warnings raised while discovering them.
-pub(crate) fn claude_instructions(env: &Env, target: &Path) -> (Vec<Source>, Vec<Warning>) {
-    let inventory = claude::ClaudeAdapter::new(env).instructions(target);
+pub(crate) fn claude_instructions(
+    env: &Env,
+    project: &ProjectPaths,
+) -> (Vec<Source>, Vec<Warning>) {
+    let inventory = claude::ClaudeAdapter::new(env).instructions(project);
     (inventory.sources, inventory.warnings)
 }
 
